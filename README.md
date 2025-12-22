@@ -1,15 +1,93 @@
 # React Native KTX2 Player
 
-Play GPU-compressed sprite animations in React Native. Encodes PNG sequences into KTX2 files using Basis Universal, then transcodes to native GPU formats (ASTC/ETC2) at runtime for efficient playback.
+A high-performance animation player for React Native, designed for smooth, transparent animations (like glowing buttons, effects, or UI highlights) with minimal CPU, RAM, and battery usage.
+
+Instead of playing videos or swapping images every frame, this library uploads a GPU-compressed texture once and lets the GPU handle the animation entirely.
+
+---
+
+## Why this exists (in plain English)
+
+If you want an animated glow, shimmer, or effect in a mobile app, the usual options are:
+
+### ❌ Image sequences (PNG/APNG)
+- Large file sizes
+- Frames are decoded and uploaded repeatedly
+- High RAM usage
+- CPU work every frame
+
+### ❌ Videos (WebM / MP4 with alpha)
+- Smaller files, but…
+- Video decoder runs constantly
+- Frames are uploaded to the GPU every frame
+- Higher battery drain
+- Harder to control playback precisely
+
+### ✅ KTX2 + GPU textures (this library)
+- Very small files on disk
+- Uploaded to the GPU once
+- Animation runs fully on the GPU
+- Near-zero CPU usage during playback
+- Ideal for looping UI effects with transparency
+
+> **Best mental model:**  
+> This works like a tiny game engine sprite system — not a video player.
+
+---
+
+## What this library does
+
+1. Takes a sequence of PNG frames
+2. Packs them into a GPU-friendly sprite sheet
+3. Compresses them using Basis Universal (KTX2)
+
+At runtime:
+1. Transcodes to the device's native GPU format (ASTC / ETC2)
+2. Uploads once to the GPU
+3. Animates by changing texture coordinates (UVs)
+
+**No per-frame decoding. No per-frame uploads.**
+
+---
+
+## Key Advantages
+
+### 🚀 Performance
+- **CPU:** Near zero usage while playing
+- **RAM:** No per-frame allocations
+- **GPU:** Efficient sampling of compressed textures
+- **Battery:** Much lower than video playback
+
+### 📦 File Size
+- Much smaller than PNG sequences
+- Comparable to video, but without decoder overhead
+
+### 🎨 Visual Quality
+- Full alpha transparency
+- Smooth looping animations
+- Excellent quality with ASTC / UASTC
+
+### 🔁 Perfect for UI animations
+- Glows
+- Highlights
+- Shimmers
+- Animated icons
+- Kiosk / always-on displays
+
+---
 
 ## Features
 
-- **GPU Texture Compression** - UASTC/ETC2/ASTC for small file sizes and fast GPU rendering
-- **Sprite Sheet Layout** - Packs frames in 2D grid within GPU texture limits
-- **Multi-Strip Support** - Large animations split across multiple files automatically
-- **Alpha Transparency** - Full support for transparent animations
-- **Async Loading** - Downloads don't block the UI thread
-- **File Caching** - Optional `cacheKey` for persistent local storage
+| Feature | Description |
+|---------|-------------|
+| **GPU Texture Compression** | Uses KTX2 with UASTC / ASTC / ETC2 for optimal size and quality |
+| **Sprite Sheet Layout** | Frames are packed into a 2D grid inside GPU texture limits |
+| **Automatic Splitting** | Large animations are split into multiple texture strips when needed |
+| **Alpha Transparency** | Designed specifically for transparent effects |
+| **Async Loading** | Loading and transcoding never block the UI thread |
+| **File Caching** | Optional on-device caching for remote animations |
+
+---
 
 ## Installation
 
@@ -20,14 +98,15 @@ npm install react-native-ktx2player
 cd ios && pod install
 ```
 
-Basis Universal source is included in the package - no additional setup needed.
+Basis Universal is bundled — no extra native dependencies required.
 
-## Usage
+---
+
+## Basic Usage
 
 ```jsx
 import { KTX2PlayerView } from 'react-native-ktx2player';
 
-// Basic usage
 <KTX2PlayerView
   style={{ width: 200, height: 200 }}
   source={{
@@ -37,8 +116,11 @@ import { KTX2PlayerView } from 'react-native-ktx2player';
   autoPlay
   loop
 />
+```
 
-// With caching and events
+### With caching and events
+
+```jsx
 <KTX2PlayerView
   style={{ width: 200, height: 200 }}
   source={{
@@ -53,11 +135,26 @@ import { KTX2PlayerView } from 'react-native-ktx2player';
 />
 ```
 
-### Source Format
+---
 
-The `source` prop requires:
-- `uri` - URL or local path to the KTX2 file
-- `metadata` - JSON string containing animation info:
+## How this compares to images and video
+
+| Method | CPU | RAM | GPU Uploads | File Size | Battery |
+|--------|-----|-----|-------------|-----------|---------|
+| PNG sequence | High | High | Every frame | Very large | High |
+| APNG | Medium | High | Every frame | Large | Medium |
+| Video (WebM) | Medium | Medium | Every frame | Small | Medium–High |
+| **KTX2 (this)** | **Very low** | **Low** | **Once** | **Small** | **Low** |
+
+---
+
+## Source Format
+
+The `source` prop includes:
+- `uri` — URL or local path to the KTX2 file(s)
+- `metadata` — JSON describing how frames are laid out
+
+### Example metadata
 
 ```json
 {
@@ -75,27 +172,15 @@ The `source` prop requires:
 }
 ```
 
-## Props
+You normally generate this automatically using an encoder.
 
-| Prop | Type | Default | Description |
-|------|------|---------|-------------|
-| `source` | `{ uri: string, metadata: string }` | required | KTX2 file location and metadata |
-| `autoPlay` | `boolean` | `true` | Start playing when loaded |
-| `loop` | `boolean` | `true` | Loop animation |
-| `playbackSpeed` | `number` | `1.0` | Playback speed multiplier |
-| `cacheKey` | `string` | - | Cache path (e.g. `"my-app/anim.ktx2"`) |
-| `enableFrameEvents` | `boolean` | `false` | Emit `onFrameUpdate` events (has overhead) |
-| `onStateChange` | `function` | - | Called with `{ state: 'loading' \| 'ready' \| 'playing' \| 'paused' }` |
-| `onFrameUpdate` | `function` | - | Called with `{ frame, totalFrames }` |
-| `onFinished` | `function` | - | Called when non-looping animation ends |
-| `onError` | `function` | - | Called with `{ error: string }` |
+---
 
 ## Creating KTX2 Animations
 
-Use a KTX2 encoder to convert PNG sequences:
+Convert a PNG frame sequence into KTX2:
 
 ```bash
-# Example using a custom encoder script
 node encode-ktx2.js \
   --input ./frames/*.png \
   --output ./animation \
@@ -104,24 +189,45 @@ node encode-ktx2.js \
   --fps 30
 ```
 
-Output:
-- `animation.ktx2` (or `animation_strip0.ktx2`, `animation_strip1.ktx2` for large animations)
-- `animation.json` (metadata)
+This produces:
+- One or more `.ktx2` files (GPU textures)
+- A `.json` metadata file
 
-## Platform Details
+---
+
+## Platform Support
 
 | Platform | Renderer | GPU Format |
 |----------|----------|------------|
-| iOS (device) | Metal | ASTC 4x4 |
-| iOS (simulator) | Metal | RGBA32 fallback |
+| iOS (device) | Metal | ASTC |
+| iOS (simulator) | Metal | RGBA fallback |
 | Android | OpenGL ES 3.0 | ASTC or ETC2 |
 
-## Performance Tips
+> Simulators fall back to uncompressed textures. Real devices use GPU compression.
 
-- Keep individual strip textures under 4096×4096 for best compatibility
-- Use `enableFrameEvents={false}` unless you need per-frame callbacks
-- Set `cacheKey` for remote files to avoid re-downloading
-- UASTC compression gives best quality; ETC1S for smallest files
+---
+
+## Performance Notes
+
+- Upload happens once, not per frame
+- GPU memory usage is higher than file size (this is normal)
+- Best used for repeating UI effects, not long videos
+
+**Ideal when you need:**
+- Smooth loops
+- Transparency
+- Predictable performance
+
+---
+
+## When not to use this
+
+- Long, non-looping videos
+- Camera footage
+- Audio-driven content
+- Content that must stream continuously
+
+---
 
 ## License
 
