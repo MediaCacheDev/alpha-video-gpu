@@ -1,0 +1,792 @@
+#import "KTX2Player.h"
+#import <React/RCTEventDispatcher.h>
+#import <TargetConditionals.h>
+
+// Basis Universal transcoder - must define this before including
+#define BASISU_NO_ITERATOR_DEBUG_LEVEL
+
+// Include the single-file transcoder implementation
+#include "vendor/basis_universal/transcoder/basisu_transcoder.cpp"
+
+// View manager is in separate KTX2PlayerViewManager.m file
+
+@implementation KTX2PlayerView {
+  basist::transcoder_texture_format _targetFormat;
+  MTLPixelFormat _metalPixelFormat;
+  BOOL _useCompressedFormat;
+  std::vector<std::vector<uint8_t>> _transcodedData;
+  id<MTLSamplerState> _samplerState;
+  BOOL _basisInitialized;
+  NSString *_basePath;
+  NSString *_sourceUri;
+  NSArray *_stripsMetadata;
+  NSArray<NSNumber *> *_stripWidths;
+  NSArray<NSNumber *> *_stripHeights;
+  BOOL _isSourceLoaded;
+  BOOL _isDestroyed;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+  NSLog(@"KTX2PlayerView: initWithFrame %@", NSStringFromCGRect(frame));
+  
+  self = [super initWithFrame:frame];
+  if (self) {
+    self.device = MTLCreateSystemDefaultDevice();
+    NSLog(@"KTX2PlayerView: Metal device=%@", self.device.name);
+    self.commandQueue = [self.device newCommandQueue];
+    self.delegate = self;
+    
+    // CRITICAL: Set up transparency
+    self.opaque = NO;
+    self.backgroundColor = [UIColor clearColor];
+    self.layer.opaque = NO;
+    self.clearColor = MTLClearColorMake(0, 0, 0, 0);
+    
+    // Initialize with default values
+    self.currentFrame = 0;
+    self.totalFrames = 0;
+    self.frameRate = 30.0;
+    self.isPlaying = NO;
+    self.loop = YES;
+    self.playbackSpeed = 1.0;
+    self.frameInterval = 1.0 / self.frameRate;
+    self.enableFrameEvents = NO;  // Disabled by default for performance
+    _isSourceLoaded = NO;
+    _isDestroyed = NO;
+    
+    // Initialize Basis transcoder (only once)
+    if (!_basisInitialized) {
+      basist::basisu_transcoder_init();
+      _basisInitialized = YES;
+    }
+    
+    // Detect and cache optimal texture format
+    [self detectAndCacheTextureFormat];
+    
+    // Default values
+    self.autoPlay = YES;
+    
+    [self setupMetal];
+    [self setupVertexData];
+  }
+  return self;
+}
+
+- (void)detectAndCacheTextureFormat
+{
+  // Check if running on simulator
+#if TARGET_OS_SIMULATOR
+  NSLog(@"KTX2PlayerView: Running on simulator - using RGBA32 fallback");
+  _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
+  _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
+  _useCompressedFormat = NO;
+  return;
+#endif
+  
+  // Check for ASTC support (all real iOS devices with Metal support ASTC)
+  if (@available(iOS 8.0, *)) {
+    // Check device capabilities - ASTC is supported on A8 and later
+    if ([self.device supportsFamily:MTLGPUFamilyApple2]) {
+      NSLog(@"KTX2PlayerView: Using ASTC 4x4 format");
+      _targetFormat = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
+      _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
+      _useCompressedFormat = YES;
+      return;
+    }
+  }
+  
+  // Fallback to RGBA32 for older devices
+  NSLog(@"KTX2PlayerView: Using RGBA32 fallback format");
+  _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
+  _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
+  _useCompressedFormat = NO;
+}
+
+- (void)setSource:(NSDictionary *)source
+{
+  NSLog(@"KTX2PlayerView: setSource called with: %@", source);
+  
+  if (!source) {
+    NSLog(@"KTX2PlayerView: setSource - source is nil, ignoring");
+    return;
+  }
+  
+  NSString *uri = source[@"uri"];
+  NSString *metadata = source[@"metadata"];
+  
+  NSLog(@"KTX2PlayerView: setSource - uri=%@, metadata length=%lu", uri, (unsigned long)[metadata length]);
+  
+  if (!uri || uri.length == 0) {
+    NSLog(@"KTX2PlayerView: Invalid source - missing uri");
+    return;
+  }
+  
+  // Check if source changed
+  if ([_sourceUri isEqualToString:uri] && _isSourceLoaded) {
+    NSLog(@"KTX2PlayerView: Source unchanged and already loaded, skipping");
+    return;
+  }
+  
+  _source = [source copy];
+  _sourceUri = [uri copy];
+  self.metadata = [metadata copy];
+  _isSourceLoaded = NO;
+  _isDestroyed = NO;
+  
+  NSLog(@"KTX2PlayerView: Loading source...");
+  [self notifyStateChange:@"loading"];
+  [self loadKTX2WithSource:source];
+}
+
+- (void)notifyStateChange:(NSString *)state
+{
+  if (self.onStateChange) {
+    self.onStateChange(@{@"state": state});
+  }
+}
+
+- (void)notifyFrameUpdate
+{
+  if (self.onFrameUpdate) {
+    self.onFrameUpdate(@{
+      @"frame": @(self.currentFrame),
+      @"totalFrames": @(self.totalFrames)
+    });
+  }
+}
+
+- (void)notifyFinished
+{
+  if (self.onFinished) {
+    self.onFinished(@{});
+  }
+}
+
+- (void)notifyError:(NSString *)error
+{
+  if (self.onError) {
+    self.onError(@{@"error": error ?: @"Unknown error"});
+  }
+}
+
+#pragma mark - Caching
+
+- (NSData *)loadDataFromURLWithCaching:(NSString *)urlString stripIndex:(NSInteger)stripIndex
+{
+  NSFileManager *fileManager = [NSFileManager defaultManager];
+  NSURL *cachesDir = [[fileManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
+  
+  NSURL *cacheFileURL;
+  
+  if (self.cacheKey && self.cacheKey.length > 0) {
+    // Use cacheKey as path from caches directory
+    // For multi-strip, append strip index to cacheKey
+    NSString *cacheKeyPath = self.cacheKey;
+    if (self.stripCount > 1) {
+      NSString *ext = [cacheKeyPath pathExtension];
+      NSString *basePath = [cacheKeyPath stringByDeletingPathExtension];
+      cacheKeyPath = [NSString stringWithFormat:@"%@_strip%ld.%@", basePath, (long)stripIndex, ext];
+    }
+    
+    cacheFileURL = [cachesDir URLByAppendingPathComponent:cacheKeyPath];
+    
+    // Create intermediate directories
+    NSURL *parentDir = [cacheFileURL URLByDeletingLastPathComponent];
+    NSError *dirError = nil;
+    [fileManager createDirectoryAtURL:parentDir withIntermediateDirectories:YES attributes:nil error:&dirError];
+    if (dirError) {
+      NSLog(@"KTX2PlayerView: Failed to create cache directory: %@", dirError);
+    }
+    
+    NSLog(@"KTX2PlayerView: Using cacheKey: %@ -> %@", cacheKeyPath, cacheFileURL.path);
+  } else {
+    // Use hash-based caching in ktx2-cache subdirectory
+    NSURL *ktx2CacheDir = [cachesDir URLByAppendingPathComponent:@"ktx2-cache"];
+    [fileManager createDirectoryAtURL:ktx2CacheDir withIntermediateDirectories:YES attributes:nil error:nil];
+    
+    // Create hash from URL
+    const char *urlCString = [urlString UTF8String];
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *urlCString++)) {
+      hash = ((hash << 5) + hash) + c;
+    }
+    
+    NSString *cacheFileName = [NSString stringWithFormat:@"%016lx.ktx2", hash];
+    cacheFileURL = [ktx2CacheDir URLByAppendingPathComponent:cacheFileName];
+    
+    NSLog(@"KTX2PlayerView: Using hash-based cache: %@", cacheFileURL.path);
+  }
+  
+  // Check if cached file exists
+  if ([fileManager fileExistsAtPath:cacheFileURL.path]) {
+    NSLog(@"KTX2PlayerView: Using cached file: %@", cacheFileURL.path);
+    return [NSData dataWithContentsOfURL:cacheFileURL];
+  }
+  
+  // Download from URL
+  NSURL *url = [NSURL URLWithString:urlString];
+  NSError *downloadError = nil;
+  NSData *downloadedData = [NSData dataWithContentsOfURL:url options:0 error:&downloadError];
+  
+  if (downloadError || !downloadedData) {
+    NSLog(@"KTX2PlayerView: Failed to download: %@, error: %@", urlString, downloadError);
+    return nil;
+  }
+  
+  // Save to cache
+  NSError *writeError = nil;
+  [downloadedData writeToURL:cacheFileURL options:NSDataWritingAtomic error:&writeError];
+  if (writeError) {
+    NSLog(@"KTX2PlayerView: Failed to write cache file: %@", writeError);
+  } else {
+    NSLog(@"KTX2PlayerView: Cached file to: %@", cacheFileURL.path);
+  }
+  
+  return downloadedData;
+}
+
+- (void)setupMetal
+{
+  // Create vertex shader
+  NSString *vertexShaderSource = @"#include <metal_stdlib>\n"
+                                  "using namespace metal;\n"
+                                  "struct VertexOut {\n"
+                                  "  float4 position [[position]];\n"
+                                  "  float2 texCoord;\n"
+                                  "};\n"
+                                  "vertex VertexOut vertex_main(uint vertexID [[vertex_id]]) {\n"
+                                  "  VertexOut out;\n"
+                                  "  const float2 positions[6] = {\n"
+                                  "    float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0),\n"
+                                  "    float2(-1.0, 1.0), float2(1.0, -1.0), float2(1.0, 1.0)\n"
+                                  "  };\n"
+                                  "  const float2 texCoords[6] = {\n"
+                                  "    float2(0.0, 1.0), float2(1.0, 1.0), float2(0.0, 0.0),\n"
+                                  "    float2(0.0, 0.0), float2(1.0, 1.0), float2(1.0, 0.0)\n"
+                                  "  };\n"
+                                  "  out.position = float4(positions[vertexID], 0.0, 1.0);\n"
+                                  "  out.texCoord = texCoords[vertexID];\n"
+                                  "  return out;\n"
+                                  "}";
+  
+  // Create fragment shader with grid support (must include VertexOut struct since shaders compile separately)
+  NSString *fragmentShaderSource = @"#include <metal_stdlib>\n"
+                                    "using namespace metal;\n"
+                                    "struct VertexOut {\n"
+                                    "  float4 position [[position]];\n"
+                                    "  float2 texCoord;\n"
+                                    "};\n"
+                                    "struct Uniforms {\n"
+                                    "  float4 frameUV;\n"
+                                    "};\n"
+                                    "fragment float4 fragment_main(VertexOut in [[stage_in]],\n"
+                                    "                             texture2d<float> tex [[texture(0)]],\n"
+                                    "                             sampler s [[sampler(0)]],\n"
+                                    "                             constant Uniforms &uniforms [[buffer(0)]]) {\n"
+                                    "  float2 uv = mix(uniforms.frameUV.xy, uniforms.frameUV.zw, in.texCoord);\n"
+                                    "  return tex.sample(s, uv);\n"
+                                    "}";
+  
+  NSLog(@"KTX2PlayerView: Compiling Metal shaders...");
+  
+  NSError *error = nil;
+  id<MTLLibrary> vertexLibrary = [self.device newLibraryWithSource:vertexShaderSource options:nil error:&error];
+  if (error) {
+    NSLog(@"KTX2PlayerView: Vertex shader compilation error: %@", error);
+  }
+  id<MTLFunction> vertexFunction = [vertexLibrary newFunctionWithName:@"vertex_main"];
+  if (!vertexFunction) {
+    NSLog(@"KTX2PlayerView: Failed to get vertex_main function!");
+  }
+  
+  error = nil;
+  id<MTLLibrary> fragmentLibrary = [self.device newLibraryWithSource:fragmentShaderSource options:nil error:&error];
+  if (error) {
+    NSLog(@"KTX2PlayerView: Fragment shader compilation error: %@", error);
+  }
+  id<MTLFunction> fragmentFunction = [fragmentLibrary newFunctionWithName:@"fragment_main"];
+  if (!fragmentFunction) {
+    NSLog(@"KTX2PlayerView: Failed to get fragment_main function!");
+  }
+  
+  NSLog(@"KTX2PlayerView: Shader compilation complete. vertex=%p, fragment=%p", vertexFunction, fragmentFunction);
+  
+  // Create pipeline
+  MTLRenderPipelineDescriptor *pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+  pipelineDescriptor.vertexFunction = vertexFunction;
+  pipelineDescriptor.fragmentFunction = fragmentFunction;
+  pipelineDescriptor.colorAttachments[0].pixelFormat = self.colorPixelFormat;
+  pipelineDescriptor.colorAttachments[0].blendingEnabled = YES;
+  pipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  pipelineDescriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+  pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+  pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  
+  error = nil;
+  self.pipelineState = [self.device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
+  
+  if (error) {
+    NSLog(@"KTX2PlayerView: Failed to create pipeline state: %@", error);
+  } else {
+    NSLog(@"KTX2PlayerView: Pipeline state created successfully: %p", self.pipelineState);
+  }
+}
+
+- (void)setupVertexData
+{
+  // Create uniform buffer for frame UVs
+  self.uniformBuffer = [self.device newBufferWithLength:sizeof(float) * 4 options:MTLResourceStorageModeShared];
+  
+  // Create sampler state
+  MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+  samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
+  samplerDescriptor.magFilter = MTLSamplerMinMagFilterLinear;
+  samplerDescriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+  samplerDescriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+  _samplerState = [self.device newSamplerStateWithDescriptor:samplerDescriptor];
+}
+
+- (void)loadKTX2WithSource:(NSDictionary *)source
+{
+  NSString *uri = source[@"uri"];
+  NSString *metadataJson = source[@"metadata"];
+  
+  // Store base path for strip file loading
+  _basePath = [[uri stringByDeletingLastPathComponent] copy];
+  
+  // Parse metadata from prop (passed as JSON string from React Native)
+  NSData *jsonData = [metadataJson dataUsingEncoding:NSUTF8StringEncoding];
+  if (!jsonData) {
+    NSLog(@"KTX2PlayerView: No metadata provided");
+    [self notifyError:@"No metadata provided"];
+    return;
+  }
+  
+  NSError *error;
+  NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&error];
+  if (error) {
+    NSLog(@"KTX2PlayerView: Failed to parse metadata: %@", error);
+    [self notifyError:[NSString stringWithFormat:@"Failed to parse metadata: %@", error.localizedDescription]];
+    return;
+  }
+  
+  // Parse metadata
+  self.totalFrames = [metadata[@"frameCount"] integerValue];
+  self.framesPerRow = [metadata[@"framesPerRow"] integerValue] ?: 1;
+  self.framesPerStrip = [metadata[@"framesPerStrip"] integerValue] ?: self.totalFrames;
+  self.stripCount = [metadata[@"stripCount"] integerValue] ?: 1;
+  self.frameWidth = [metadata[@"frameWidth"] integerValue];
+  self.frameHeight = [metadata[@"frameHeight"] integerValue];
+  self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+  self.frameInterval = 1.0 / self.frameRate;
+  _stripsMetadata = metadata[@"strips"];
+  
+  NSLog(@"KTX2PlayerView: Metadata: %ld frames, %ldx%ld, %.1f fps, %ld strips",
+        (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight,
+        self.frameRate, (long)self.stripCount);
+  
+  // Load strip textures
+  [self loadStripTextures:metadata basePath:_basePath sourceUri:uri];
+}
+
+- (void)loadStripTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri
+{
+  // Perform loading and transcoding on background thread to avoid blocking main thread
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    NSMutableArray<NSDictionary *> *loadedStrips = [NSMutableArray array];
+    NSArray *stripsArray = metadata[@"strips"];
+    
+    for (NSInteger i = 0; i < self.stripCount; i++) {
+      NSString *stripPath;
+      
+      if (self.stripCount > 1 && stripsArray && i < stripsArray.count) {
+        NSString *stripFilename = stripsArray[i][@"file"];
+        if (stripFilename) {
+          stripPath = [basePath stringByAppendingPathComponent:stripFilename];
+        } else {
+          NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_strip0.ktx2" withString:@""];
+          baseName = [baseName stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
+          stripPath = [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_strip%ld.ktx2", baseName, (long)i]];
+        }
+      } else {
+        stripPath = sourceUri;
+      }
+      
+      NSLog(@"KTX2PlayerView: Loading strip %ld: %@", (long)i, stripPath);
+      
+      // Load data from URL or file path (safe on background thread)
+      NSData *ktx2Data = nil;
+      if ([stripPath hasPrefix:@"http://"] || [stripPath hasPrefix:@"https://"]) {
+        // HTTP URL - use caching
+        ktx2Data = [self loadDataFromURLWithCaching:stripPath stripIndex:i];
+      } else if ([stripPath hasPrefix:@"file://"]) {
+        NSURL *fileURL = [NSURL URLWithString:stripPath];
+        ktx2Data = [NSData dataWithContentsOfURL:fileURL];
+      } else {
+        ktx2Data = [NSData dataWithContentsOfFile:stripPath];
+      }
+      
+      if (!ktx2Data) {
+        NSLog(@"KTX2PlayerView: Failed to load strip file: %@", stripPath);
+        continue;
+      }
+      
+      NSLog(@"KTX2PlayerView: Strip %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
+      
+      // Transcode using Basis Universal KTX2 transcoder
+      basist::ktx2_transcoder transcoder;
+      if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
+        NSLog(@"KTX2PlayerView: Failed to init KTX2 transcoder for strip %ld", (long)i);
+        continue;
+      }
+      
+      if (!transcoder.start_transcoding()) {
+        NSLog(@"KTX2PlayerView: Failed to start transcoding for strip %ld", (long)i);
+        continue;
+      }
+      
+      uint32_t width = transcoder.get_width();
+      uint32_t height = transcoder.get_height();
+      NSLog(@"KTX2PlayerView: Strip %ld dimensions: %dx%d", (long)i, width, height);
+      
+      // Calculate transcoded data size
+      uint32_t dataSize;
+      uint32_t blocksX = 0, blocksY = 0;
+      
+      if (self->_useCompressedFormat) {
+        blocksX = (width + 3) / 4;
+        blocksY = (height + 3) / 4;
+        dataSize = blocksX * blocksY * 16;
+      } else {
+        dataSize = width * height * 4;
+      }
+      
+      // Allocate and transcode
+      NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
+      if (!transcoder.transcode_image_level(0, 0, 0, (uint8_t*)[transcodedData mutableBytes], dataSize, self->_targetFormat, 0)) {
+        NSLog(@"KTX2PlayerView: Failed to transcode strip %ld", (long)i);
+        continue;
+      }
+      
+      // Store strip info for main thread
+      [loadedStrips addObject:@{
+        @"data": transcodedData,
+        @"width": @(width),
+        @"height": @(height),
+        @"blocksX": @(blocksX),
+        @"blocksY": @(blocksY)
+      }];
+      
+      NSLog(@"KTX2PlayerView: Transcoded strip %ld successfully", (long)i);
+    }
+    
+    // Dispatch to main thread for Metal texture creation and UI updates
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (self->_isDestroyed) {
+        NSLog(@"KTX2PlayerView: View destroyed during loading, aborting");
+        return;
+      }
+      
+      NSMutableArray *textures = [NSMutableArray array];
+      NSMutableArray *stripWidths = [NSMutableArray array];
+      NSMutableArray *stripHeights = [NSMutableArray array];
+      self->_transcodedData.clear();
+      
+      for (NSDictionary *stripInfo in loadedStrips) {
+        NSData *data = stripInfo[@"data"];
+        uint32_t width = [stripInfo[@"width"] unsignedIntValue];
+        uint32_t height = [stripInfo[@"height"] unsignedIntValue];
+        uint32_t blocksX = [stripInfo[@"blocksX"] unsignedIntValue];
+        
+        // Create Metal texture
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
+                                                                                             width:width
+                                                                                            height:height
+                                                                                         mipmapped:NO];
+        descriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [self.device newTextureWithDescriptor:descriptor];
+        
+        NSUInteger bytesPerRow = self->_useCompressedFormat ? (blocksX * 16) : (width * 4);
+        
+        [texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                   mipmapLevel:0
+                     withBytes:[data bytes]
+                   bytesPerRow:bytesPerRow];
+        
+        [textures addObject:texture];
+        [stripWidths addObject:@(width)];
+        [stripHeights addObject:@(height)];
+        
+        NSLog(@"KTX2PlayerView: Created texture %p (%dx%d)", texture, width, height);
+      }
+      
+      self.stripTextures = [textures copy];
+      self->_stripWidths = [stripWidths copy];
+      self->_stripHeights = [stripHeights copy];
+      NSLog(@"KTX2PlayerView: Loaded %lu strip textures total", (unsigned long)self.stripTextures.count);
+      
+      if (self.stripTextures.count == 0) {
+        [self notifyError:@"No textures loaded"];
+        return;
+      }
+      
+      self->_isSourceLoaded = YES;
+      self.currentTexture = self.stripTextures[0];
+      [self updateUniforms];
+      [self notifyStateChange:@"ready"];
+      
+      if (self.autoPlay && self.stripTextures.count > 0) {
+        [self play];
+      }
+    });
+  });
+}
+
+- (void)play
+{
+  NSLog(@"KTX2PlayerView: play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu", 
+        self.isPlaying, (long)self.totalFrames, (unsigned long)self.stripTextures.count);
+  
+  if (!self.isPlaying && self.totalFrames > 0) {
+    NSLog(@"KTX2PlayerView: Starting playback...");
+    self.isPlaying = YES;
+    self.lastFrameTime = CACurrentMediaTime();
+    
+    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
+    self.displayLink.preferredFramesPerSecond = (NSInteger)self.frameRate;
+    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    
+    [self notifyStateChange:@"playing"];
+  }
+}
+
+- (void)pause
+{
+  if (self.isPlaying) {
+    self.isPlaying = NO;
+    if (self.displayLink) {
+      [self.displayLink invalidate];
+      self.displayLink = nil;
+    }
+    [self notifyStateChange:@"paused"];
+  }
+}
+
+- (void)stop
+{
+  [self pause];
+  self.currentFrame = 0;
+  [self updateUniforms];
+  [self setNeedsDisplay];
+  [self notifyStateChange:@"stopped"];
+}
+
+- (void)seekToFrame:(NSInteger)frame
+{
+  self.currentFrame = MAX(0, MIN(frame, self.totalFrames - 1));
+  [self updateUniforms];
+  [self setNeedsDisplay];
+}
+
+- (void)setPlaybackSpeed:(CGFloat)speed
+{
+  _playbackSpeed = speed;
+  _frameInterval = 1.0 / (_frameRate * speed);
+}
+
+- (void)updateFrame
+{
+  if (!self.isPlaying) return;
+  
+  CFTimeInterval currentTime = CACurrentMediaTime();
+  CFTimeInterval elapsed = currentTime - self.lastFrameTime;
+  
+  if (elapsed >= self.frameInterval / self.playbackSpeed) {
+    self.lastFrameTime = currentTime - fmod(elapsed, self.frameInterval / self.playbackSpeed);
+    
+    self.currentFrame++;
+    
+    if (self.currentFrame >= self.totalFrames) {
+      if (self.loop) {
+        self.currentFrame = 0;
+      } else {
+        self.isPlaying = NO;
+        if (self.displayLink) {
+          [self.displayLink invalidate];
+          self.displayLink = nil;
+        }
+        [self notifyFinished];
+        return;
+      }
+    }
+    
+    if (self.enableFrameEvents) {
+      [self notifyFrameUpdate];
+    }
+    [self updateUniforms];
+    [self setNeedsDisplay];
+  }
+}
+
+- (void)updateUniforms
+{
+  // Calculate frame UV based on 2D grid layout
+  NSInteger stripIndex = self.framesPerStrip > 0 ? self.currentFrame / self.framesPerStrip : 0;
+  stripIndex = MIN(stripIndex, (NSInteger)self.stripTextures.count - 1);
+  NSInteger frameInStrip = self.framesPerStrip > 0 ? self.currentFrame % self.framesPerStrip : self.currentFrame;
+  
+  NSInteger col = self.framesPerRow > 0 ? frameInStrip % self.framesPerRow : 0;
+  NSInteger row = self.framesPerRow > 0 ? frameInStrip / self.framesPerRow : 0;
+  
+  // Get strip dimensions from metadata or actual texture
+  NSInteger stripWidth, stripHeight;
+  
+  if (_stripsMetadata && stripIndex < [_stripsMetadata count]) {
+    NSDictionary *stripInfo = _stripsMetadata[stripIndex];
+    NSInteger cols = [stripInfo[@"columns"] integerValue] ?: self.framesPerRow;
+    NSInteger rows = [stripInfo[@"rows"] integerValue] ?: ((self.framesPerStrip + self.framesPerRow - 1) / self.framesPerRow);
+    stripWidth = cols * self.frameWidth;
+    stripHeight = rows * self.frameHeight;
+  } else if (stripIndex < _stripWidths.count) {
+    // Use actual texture dimensions
+    stripWidth = [_stripWidths[stripIndex] integerValue];
+    stripHeight = [_stripHeights[stripIndex] integerValue];
+  } else {
+    // Fallback calculation
+    stripWidth = self.framesPerRow * self.frameWidth;
+    if (self.stripCount > 1) {
+      NSInteger framesInThisStrip = MIN(self.framesPerStrip, self.totalFrames - stripIndex * self.framesPerStrip);
+      stripHeight = ((framesInThisStrip + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
+    } else {
+      stripHeight = ((self.totalFrames + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
+    }
+  }
+  
+  // Calculate UV coordinates
+  float minU = (col * self.frameWidth) / (float)stripWidth;
+  float maxU = ((col + 1) * self.frameWidth) / (float)stripWidth;
+  float minV = (row * self.frameHeight) / (float)stripHeight;
+  float maxV = ((row + 1) * self.frameHeight) / (float)stripHeight;
+  
+  float *uniforms = (float *)[self.uniformBuffer contents];
+  uniforms[0] = minU;
+  uniforms[1] = minV;
+  uniforms[2] = maxU;
+  uniforms[3] = maxV;
+  
+  // Update current texture based on strip index
+  if (stripIndex < (NSInteger)self.stripTextures.count) {
+    self.currentTexture = self.stripTextures[stripIndex];
+  }
+}
+
+- (void)drawInMTKView:(MTKView *)view
+{
+  static int drawCount = 0;
+  
+  if (!self.currentTexture || !self.pipelineState) {
+    if (drawCount < 5) {
+      NSLog(@"KTX2PlayerView: drawInMTKView - skipping (texture=%p, pipeline=%p)", self.currentTexture, self.pipelineState);
+    }
+    drawCount++;
+    return;
+  }
+  
+  if (drawCount < 5) {
+    NSLog(@"KTX2PlayerView: drawInMTKView - rendering frame %ld", (long)self.currentFrame);
+    drawCount++;
+  }
+  
+  id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+  
+  MTLRenderPassDescriptor *renderPassDescriptor = view.currentRenderPassDescriptor;
+  if (renderPassDescriptor) {
+    id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+    
+    [renderEncoder setRenderPipelineState:self.pipelineState];
+    [renderEncoder setFragmentTexture:self.currentTexture atIndex:0];
+    [renderEncoder setFragmentSamplerState:_samplerState atIndex:0];
+    [renderEncoder setFragmentBuffer:self.uniformBuffer offset:0 atIndex:0];
+    
+    [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    [renderEncoder endEncoding];
+    
+    [commandBuffer presentDrawable:view.currentDrawable];
+  }
+  
+  [commandBuffer commit];
+}
+
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size
+{
+  // Handle view size changes if needed
+}
+
+#pragma mark - Lifecycle
+
+- (void)cleanup
+{
+  NSLog(@"KTX2PlayerView: cleanup");
+  _isDestroyed = YES;
+  _isSourceLoaded = NO;
+  
+  // Stop playback
+  self.isPlaying = NO;
+  if (self.displayLink) {
+    [self.displayLink invalidate];
+    self.displayLink = nil;
+  }
+  
+  // Release textures
+  self.stripTextures = nil;
+  self.currentTexture = nil;
+  _transcodedData.clear();
+}
+
+- (void)willMoveToSuperview:(UIView *)newSuperview
+{
+  [super willMoveToSuperview:newSuperview];
+  
+  if (newSuperview == nil) {
+    // View is being removed - cleanup
+    NSLog(@"KTX2PlayerView: willMoveToSuperview nil - cleaning up");
+    [self cleanup];
+  } else {
+    // View is being added - restart if we have a source
+    NSLog(@"KTX2PlayerView: willMoveToSuperview - view added");
+    _isDestroyed = NO;
+    
+    // If we have a source but it's not loaded, reload it
+    if (_source && !_isSourceLoaded) {
+      NSLog(@"KTX2PlayerView: Restarting playback after view re-added");
+      [self loadKTX2WithSource:_source];
+    }
+  }
+}
+
+- (void)didMoveToWindow
+{
+  [super didMoveToWindow];
+  
+  if (self.window == nil) {
+    // View removed from window - pause but don't cleanup yet
+    NSLog(@"KTX2PlayerView: didMoveToWindow nil - pausing");
+    [self pause];
+  } else if (_source && _isSourceLoaded && self.autoPlay && !self.isPlaying) {
+    // View added to window and we have loaded source - resume
+    NSLog(@"KTX2PlayerView: didMoveToWindow - resuming playback");
+    [self play];
+  }
+}
+
+- (void)dealloc
+{
+  NSLog(@"KTX2PlayerView: dealloc");
+  [self cleanup];
+}
+
+@end

@@ -1,0 +1,64 @@
+{
+  "name": "react-native-ktx2player",
+  "version": "1.0.0",
+  "description": "React Native module for playing KTX2 animated textures with 2D grid layout and multi-strip support",
+  "main": "index.js",
+  "types": "src/index.d.ts",
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "prepublishOnly": "npm run setup",
+    "clean": "rm -rf vendor ios/vendor android/src/main/cpp/basis_universal",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "codegenConfig": {
+    "name": "RTNKtx2PlayerSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.ktx2player"
+    }
+  },
+  "keywords": [
+    "react-native",
+    "ktx2",
+    "basis-universal",
+    "animation",
+    "texture",
+    "sprite-sheet",
+    "astc",
+    "uastc",
+    "gpu-texture",
+    "metal",
+    "opengl"
+  ],
+  "author": "",
+  "license": "MIT",
+  "homepage": "https://github.com/user/react-native-ktx2player#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/user/react-native-ktx2player.git"
+  },
+  "bugs": {
+    "url": "https://github.com/user/react-native-ktx2player/issues"
+  },
+  "files": [
+    "android/",
+    "ios/",
+    "src/",
+    "vendor/",
+    "scripts/",
+    "index.js",
+    "react-native-ktx2player.podspec",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": ">=16.8.0",
+    "react-native": ">=0.60.0"
+  },
+  "devDependencies": {
+    "react": "^18.0.0",
+    "react-native": "^0.72.0",
+    "@types/react": "^18.0.0",
+    "typescript": "^5.0.0"
+  }
+}
