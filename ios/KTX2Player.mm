@@ -19,9 +19,9 @@
   BOOL _basisInitialized;
   NSString *_basePath;
   NSString *_sourceUri;
-  NSArray *_stripsMetadata;
-  NSArray<NSNumber *> *_stripWidths;
-  NSArray<NSNumber *> *_stripHeights;
+  NSArray *_partsMetadata;
+  NSArray<NSNumber *> *_partWidths;
+  NSArray<NSNumber *> *_partHeights;
   BOOL _isSourceLoaded;
   BOOL _isDestroyed;
 }
@@ -172,7 +172,7 @@
 
 #pragma mark - Caching
 
-- (NSData *)loadDataFromURLWithCaching:(NSString *)urlString stripIndex:(NSInteger)stripIndex
+- (NSData *)loadDataFromURLWithCaching:(NSString *)urlString partIndex:(NSInteger)partIndex
 {
   NSFileManager *fileManager = [NSFileManager defaultManager];
   NSURL *cachesDir = [[fileManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
@@ -181,12 +181,12 @@
   
   if (self.cacheKey && self.cacheKey.length > 0) {
     // Use cacheKey as path from caches directory
-    // For multi-strip, append strip index to cacheKey
+    // For multi-part, append part index to cacheKey
     NSString *cacheKeyPath = self.cacheKey;
-    if (self.stripCount > 1) {
+    if (self.partCount > 1) {
       NSString *ext = [cacheKeyPath pathExtension];
       NSString *basePath = [cacheKeyPath stringByDeletingPathExtension];
-      cacheKeyPath = [NSString stringWithFormat:@"%@_strip%ld.%@", basePath, (long)stripIndex, ext];
+      cacheKeyPath = [NSString stringWithFormat:@"%@_%ld.%@", basePath, (long)partIndex, ext];
     }
     
     cacheFileURL = [cachesDir URLByAppendingPathComponent:cacheKeyPath];
@@ -355,7 +355,7 @@
   NSString *uri = source[@"uri"];
   NSString *metadataJson = source[@"metadata"];
   
-  // Store base path for strip file loading
+  // Store base path for part file loading
   _basePath = [[uri stringByDeletingLastPathComponent] copy];
   
   // Parse metadata from prop (passed as JSON string from React Native)
@@ -374,84 +374,84 @@
     return;
   }
   
-  // Parse metadata
+  // Parse metadata (support both new 'part' and legacy 'strip' terminology)
   self.totalFrames = [metadata[@"frameCount"] integerValue];
   self.framesPerRow = [metadata[@"framesPerRow"] integerValue] ?: 1;
-  self.framesPerStrip = [metadata[@"framesPerStrip"] integerValue] ?: self.totalFrames;
-  self.stripCount = [metadata[@"stripCount"] integerValue] ?: 1;
+  self.framesPerPart = [metadata[@"framesPerPart"] integerValue] ?: [metadata[@"framesPerStrip"] integerValue] ?: self.totalFrames;
+  self.partCount = [metadata[@"partCount"] integerValue] ?: [metadata[@"stripCount"] integerValue] ?: 1;
   self.frameWidth = [metadata[@"frameWidth"] integerValue];
   self.frameHeight = [metadata[@"frameHeight"] integerValue];
   self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
   self.frameInterval = 1.0 / self.frameRate;
-  _stripsMetadata = metadata[@"strips"];
+  _partsMetadata = metadata[@"parts"] ?: metadata[@"strips"];
   
-  NSLog(@"KTX2PlayerView: Metadata: %ld frames, %ldx%ld, %.1f fps, %ld strips",
+  NSLog(@"KTX2PlayerView: Metadata: %ld frames, %ldx%ld, %.1f fps, %ld parts",
         (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight,
-        self.frameRate, (long)self.stripCount);
+        self.frameRate, (long)self.partCount);
   
-  // Load strip textures
-  [self loadStripTextures:metadata basePath:_basePath sourceUri:uri];
+  // Load part textures
+  [self loadPartTextures:metadata basePath:_basePath sourceUri:uri];
 }
 
-- (void)loadStripTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri
+- (void)loadPartTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri
 {
   // Perform loading and transcoding on background thread to avoid blocking main thread
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    NSMutableArray<NSDictionary *> *loadedStrips = [NSMutableArray array];
-    NSArray *stripsArray = metadata[@"strips"];
+    NSMutableArray<NSDictionary *> *loadedParts = [NSMutableArray array];
+    NSArray *partsArray = metadata[@"parts"] ?: metadata[@"strips"];
     
-    for (NSInteger i = 0; i < self.stripCount; i++) {
-      NSString *stripPath;
+    for (NSInteger i = 0; i < self.partCount; i++) {
+      NSString *partPath;
       
-      if (self.stripCount > 1 && stripsArray && i < stripsArray.count) {
-        NSString *stripFilename = stripsArray[i][@"file"];
-        if (stripFilename) {
-          stripPath = [basePath stringByAppendingPathComponent:stripFilename];
+      if (self.partCount > 1 && partsArray && i < partsArray.count) {
+        NSString *partFilename = partsArray[i][@"file"];
+        if (partFilename) {
+          partPath = [basePath stringByAppendingPathComponent:partFilename];
         } else {
-          NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_strip0.ktx2" withString:@""];
+          NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
           baseName = [baseName stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
-          stripPath = [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_strip%ld.ktx2", baseName, (long)i]];
+          partPath = [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld.ktx2", baseName, (long)i]];
         }
       } else {
-        stripPath = sourceUri;
+        partPath = sourceUri;
       }
       
-      NSLog(@"KTX2PlayerView: Loading strip %ld: %@", (long)i, stripPath);
+      NSLog(@"KTX2PlayerView: Loading part %ld: %@", (long)i, partPath);
       
       // Load data from URL or file path (safe on background thread)
       NSData *ktx2Data = nil;
-      if ([stripPath hasPrefix:@"http://"] || [stripPath hasPrefix:@"https://"]) {
+      if ([partPath hasPrefix:@"http://"] || [partPath hasPrefix:@"https://"]) {
         // HTTP URL - use caching
-        ktx2Data = [self loadDataFromURLWithCaching:stripPath stripIndex:i];
-      } else if ([stripPath hasPrefix:@"file://"]) {
-        NSURL *fileURL = [NSURL URLWithString:stripPath];
+        ktx2Data = [self loadDataFromURLWithCaching:partPath partIndex:i];
+      } else if ([partPath hasPrefix:@"file://"]) {
+        NSURL *fileURL = [NSURL URLWithString:partPath];
         ktx2Data = [NSData dataWithContentsOfURL:fileURL];
       } else {
-        ktx2Data = [NSData dataWithContentsOfFile:stripPath];
+        ktx2Data = [NSData dataWithContentsOfFile:partPath];
       }
       
       if (!ktx2Data) {
-        NSLog(@"KTX2PlayerView: Failed to load strip file: %@", stripPath);
+        NSLog(@"KTX2PlayerView: Failed to load part file: %@", partPath);
         continue;
       }
       
-      NSLog(@"KTX2PlayerView: Strip %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
+      NSLog(@"KTX2PlayerView: Part %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
       
       // Transcode using Basis Universal KTX2 transcoder
       basist::ktx2_transcoder transcoder;
       if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
-        NSLog(@"KTX2PlayerView: Failed to init KTX2 transcoder for strip %ld", (long)i);
+        NSLog(@"KTX2PlayerView: Failed to init KTX2 transcoder for part %ld", (long)i);
         continue;
       }
       
       if (!transcoder.start_transcoding()) {
-        NSLog(@"KTX2PlayerView: Failed to start transcoding for strip %ld", (long)i);
+        NSLog(@"KTX2PlayerView: Failed to start transcoding for part %ld", (long)i);
         continue;
       }
       
       uint32_t width = transcoder.get_width();
       uint32_t height = transcoder.get_height();
-      NSLog(@"KTX2PlayerView: Strip %ld dimensions: %dx%d", (long)i, width, height);
+      NSLog(@"KTX2PlayerView: Part %ld dimensions: %dx%d", (long)i, width, height);
       
       // Calculate transcoded data size
       uint32_t dataSize;
@@ -468,12 +468,12 @@
       // Allocate and transcode
       NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
       if (!transcoder.transcode_image_level(0, 0, 0, (uint8_t*)[transcodedData mutableBytes], dataSize, self->_targetFormat, 0)) {
-        NSLog(@"KTX2PlayerView: Failed to transcode strip %ld", (long)i);
+        NSLog(@"KTX2PlayerView: Failed to transcode part %ld", (long)i);
         continue;
       }
       
-      // Store strip info for main thread
-      [loadedStrips addObject:@{
+      // Store part info for main thread
+      [loadedParts addObject:@{
         @"data": transcodedData,
         @"width": @(width),
         @"height": @(height),
@@ -481,7 +481,7 @@
         @"blocksY": @(blocksY)
       }];
       
-      NSLog(@"KTX2PlayerView: Transcoded strip %ld successfully", (long)i);
+      NSLog(@"KTX2PlayerView: Transcoded part %ld successfully", (long)i);
     }
     
     // Dispatch to main thread for Metal texture creation and UI updates
@@ -492,15 +492,15 @@
       }
       
       NSMutableArray *textures = [NSMutableArray array];
-      NSMutableArray *stripWidths = [NSMutableArray array];
-      NSMutableArray *stripHeights = [NSMutableArray array];
+      NSMutableArray *partWidths = [NSMutableArray array];
+      NSMutableArray *partHeights = [NSMutableArray array];
       self->_transcodedData.clear();
       
-      for (NSDictionary *stripInfo in loadedStrips) {
-        NSData *data = stripInfo[@"data"];
-        uint32_t width = [stripInfo[@"width"] unsignedIntValue];
-        uint32_t height = [stripInfo[@"height"] unsignedIntValue];
-        uint32_t blocksX = [stripInfo[@"blocksX"] unsignedIntValue];
+      for (NSDictionary *partInfo in loadedParts) {
+        NSData *data = partInfo[@"data"];
+        uint32_t width = [partInfo[@"width"] unsignedIntValue];
+        uint32_t height = [partInfo[@"height"] unsignedIntValue];
+        uint32_t blocksX = [partInfo[@"blocksX"] unsignedIntValue];
         
         // Create Metal texture
         MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
@@ -518,28 +518,28 @@
                    bytesPerRow:bytesPerRow];
         
         [textures addObject:texture];
-        [stripWidths addObject:@(width)];
-        [stripHeights addObject:@(height)];
+        [partWidths addObject:@(width)];
+        [partHeights addObject:@(height)];
         
         NSLog(@"KTX2PlayerView: Created texture %p (%dx%d)", texture, width, height);
       }
       
-      self.stripTextures = [textures copy];
-      self->_stripWidths = [stripWidths copy];
-      self->_stripHeights = [stripHeights copy];
-      NSLog(@"KTX2PlayerView: Loaded %lu strip textures total", (unsigned long)self.stripTextures.count);
+      self.partTextures = [textures copy];
+      self->_partWidths = [partWidths copy];
+      self->_partHeights = [partHeights copy];
+      NSLog(@"KTX2PlayerView: Loaded %lu part textures total", (unsigned long)self.partTextures.count);
       
-      if (self.stripTextures.count == 0) {
+      if (self.partTextures.count == 0) {
         [self notifyError:@"No textures loaded"];
         return;
       }
       
       self->_isSourceLoaded = YES;
-      self.currentTexture = self.stripTextures[0];
+      self.currentTexture = self.partTextures[0];
       [self updateUniforms];
       [self notifyStateChange:@"ready"];
       
-      if (self.autoPlay && self.stripTextures.count > 0) {
+      if (self.autoPlay && self.partTextures.count > 0) {
         [self play];
       }
     });
@@ -549,7 +549,7 @@
 - (void)play
 {
   NSLog(@"KTX2PlayerView: play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu", 
-        self.isPlaying, (long)self.totalFrames, (unsigned long)self.stripTextures.count);
+        self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count);
   
   if (!self.isPlaying && self.totalFrames > 0) {
     NSLog(@"KTX2PlayerView: Starting playback...");
@@ -635,42 +635,42 @@
 - (void)updateUniforms
 {
   // Calculate frame UV based on 2D grid layout
-  NSInteger stripIndex = self.framesPerStrip > 0 ? self.currentFrame / self.framesPerStrip : 0;
-  stripIndex = MIN(stripIndex, (NSInteger)self.stripTextures.count - 1);
-  NSInteger frameInStrip = self.framesPerStrip > 0 ? self.currentFrame % self.framesPerStrip : self.currentFrame;
+  NSInteger partIndex = self.framesPerPart > 0 ? self.currentFrame / self.framesPerPart : 0;
+  partIndex = MIN(partIndex, (NSInteger)self.partTextures.count - 1);
+  NSInteger frameInPart = self.framesPerPart > 0 ? self.currentFrame % self.framesPerPart : self.currentFrame;
   
-  NSInteger col = self.framesPerRow > 0 ? frameInStrip % self.framesPerRow : 0;
-  NSInteger row = self.framesPerRow > 0 ? frameInStrip / self.framesPerRow : 0;
+  NSInteger col = self.framesPerRow > 0 ? frameInPart % self.framesPerRow : 0;
+  NSInteger row = self.framesPerRow > 0 ? frameInPart / self.framesPerRow : 0;
   
-  // Get strip dimensions from metadata or actual texture
-  NSInteger stripWidth, stripHeight;
+  // Get part dimensions from metadata or actual texture
+  NSInteger partWidth, partHeight;
   
-  if (_stripsMetadata && stripIndex < [_stripsMetadata count]) {
-    NSDictionary *stripInfo = _stripsMetadata[stripIndex];
-    NSInteger cols = [stripInfo[@"columns"] integerValue] ?: self.framesPerRow;
-    NSInteger rows = [stripInfo[@"rows"] integerValue] ?: ((self.framesPerStrip + self.framesPerRow - 1) / self.framesPerRow);
-    stripWidth = cols * self.frameWidth;
-    stripHeight = rows * self.frameHeight;
-  } else if (stripIndex < _stripWidths.count) {
+  if (_partsMetadata && partIndex < [_partsMetadata count]) {
+    NSDictionary *partInfo = _partsMetadata[partIndex];
+    NSInteger cols = [partInfo[@"columns"] integerValue] ?: self.framesPerRow;
+    NSInteger rows = [partInfo[@"rows"] integerValue] ?: ((self.framesPerPart + self.framesPerRow - 1) / self.framesPerRow);
+    partWidth = cols * self.frameWidth;
+    partHeight = rows * self.frameHeight;
+  } else if (partIndex < _partWidths.count) {
     // Use actual texture dimensions
-    stripWidth = [_stripWidths[stripIndex] integerValue];
-    stripHeight = [_stripHeights[stripIndex] integerValue];
+    partWidth = [_partWidths[partIndex] integerValue];
+    partHeight = [_partHeights[partIndex] integerValue];
   } else {
     // Fallback calculation
-    stripWidth = self.framesPerRow * self.frameWidth;
-    if (self.stripCount > 1) {
-      NSInteger framesInThisStrip = MIN(self.framesPerStrip, self.totalFrames - stripIndex * self.framesPerStrip);
-      stripHeight = ((framesInThisStrip + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
+    partWidth = self.framesPerRow * self.frameWidth;
+    if (self.partCount > 1) {
+      NSInteger framesInThisPart = MIN(self.framesPerPart, self.totalFrames - partIndex * self.framesPerPart);
+      partHeight = ((framesInThisPart + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
     } else {
-      stripHeight = ((self.totalFrames + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
+      partHeight = ((self.totalFrames + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
     }
   }
   
   // Calculate UV coordinates
-  float minU = (col * self.frameWidth) / (float)stripWidth;
-  float maxU = ((col + 1) * self.frameWidth) / (float)stripWidth;
-  float minV = (row * self.frameHeight) / (float)stripHeight;
-  float maxV = ((row + 1) * self.frameHeight) / (float)stripHeight;
+  float minU = (col * self.frameWidth) / (float)partWidth;
+  float maxU = ((col + 1) * self.frameWidth) / (float)partWidth;
+  float minV = (row * self.frameHeight) / (float)partHeight;
+  float maxV = ((row + 1) * self.frameHeight) / (float)partHeight;
   
   float *uniforms = (float *)[self.uniformBuffer contents];
   uniforms[0] = minU;
@@ -678,9 +678,9 @@
   uniforms[2] = maxU;
   uniforms[3] = maxV;
   
-  // Update current texture based on strip index
-  if (stripIndex < (NSInteger)self.stripTextures.count) {
-    self.currentTexture = self.stripTextures[stripIndex];
+  // Update current texture based on part index
+  if (partIndex < (NSInteger)self.partTextures.count) {
+    self.currentTexture = self.partTextures[partIndex];
   }
 }
 
@@ -742,7 +742,7 @@
   }
   
   // Release textures
-  self.stripTextures = nil;
+  self.partTextures = nil;
   self.currentTexture = nil;
   _transcodedData.clear();
 }

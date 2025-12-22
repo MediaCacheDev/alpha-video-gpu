@@ -82,7 +82,7 @@ At runtime:
 |---------|-------------|
 | **GPU Texture Compression** | Uses KTX2 with UASTC / ASTC / ETC2 for optimal size and quality |
 | **Sprite Sheet Layout** | Frames are packed into a 2D grid inside GPU texture limits |
-| **Automatic Splitting** | Large animations are split into multiple texture strips when needed |
+| **Automatic Splitting** | Large animations are split into multiple texture parts when needed |
 | **Alpha Transparency** | Designed specifically for transparent effects |
 | **Async Loading** | Loading and transcoding never block the UI thread |
 | **File Caching** | Optional on-device caching for remote animations |
@@ -163,11 +163,11 @@ The `source` prop includes:
   "frameHeight": 400,
   "frameRate": 30,
   "framesPerRow": 4,
-  "framesPerStrip": 64,
-  "stripCount": 2,
-  "strips": [
-    { "file": "anim_strip0.ktx2", "columns": 4, "rows": 16 },
-    { "file": "anim_strip1.ktx2", "columns": 4, "rows": 14 }
+  "framesPerPart": 64,
+  "partCount": 2,
+  "parts": [
+    { "file": "anim_0.ktx2", "columns": 4, "rows": 16 },
+    { "file": "anim_1.ktx2", "columns": 4, "rows": 14 }
   ]
 }
 ```

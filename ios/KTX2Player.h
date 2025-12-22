@@ -12,7 +12,7 @@
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
 @property (nonatomic, strong) id<MTLTexture> currentTexture;
-@property (nonatomic, strong) NSArray<id<MTLTexture>> *stripTextures;
+@property (nonatomic, strong) NSArray<id<MTLTexture>> *partTextures;
 @property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
 @property (nonatomic, strong) id<MTLBuffer> uniformBuffer;
 
@@ -34,8 +34,8 @@
 
 // Grid layout properties
 @property (nonatomic, assign) NSInteger framesPerRow;
-@property (nonatomic, assign) NSInteger framesPerStrip;
-@property (nonatomic, assign) NSInteger stripCount;
+@property (nonatomic, assign) NSInteger framesPerPart;
+@property (nonatomic, assign) NSInteger partCount;
 @property (nonatomic, assign) NSInteger frameWidth;
 @property (nonatomic, assign) NSInteger frameHeight;
 

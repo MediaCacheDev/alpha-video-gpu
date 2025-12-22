@@ -77,13 +77,13 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     // Grid layout
     private int framesPerRow = 0;
-    private int framesPerStrip = 0;
-    private int stripCount = 0;
+    private int framesPerPart = 0;
+    private int partCount = 0;
     private int frameWidth = 0;
     private int frameHeight = 0;
     
-    // Strip info
-    private static class StripInfo {
+    // Part info
+    private static class PartInfo {
         int index;
         int startFrame;
         int endFrame;
@@ -92,7 +92,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         int columns;
         String file;
     }
-    private List<StripInfo> stripInfoList = new ArrayList<>();
+    private List<PartInfo> partInfoList = new ArrayList<>();
     
     // OpenGL resources
     private EGLDisplay eglDisplay;
@@ -393,7 +393,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Load textures
         try {
-            loadStripTextures(localPath);
+            loadPartTextures(localPath);
         } catch (Exception e) {
             mainHandler.post(() -> notifyError("Failed to load textures: " + e.getMessage()));
             return;
@@ -609,75 +609,77 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         totalFrames = metadata.getInt("frameCount");
         frameRate = (float) metadata.getDouble("frameRate");
         framesPerRow = metadata.optInt("framesPerRow", 1);
-        framesPerStrip = metadata.optInt("framesPerStrip", totalFrames);
-        stripCount = metadata.optInt("stripCount", 1);
+        // Support both new 'part' and legacy 'strip' terminology
+        framesPerPart = metadata.optInt("framesPerPart", metadata.optInt("framesPerStrip", totalFrames));
+        partCount = metadata.optInt("partCount", metadata.optInt("stripCount", 1));
         
         frameIntervalNanos = (long) (1_000_000_000L / frameRate);
         
-        // Parse strips array
-        stripInfoList.clear();
-        if (metadata.has("strips")) {
-            JSONArray stripsArray = metadata.getJSONArray("strips");
-            for (int i = 0; i < stripsArray.length(); i++) {
-                JSONObject stripObj = stripsArray.getJSONObject(i);
-                StripInfo info = new StripInfo();
-                info.index = stripObj.optInt("index", i);
-                info.startFrame = stripObj.optInt("startFrame", i * framesPerStrip);
-                info.endFrame = stripObj.optInt("endFrame", info.startFrame + framesPerStrip - 1);
-                info.frameCount = stripObj.optInt("frameCount", framesPerStrip);
-                info.rows = stripObj.optInt("rows", (framesPerStrip + framesPerRow - 1) / framesPerRow);
-                info.columns = stripObj.optInt("columns", framesPerRow);
-                info.file = stripObj.optString("file", null);
-                stripInfoList.add(info);
-                Log.d(TAG, "Strip " + i + ": " + info.file + " (" + info.rows + "x" + info.columns + ")");
+        // Parse parts array (support both 'parts' and legacy 'strips')
+        partInfoList.clear();
+        JSONArray partsArray = metadata.has("parts") ? metadata.getJSONArray("parts") : 
+                              (metadata.has("strips") ? metadata.getJSONArray("strips") : null);
+        if (partsArray != null) {
+            for (int i = 0; i < partsArray.length(); i++) {
+                JSONObject partObj = partsArray.getJSONObject(i);
+                PartInfo info = new PartInfo();
+                info.index = partObj.optInt("index", i);
+                info.startFrame = partObj.optInt("startFrame", i * framesPerPart);
+                info.endFrame = partObj.optInt("endFrame", info.startFrame + framesPerPart - 1);
+                info.frameCount = partObj.optInt("frameCount", framesPerPart);
+                info.rows = partObj.optInt("rows", (framesPerPart + framesPerRow - 1) / framesPerRow);
+                info.columns = partObj.optInt("columns", framesPerRow);
+                info.file = partObj.optString("file", null);
+                partInfoList.add(info);
+                Log.d(TAG, "Part " + i + ": " + info.file + " (" + info.rows + "x" + info.columns + ")");
             }
         }
         
         Log.i(TAG, "Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
-                ", " + frameRate + " fps, " + stripCount + " strips");
+                ", " + frameRate + " fps, " + partCount + " parts");
     }
     
-    private void loadStripTextures(String ktx2Path) throws Exception {
-        String basePath = ktx2Path.replaceAll("_strip\\d+\\.ktx2$", "").replaceAll("\\.ktx2$", "");
+    private void loadPartTextures(String ktx2Path) throws Exception {
+        String basePath = ktx2Path.replaceAll("_\\d+\\.ktx2$", "").replaceAll("\\.ktx2$", "");
         
         List<Integer> loadedTextureIds = new ArrayList<>();
         List<Integer> loadedTextureWidths = new ArrayList<>();
         List<Integer> loadedTextureHeights = new ArrayList<>();
         
-        if (stripCount > 1 && !stripInfoList.isEmpty()) {
-            Log.d(TAG, "Loading " + stripCount + " strip files...");
+        if (partCount > 1 && !partInfoList.isEmpty()) {
+            Log.d(TAG, "Loading " + partCount + " part files...");
             
-            for (int i = 0; i < stripCount; i++) {
-                String stripPath;
-                if (i < stripInfoList.size() && stripInfoList.get(i).file != null) {
+            for (int i = 0; i < partCount; i++) {
+                String partPath;
+                if (i < partInfoList.size() && partInfoList.get(i).file != null) {
                     File ktx2File = new File(ktx2Path);
                     File parentDir = ktx2File.getParentFile();
                     if (parentDir != null) {
-                        stripPath = new File(parentDir, stripInfoList.get(i).file).getAbsolutePath();
+                        partPath = new File(parentDir, partInfoList.get(i).file).getAbsolutePath();
                     } else {
-                        stripPath = stripInfoList.get(i).file;
+                        partPath = partInfoList.get(i).file;
                     }
                 } else {
-                    stripPath = basePath + "_strip" + i + ".ktx2";
+                    partPath = basePath + "_" + i + ".ktx2";
                 }
                 
-                Log.d(TAG, "Loading strip " + i + ": " + stripPath);
+                Log.d(TAG, "Loading part " + i + ": " + partPath);
                 
-                byte[] ktx2Data = readFileBytes(stripPath);
+                byte[] ktx2Data = readFileBytes(partPath);
                 if (ktx2Data == null) {
-                    throw new Exception("Failed to read strip file: " + stripPath);
+                    throw new Exception("Failed to read part file: " + partPath);
                 }
                 
                 int[] result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
                 if (result == null || result.length < 3) {
-                    throw new Exception("Failed to transcode strip " + i);
+                    throw new Exception("Failed to transcode part " + i);
                 }
                 
                 loadedTextureIds.add(result[0]);
                 loadedTextureWidths.add(result[1]);
                 loadedTextureHeights.add(result[2]);
                 
-                Log.d(TAG, "Loaded strip " + i + " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
+                Log.d(TAG, "Loaded part " + i + " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
             }
         } else {
             Log.d(TAG, "Loading single KTX2 file: " + ktx2Path);
@@ -727,8 +729,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Bind texture
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
-        int stripIndex = getCurrentStripIndex();
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[stripIndex]);
+        int partIndex = getCurrentPartIndex();
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[partIndex]);
         GLES30.glUniform1i(uniformTextureLocation, 0);
         
         // Set vertex attributes
@@ -754,36 +756,36 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return new float[]{0, 0, 1, 1};
         }
 
-        int stripIndex = currentFrame / framesPerStrip;
-        int frameInStrip = currentFrame % framesPerStrip;
+        int partIndex = currentFrame / framesPerPart;
+        int frameInPart = currentFrame % framesPerPart;
 
-        int col = frameInStrip % framesPerRow;
-        int row = frameInStrip / framesPerRow;
+        int col = frameInPart % framesPerRow;
+        int row = frameInPart / framesPerRow;
 
-        int stripWidth, stripHeight;
-        if (stripIndex < stripInfoList.size()) {
-            StripInfo info = stripInfoList.get(stripIndex);
-            stripWidth = info.columns * frameWidth;
-            stripHeight = info.rows * frameHeight;
-        } else if (stripIndex < textureWidths.length) {
-            stripWidth = textureWidths[stripIndex];
-            stripHeight = textureHeights[stripIndex];
+        int partWidth, partHeight;
+        if (partIndex < partInfoList.size()) {
+            PartInfo info = partInfoList.get(partIndex);
+            partWidth = info.columns * frameWidth;
+            partHeight = info.rows * frameHeight;
+        } else if (partIndex < textureWidths.length) {
+            partWidth = textureWidths[partIndex];
+            partHeight = textureHeights[partIndex];
         } else {
-            stripWidth = framesPerRow * frameWidth;
-            stripHeight = ((framesPerStrip + framesPerRow - 1) / framesPerRow) * frameHeight;
+            partWidth = framesPerRow * frameWidth;
+            partHeight = ((framesPerPart + framesPerRow - 1) / framesPerRow) * frameHeight;
         }
 
-        float minU = (col * frameWidth) / (float) stripWidth;
-        float maxU = ((col + 1) * frameWidth) / (float) stripWidth;
-        float minV = (row * frameHeight) / (float) stripHeight;
-        float maxV = ((row + 1) * frameHeight) / (float) stripHeight;
+        float minU = (col * frameWidth) / (float) partWidth;
+        float maxU = ((col + 1) * frameWidth) / (float) partWidth;
+        float minV = (row * frameHeight) / (float) partHeight;
+        float maxV = ((row + 1) * frameHeight) / (float) partHeight;
 
         return new float[]{minU, minV, maxU, maxV};
     }
     
-    private int getCurrentStripIndex() {
-        if (framesPerStrip <= 0) return 0;
-        return Math.min(currentFrame / framesPerStrip, textureIds.length - 1);
+    private int getCurrentPartIndex() {
+        if (framesPerPart <= 0) return 0;
+        return Math.min(currentFrame / framesPerPart, textureIds.length - 1);
     }
     
     private void cleanupGL() {
