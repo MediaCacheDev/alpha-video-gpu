@@ -133,16 +133,74 @@ Remote files are automatically cached. Use `cacheKey` for explicit cache control
 
 ### Local Bundled Asset (Recommended)
 
-Include a `.ktx2` file in your React Native project and use `require()` with `Image.resolveAssetSource()`:
+Include a `.ktx2` or `.glb` file in your React Native project and resolve it correctly for each platform.
+
+#### Cross-Platform Asset Resolution
+
+```jsx
+import { KTX2PlayerView } from 'react-native-ktx2player';
+import { Image, Platform } from 'react-native';
+
+// Import the asset
+const glbAsset = require('./assets/animation.glb');
+
+// Cross-platform asset resolver
+function resolveAsset(asset) {
+  // Native platforms: use Image.resolveAssetSource
+  if (Platform.OS !== 'web') {
+    const resolved = Image.resolveAssetSource(asset);
+    return resolved?.uri || null;
+  }
+  
+  // Web: Metro may return a string path directly or a number ID
+  if (typeof asset === 'string') {
+    return asset; // Already a URL path
+  }
+  
+  // Web with number ID: use expo-asset to resolve
+  if (typeof asset === 'number') {
+    const { Asset } = require('expo-asset');
+    const resolved = Asset.fromModule(asset);
+    return resolved.uri;
+  }
+  
+  // Object with uri property
+  if (asset?.uri) {
+    return asset.uri;
+  }
+  
+  return null;
+}
+
+// Usage
+const animationUri = resolveAsset(glbAsset);
+
+<KTX2PlayerView
+  style={{ width: 400, height: 400 }}
+  source={{ uri: animationUri }}
+  autoPlay
+  loop
+/>
+```
+
+#### Platform-Specific Behavior
+
+| Platform | `require()` returns | Resolution method |
+|----------|---------------------|-------------------|
+| **iOS/Android (Debug)** | Number (asset ID) | `Image.resolveAssetSource()` → Metro URL |
+| **iOS/Android (Release)** | Number (asset ID) | `Image.resolveAssetSource()` → File path |
+| **Web (Expo)** | String (URL path) | Use directly |
+| **Web (Metro)** | Number (asset ID) | `expo-asset` → URL path |
+
+#### Simple Native-Only Usage
+
+If you don't need web support, the simpler approach works:
 
 ```jsx
 import { KTX2PlayerView } from 'react-native-ktx2player';
 import { Image } from 'react-native';
 
-// Import the asset (returns an asset ID number)
 const ktx2Asset = require('./assets/animation.ktx2');
-
-// Resolve to platform-specific URI
 const resolvedAsset = Image.resolveAssetSource(ktx2Asset);
 
 <KTX2PlayerView
@@ -153,21 +211,21 @@ const resolvedAsset = Image.resolveAssetSource(ktx2Asset);
 />
 ```
 
-**Why `Image.resolveAssetSource()` is required:**
-- `require()` returns an asset ID number, not a path
-- `resolveAssetSource()` converts it to a platform-specific URI:
-  - **Debug (Metro):** `http://localhost:8081/assets/...`
-  - **iOS Release:** `file:///path/to/bundle/...`
-  - **Android Release:** Resource name resolved from APK assets
+#### Metro Configuration
 
-**Metro config:** Ensure `.ktx2` is in your asset extensions:
+Ensure your asset extensions are registered in `metro.config.js`:
 
 ```js
 // metro.config.js
-const { getDefaultConfig } = require('@react-native/metro-config');
-const config = getDefaultConfig(__dirname);
-config.resolver.assetExts.push('ktx2');
-module.exports = config;
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+const config = {
+  resolver: {
+    assetExts: [...getDefaultConfig(__dirname).resolver.assetExts, 'ktx2', 'glb'],
+  },
+};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
 ```
 
 ### Android Assets Folder (Alternative)
@@ -298,17 +356,45 @@ For separate KTX2 files (using `--no-glb` encoder flag), metadata is embedded in
 
 ## Web Support
 
-Works with React Native Web. Requires the Basis Universal transcoder for UASTC files. Copy the libs folder to your public directory of your web server:
+Works with React Native Web. Requires external scripts loaded before your app bundle.
 
-```bash
-cp -r node_modules/react-native-ktx2player/web/libs public/
-```
+### Required Scripts
 
 ```html
-<script src="/libs/basis_transcoder.js"></script>
+<!-- Zstandard decompression (for zstd-compressed KTX2/GLB files) -->
+<script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
+
+<!-- Basis Universal transcoder (for UASTC files) -->
+<script src="/basis_transcoder.js"></script>
 ```
 
-Native ASTC files on web require browser ASTC extension support (`WEBGL_compressed_texture_astc`). Most mobile browsers support this; desktop browser support varies.
+Copy the Basis transcoder to your public directory:
+
+```bash
+cp node_modules/react-native-ktx2player/web/libs/basis_transcoder.js public/
+cp node_modules/react-native-ktx2player/web/libs/basis_transcoder.wasm public/
+```
+
+### Web Texture Format Support
+
+| Format | Browser Support | Notes |
+|--------|-----------------|-------|
+| **Native ASTC** | Mobile browsers, some desktop | Requires `WEBGL_compressed_texture_astc` |
+| **UASTC** | All (transcoded) | Transcodes to BC7/ETC2/RGBA at runtime |
+| **Zstd compression** | All (with fzstd) | Requires fzstd library loaded |
+
+### Expo Web Build
+
+For Expo web builds, inject the scripts in your build process. Example post-build script:
+
+```javascript
+// Add to your build pipeline
+const scripts = `
+  <script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
+  <script src="/basis_transcoder.js"></script>
+`;
+// Inject into <head> of dist/index.html
+```
 
 ---
 

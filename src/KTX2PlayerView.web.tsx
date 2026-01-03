@@ -262,6 +262,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   const stateRef = useRef<string>('idle');
   
   const [state, setState] = useState<string>('idle');
+  const loadedSourceRef = useRef<string | null>(null);
   
   // Normalize source
   const normalizedSource = useMemo(() => {
@@ -752,14 +753,23 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
 
   // Effect: Load source when it changes
   useEffect(() => {
-    if (normalizedSource) {
-      loadSource(normalizedSource);
+    const sourceUri = normalizedSource?.uri;
+    
+    // Skip if no source or already loaded this exact URI
+    if (!sourceUri || loadedSourceRef.current === sourceUri) {
+      return;
     }
+    
+    loadedSourceRef.current = sourceUri;
+    loadSource(normalizedSource);
     
     return () => {
       stopAnimationLoop();
+      // Reset loaded ref on cleanup so re-mounting loads again
+      loadedSourceRef.current = null;
     };
-  }, [normalizedSource, loadSource, stopAnimationLoop]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [normalizedSource?.uri]); // Intentionally only depend on URI to prevent re-loads
 
   // Effect: Handle playback speed changes
   useEffect(() => {
