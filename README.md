@@ -1,91 +1,91 @@
 # React Native KTX2 Player
 
-A high-performance animation player for React Native, designed for smooth, transparent animations (like glowing buttons, effects, or UI highlights) with minimal CPU, RAM, and battery usage.
+A GPU-accelerated texture animation player for React Native (iOS, Android, Web). Plays pre-encoded KTX2 sprite sheet animations with hardware texture compression support.
 
-Instead of playing videos or swapping images every frame, this library uploads a GPU-compressed texture once and lets the GPU handle the animation entirely.
+## Overview
 
----
+This library renders animations from KTX2 texture files containing sprite sheets. Frames are packed into GPU-compressed textures and uploaded once, then animated by updating UV coordinates on the GPU.
 
-## Why this exists (in plain English)
-
-If you want an animated glow, shimmer, or effect in a mobile app, the usual options are:
-
-### ❌ Image sequences (PNG/APNG)
-- Large file sizes
-- Frames are decoded and uploaded repeatedly
-- High RAM usage
-- CPU work every frame
-
-### ❌ Videos (WebM / MP4 with alpha)
-- Smaller files, but…
-- Video decoder runs constantly
-- Frames are uploaded to the GPU every frame
-- Higher battery drain
-- Harder to control playback precisely
-
-### ✅ KTX2 + GPU textures (this library)
-- Very small files on disk
-- Uploaded to the GPU once
-- Animation runs fully on the GPU
-- Near-zero CPU usage during playback
-- Ideal for looping UI effects with transparency
-
-> **Best mental model:**  
-> This works like a tiny game engine sprite system — not a video player.
+**Key characteristics:**
+- Single texture upload per animation part (no per-frame decoding)
+- Hardware texture compression (ASTC on iOS/Android, transcoded formats on web)
+- Software RGBA fallback for emulators and unsupported devices
+- Metadata embedded in KTX2 files or provided separately
 
 ---
 
-## What this library does
+## Encoding Modes
 
-1. Takes a sequence of PNG frames
-2. Packs them into a GPU-friendly sprite sheet
-3. Compresses them using Basis Universal (KTX2)
+This player supports two encoding formats. Both require a separate encoder tool (not included in this package).
 
-At runtime:
-1. Transcodes to the device's native GPU format (ASTC / ETC2)
-2. Uploads once to the GPU
-3. Animates by changing texture coordinates (UVs)
+### Native ASTC
 
-**No per-frame decoding. No per-frame uploads.**
+Direct ASTC 4x4 block compression using `toktx` from the KTX-Software tools. Produces the highest visual quality but requires ASTC hardware support for GPU-accelerated playback.
 
----
+- **Pros:** Best quality, no runtime transcoding
+- **Cons:** Larger files than UASTC+RDO, no GPU benefit on emulators
 
-## Key Advantages
+### UASTC (Basis Universal)
 
-### 🚀 Performance
-- **CPU:** Near zero usage while playing
-- **RAM:** No per-frame allocations
-- **GPU:** Efficient sampling of compressed textures
-- **Battery:** Much lower than video playback
+Universal texture format that transcodes at runtime to the device's native GPU format (ASTC, ETC2, BC7, etc.).
 
-### 📦 File Size
-- Much smaller than PNG sequences
-- Comparable to video, but without decoder overhead
-
-### 🎨 Visual Quality
-- Full alpha transparency
-- Smooth looping animations
-- Excellent quality with ASTC / UASTC
-
-### 🔁 Perfect for UI animations
-- Glows
-- Highlights
-- Shimmers
-- Animated icons
-- Kiosk / always-on displays
+- **Pros:** Smaller files with RDO, universal GPU support
+- **Cons:** Slight quality loss vs native ASTC, transcoding overhead on first load
 
 ---
 
-## Features
+## Encoding Examples
 
-| Feature | Description |
-|---------|-------------|
-| **GPU Texture Compression** | Uses KTX2 with UASTC / ASTC / ETC2 for optimal size and quality |
-| **Sprite Sheet Layout** | Frames are packed into a 2D grid inside GPU texture limits |
-| **Automatic Splitting** | Large animations are split into multiple texture parts when needed |
-| **Alpha Transparency** | Designed specifically for transparent effects |
-| **Async Loading** | Loading and transcoding never block the UI thread |
-| **File Caching** | Optional on-device caching for remote animations |
+The encoder is a separate tool (`encode-basis.js`). Example commands:
+
+### Maximum Quality (Native ASTC)
+
+```bash
+node encode-basis.js \
+  --input ./frames \
+  --output ./animation.ktx2 \
+  --width 400 \
+  --height 400 \
+  --fps 30 \
+  --no-mipmap \
+  --astc \
+  --astc-quality exhaustive \
+  --astc-block 4x4 \
+  --zstd 22 \
+  --astc-perceptual
+```
+
+### Maximum Quality (UASTC)
+
+```bash
+node encode-basis.js \
+  --input ./frames \
+  --output ./animation.ktx2 \
+  --width 400 \
+  --height 400 \
+  --fps 30 \
+  --no-mipmap \
+  --uastc \
+  --uastc-rdo 0
+```
+
+> **Note:** `--uastc-rdo 0` disables rate-distortion optimization for maximum quality. Use `--uastc-rdo 0.5` to `--uastc-rdo 3.0` for smaller files with some quality tradeoff.
+
+---
+
+## Emulator / Fallback Behavior
+
+On devices without hardware ASTC support (iOS Simulator, Android Emulator, some browsers), the player automatically decodes ASTC textures to RGBA in software.
+
+| Platform | Hardware Support | Fallback |
+|----------|------------------|----------|
+| iOS Device | ASTC (Metal) | — |
+| iOS Simulator | None | Software ASTC→RGBA decode |
+| Android Device | ASTC or ETC2 | ETC2 or software decode |
+| Android Emulator | Usually none | Software ASTC→RGBA decode |
+| Web (desktop) | Varies (ASTC/BC7/ETC2) | Error if ASTC unsupported |
+
+**Important:** Both ASTC and UASTC modes fall back to uncompressed RGBA on emulators. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices.
 
 ---
 
@@ -98,35 +98,31 @@ npm install react-native-ktx2player
 cd ios && pod install
 ```
 
-Basis Universal is bundled — no extra native dependencies required.
+Basis Universal transcoder is bundled. No additional native dependencies required.
 
 ---
 
-## Basic Usage
+## Usage
+
+### Remote URL
 
 ```jsx
 import { KTX2PlayerView } from 'react-native-ktx2player';
 
 <KTX2PlayerView
-  style={{ width: 200, height: 200 }}
-  source={{
-    uri: 'https://example.com/animation.ktx2',
-    metadata: JSON.stringify(animationMetadata),
-  }}
+  style={{ width: 400, height: 400 }}
+  source={{ uri: 'https://example.com/animation.ktx2' }}
   autoPlay
   loop
 />
 ```
 
-### With caching and events
+Remote files are automatically cached. Use `cacheKey` for explicit cache control:
 
 ```jsx
 <KTX2PlayerView
-  style={{ width: 200, height: 200 }}
-  source={{
-    uri: 'https://example.com/glow.ktx2',
-    metadata: JSON.stringify(metadata),
-  }}
+  style={{ width: 400, height: 400 }}
+  source={{ uri: 'https://example.com/animation.ktx2' }}
   cacheKey="animations/glow.ktx2"
   autoPlay
   loop
@@ -135,26 +131,107 @@ import { KTX2PlayerView } from 'react-native-ktx2player';
 />
 ```
 
+### Local Bundled Asset (Recommended)
+
+Include a `.ktx2` file in your React Native project and use `require()` with `Image.resolveAssetSource()`:
+
+```jsx
+import { KTX2PlayerView } from 'react-native-ktx2player';
+import { Image } from 'react-native';
+
+// Import the asset (returns an asset ID number)
+const ktx2Asset = require('./assets/animation.ktx2');
+
+// Resolve to platform-specific URI
+const resolvedAsset = Image.resolveAssetSource(ktx2Asset);
+
+<KTX2PlayerView
+  style={{ width: 400, height: 400 }}
+  source={{ uri: resolvedAsset.uri }}
+  autoPlay
+  loop
+/>
+```
+
+**Why `Image.resolveAssetSource()` is required:**
+- `require()` returns an asset ID number, not a path
+- `resolveAssetSource()` converts it to a platform-specific URI:
+  - **Debug (Metro):** `http://localhost:8081/assets/...`
+  - **iOS Release:** `file:///path/to/bundle/...`
+  - **Android Release:** Resource name resolved from APK assets
+
+**Metro config:** Ensure `.ktx2` is in your asset extensions:
+
+```js
+// metro.config.js
+const { getDefaultConfig } = require('@react-native/metro-config');
+const config = getDefaultConfig(__dirname);
+config.resolver.assetExts.push('ktx2');
+module.exports = config;
+```
+
+### Android Assets Folder (Alternative)
+
+Place the file directly in Android's assets folder:
+
+```
+android/app/src/main/assets/animations/glow.ktx2
+```
+
+Then use the `asset://` URI scheme:
+
+```jsx
+<KTX2PlayerView
+  style={{ width: 400, height: 400 }}
+  source={{ uri: 'asset://animations/glow.ktx2' }}
+  autoPlay
+  loop
+/>
+```
+
+> **Note:** This approach is Android-only. For cross-platform, use the bundled asset method above.
+
+### Local File Path
+
+For files on the device filesystem:
+
+```jsx
+<KTX2PlayerView
+  style={{ width: 400, height: 400 }}
+  source={{ uri: 'file:///path/to/animation.ktx2' }}
+  autoPlay
+  loop
+/>
+```
+
 ---
 
-## How this compares to images and video
+## Multi-Part Animations
 
-| Method | CPU | RAM | GPU Uploads | File Size | Battery |
-|--------|-----|-----|-------------|-----------|---------|
-| PNG sequence | High | High | Every frame | Very large | High |
-| APNG | Medium | High | Every frame | Large | Medium |
-| Video (WebM) | Medium | Medium | Every frame | Small | Medium–High |
-| **KTX2 (this)** | **Very low** | **Low** | **Once** | **Small** | **Low** |
+For large animations that exceed GPU texture size limits, the encoder splits frames across multiple KTX2 files. All parts are loaded into GPU memory at startup.
+
+```jsx
+<KTX2PlayerView
+  source={{ uri: 'https://example.com/animation.ktx2' }}
+  parts={[
+    { uri: 'https://example.com/anim_0.ktx2' },
+    { uri: 'https://example.com/anim_1.ktx2' },
+    { uri: 'https://example.com/anim_2.ktx2' },
+  ]}
+  autoPlay
+  loop
+/>
+```
+
+The first part (`source`) contains the animation metadata. The `parts` array provides explicit URIs for all parts. The player loads and decodes all parts before playback begins, then switches between textures as frames advance.
 
 ---
 
-## Source Format
+## Metadata
 
-The `source` prop includes:
-- `uri` — URL or local path to the KTX2 file(s)
-- `metadata` — JSON describing how frames are laid out
+Animation metadata (frame count, dimensions, layout) is embedded in the KTX2 file's key-value data section by the encoder. The player reads this automatically.
 
-### Example metadata
+For multi-part animations (large frame counts split across multiple textures), metadata includes part information:
 
 ```json
 {
@@ -165,6 +242,7 @@ The `source` prop includes:
   "framesPerRow": 4,
   "framesPerPart": 64,
   "partCount": 2,
+  "mode": "astc",
   "parts": [
     { "file": "anim_0.ktx2", "columns": 4, "rows": 16 },
     { "file": "anim_1.ktx2", "columns": 4, "rows": 14 }
@@ -172,60 +250,53 @@ The `source` prop includes:
 }
 ```
 
-You normally generate this automatically using an encoder.
+---
+
+## Platform Details
+
+| Platform | Renderer | Native Format | Fallback |
+|----------|----------|---------------|----------|
+| iOS Device | Metal | ASTC 4x4 | — |
+| iOS Simulator | Metal | — | RGBA (software decode) |
+| Android Device | OpenGL ES 3.0 | ASTC or ETC2 | RGBA (software decode) |
+| Android Emulator | OpenGL ES 3.0 | — | RGBA (software decode) |
+| Web | WebGL | ASTC/BC7/ETC2 | Error (no software fallback) |
 
 ---
 
-## Creating KTX2 Animations
+## Web Support
 
-Convert a PNG frame sequence into KTX2:
+Works with React Native Web. Requires the Basis Universal transcoder for UASTC files:
 
 ```bash
-node encode-ktx2.js \
-  --input ./frames/*.png \
-  --output ./animation \
-  --frameWidth 400 \
-  --frameHeight 400 \
-  --fps 30
+cp -r node_modules/react-native-ktx2player/web/libs public/
 ```
 
-This produces:
-- One or more `.ktx2` files (GPU textures)
-- A `.json` metadata file
+```html
+<script src="/libs/basis_transcoder.js"></script>
+```
+
+Native ASTC files on web require browser ASTC extension support (`WEBGL_compressed_texture_astc`). Most mobile browsers support this; desktop browser support varies.
 
 ---
 
-## Platform Support
+## Performance Characteristics
 
-| Platform | Renderer | GPU Format |
-|----------|----------|------------|
-| iOS (device) | Metal | ASTC |
-| iOS (simulator) | Metal | RGBA fallback |
-| Android | OpenGL ES 3.0 | ASTC or ETC2 |
+- **CPU:** Near-zero during playback (UV updates only)
+- **Memory:** GPU texture memory = uncompressed size (ASTC decompresses on GPU)
+- **Battery:** Significantly lower than video playback
+- **Load time:** One-time transcode (UASTC) or direct upload (ASTC)
 
-> Simulators fall back to uncompressed textures. Real devices use GPU compression.
+Best suited for:
+- Looping UI effects (glows, shimmers, highlights)
+- Transparent overlays
+- Kiosk/always-on displays
+- Any animation where consistent frame timing matters
 
----
-
-## Performance Notes
-
-- Upload happens once, not per frame
-- GPU memory usage is higher than file size (this is normal)
-- Best used for repeating UI effects, not long videos
-
-**Ideal when you need:**
-- Smooth loops
-- Transparency
-- Predictable performance
-
----
-
-## When not to use this
-
-- Long, non-looping videos
-- Camera footage
-- Audio-driven content
-- Content that must stream continuously
+Not ideal for:
+- Long-form video content
+- Streaming media
+- Audio-synced playback
 
 ---
 
