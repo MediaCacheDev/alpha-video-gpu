@@ -78,6 +78,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private int framesPerRow = 0;
     private int framesPerPart = 0;
     private int partCount = 0;
+    
+    // GLB container support
+    private boolean isGLBContainer = false;
+    private List<byte[]> glbKtx2Parts = null;
     private int frameWidth = 0;
     private int frameHeight = 0;
     
@@ -395,23 +399,37 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // Detect texture format first (needed for transcoding)
         detectAndCacheTextureFormat();
         
-        // Extract embedded metadata from KTX2 file (required)
-        byte[] ktx2Data = null;
+        // Read file data
+        byte[] fileData = null;
         try {
-            ktx2Data = readFileBytes(localPath);
+            fileData = readFileBytes(localPath);
         } catch (IOException e) {
-            mainHandler.post(() -> notifyError("Failed to read KTX2 file: " + e.getMessage()));
+            mainHandler.post(() -> notifyError("Failed to read file: " + e.getMessage()));
             return;
         }
         
-        String metadataJson = extractKTX2Metadata(ktx2Data);
+        // Reset GLB state
+        isGLBContainer = false;
+        glbKtx2Parts = null;
         
-        if (metadataJson == null) {
-            mainHandler.post(() -> notifyError("No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."));
-            return;
+        // Check if this is a GLB container or KTX2 file
+        String metadataJson;
+        if (isGLBData(fileData)) {
+            Log.i(TAG, "Detected GLB container");
+            metadataJson = parseGLBContainer(fileData);
+            if (metadataJson == null) {
+                mainHandler.post(() -> notifyError("Failed to parse GLB container"));
+                return;
+            }
+        } else {
+            // Regular KTX2 file
+            metadataJson = extractKTX2Metadata(fileData);
+            if (metadataJson == null) {
+                mainHandler.post(() -> notifyError("No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."));
+                return;
+            }
+            Log.i(TAG, "Using embedded KTX2 metadata");
         }
-        
-        Log.i(TAG, "Using embedded KTX2 metadata");
         
         // Parse metadata
         try {
@@ -627,6 +645,94 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         return shader;
+    }
+    
+    /**
+     * Check if data is a GLB container (magic: "glTF" = 0x46546C67)
+     */
+    private boolean isGLBData(byte[] data) {
+        if (data == null || data.length < 12) return false;
+        return data[0] == 0x67 && data[1] == 0x6C && data[2] == 0x54 && data[3] == 0x46;
+    }
+    
+    /**
+     * Parse GLB container and extract metadata JSON and KTX2 parts.
+     * Returns metadata JSON string, populates glbKtx2Parts list.
+     */
+    private String parseGLBContainer(byte[] data) {
+        try {
+            if (!isGLBData(data)) return null;
+            
+            ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+            
+            // Read header
+            int magic = buffer.getInt(0);
+            int version = buffer.getInt(4);
+            int totalLength = buffer.getInt(8);
+            
+            if (version != 2) {
+                Log.w(TAG, "Unsupported GLB version: " + version);
+                return null;
+            }
+            
+            // Read JSON chunk (starts at byte 12)
+            int offset = 12;
+            int jsonChunkLength = buffer.getInt(offset);
+            offset += 4;
+            int jsonChunkType = buffer.getInt(offset);
+            offset += 4;
+            
+            if (jsonChunkType != 0x4E4F534A) { // "JSON"
+                Log.w(TAG, "Expected JSON chunk, got: " + Integer.toHexString(jsonChunkType));
+                return null;
+            }
+            
+            // Parse JSON metadata
+            String jsonData = new String(data, offset, jsonChunkLength, "UTF-8").trim();
+            offset += jsonChunkLength;
+            
+            // Read BIN chunk
+            int binChunkLength = buffer.getInt(offset);
+            offset += 4;
+            int binChunkType = buffer.getInt(offset);
+            offset += 4;
+            
+            if (binChunkType != 0x004E4942) { // "BIN\0"
+                Log.w(TAG, "Expected BIN chunk, got: " + Integer.toHexString(binChunkType));
+                return null;
+            }
+            
+            int binDataStart = offset;
+            
+            // Parse metadata to get ktx2Parts offsets
+            JSONObject metadata = new JSONObject(jsonData);
+            JSONArray ktx2PartsArray = metadata.optJSONArray("ktx2Parts");
+            
+            if (ktx2PartsArray == null || ktx2PartsArray.length() == 0) {
+                Log.w(TAG, "No ktx2Parts found in GLB metadata");
+                return null;
+            }
+            
+            // Extract KTX2 parts from BIN chunk
+            glbKtx2Parts = new ArrayList<>();
+            for (int i = 0; i < ktx2PartsArray.length(); i++) {
+                JSONObject partInfo = ktx2PartsArray.getJSONObject(i);
+                int byteOffset = partInfo.getInt("byteOffset");
+                int byteLength = partInfo.getInt("byteLength");
+                
+                byte[] partData = new byte[byteLength];
+                System.arraycopy(data, binDataStart + byteOffset, partData, 0, byteLength);
+                glbKtx2Parts.add(partData);
+            }
+            
+            Log.i(TAG, "Parsed GLB container: " + glbKtx2Parts.size() + " KTX2 parts");
+            isGLBContainer = true;
+            
+            return jsonData;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to parse GLB container: " + e.getMessage());
+            return null;
+        }
     }
     
     /**
@@ -971,48 +1077,74 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         List<Integer> loadedTextureWidths = new ArrayList<>();
         List<Integer> loadedTextureHeights = new ArrayList<>();
         
-        // Check if we have explicit part URIs (from React Native parts prop)
-        boolean useExplicitParts = explicitPartUris != null && explicitPartUris.length > 1;
-        int actualPartCount = useExplicitParts ? explicitPartUris.length : partCount;
-        
-        if (actualPartCount > 1 && (useExplicitParts || !partInfoList.isEmpty())) {
-            // Load all parts
-            Log.d(TAG, "Loading " + actualPartCount + " part files" + (useExplicitParts ? " (explicit URIs)" : "") + "...");
+        // Check if we're loading from GLB container
+        if (isGLBContainer && glbKtx2Parts != null && glbKtx2Parts.size() > 0) {
+            Log.d(TAG, "Loading " + glbKtx2Parts.size() + " KTX2 parts from GLB container...");
             
-            for (int i = 0; i < actualPartCount; i++) {
-                int[] result = loadSinglePart(i, ktx2Path, basePath, useExplicitParts);
-                if (result != null) {
+            for (int i = 0; i < glbKtx2Parts.size(); i++) {
+                byte[] ktx2Data = glbKtx2Parts.get(i);
+                
+                int[] result;
+                if (isNativeASTC) {
+                    Log.d(TAG, "Using native ASTC loader for GLB part " + i);
+                    result = loadNativeASTCFromKTX2(ktx2Data);
+                } else {
+                    result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+                }
+                
+                if (result != null && result.length >= 3) {
                     loadedTextureIds.add(result[0]);
                     loadedTextureWidths.add(result[1]);
                     loadedTextureHeights.add(result[2]);
+                    Log.d(TAG, "Loaded GLB part " + i + " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
+                } else {
+                    Log.e(TAG, "Failed to load GLB part " + i);
                 }
             }
         } else {
-            Log.d(TAG, "Loading single KTX2 file: " + ktx2Path + (isNativeASTC ? " (native ASTC)" : ""));
+            // Check if we have explicit part URIs (from React Native parts prop)
+            boolean useExplicitParts = explicitPartUris != null && explicitPartUris.length > 1;
+            int actualPartCount = useExplicitParts ? explicitPartUris.length : partCount;
             
-            byte[] ktx2Data = readFileBytes(ktx2Path);
-            if (ktx2Data == null) {
-                throw new Exception("Failed to read KTX2 file: " + ktx2Path);
-            }
-            
-            int[] result;
-            if (isNativeASTC) {
-                Log.d(TAG, "Using native ASTC loader");
-                result = loadNativeASTCFromKTX2(ktx2Data);
+            if (actualPartCount > 1 && (useExplicitParts || !partInfoList.isEmpty())) {
+                // Load all parts from separate files
+                Log.d(TAG, "Loading " + actualPartCount + " part files" + (useExplicitParts ? " (explicit URIs)" : "") + "...");
+                
+                for (int i = 0; i < actualPartCount; i++) {
+                    int[] result = loadSinglePart(i, ktx2Path, basePath, useExplicitParts);
+                    if (result != null) {
+                        loadedTextureIds.add(result[0]);
+                        loadedTextureWidths.add(result[1]);
+                        loadedTextureHeights.add(result[2]);
+                    }
+                }
             } else {
-                result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+                Log.d(TAG, "Loading single KTX2 file: " + ktx2Path + (isNativeASTC ? " (native ASTC)" : ""));
+                
+                byte[] ktx2Data = readFileBytes(ktx2Path);
+                if (ktx2Data == null) {
+                    throw new Exception("Failed to read KTX2 file: " + ktx2Path);
+                }
+                
+                int[] result;
+                if (isNativeASTC) {
+                    Log.d(TAG, "Using native ASTC loader");
+                    result = loadNativeASTCFromKTX2(ktx2Data);
+                } else {
+                    result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+                }
+                
+                if (result == null || result.length < 3) {
+                    throw new Exception("Failed to " + (isNativeASTC ? "load native ASTC" : "transcode") + " KTX2 file");
+                }
+                
+                loadedTextureIds.add(result[0]);
+                loadedTextureWidths.add(result[1]);
+                loadedTextureHeights.add(result[2]);
+                
+                Log.d(TAG, (isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " texture ID " + 
+                      result[0] + " (" + result[1] + "x" + result[2] + ")");
             }
-            
-            if (result == null || result.length < 3) {
-                throw new Exception("Failed to " + (isNativeASTC ? "load native ASTC" : "transcode") + " KTX2 file");
-            }
-            
-            loadedTextureIds.add(result[0]);
-            loadedTextureWidths.add(result[1]);
-            loadedTextureHeights.add(result[2]);
-            
-            Log.d(TAG, (isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " texture ID " + 
-                  result[0] + " (" + result[1] + "x" + result[2] + ")");
         }
         
         textureIds = new int[loadedTextureIds.size()];

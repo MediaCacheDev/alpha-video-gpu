@@ -58,6 +58,87 @@ interface Metadata {
   mode?: string;
 }
 
+interface GLBParseResult {
+  metadata: Metadata;
+  ktx2Parts: Uint8Array[];
+}
+
+/**
+ * Check if data is a GLB container (magic: "glTF")
+ */
+function isGLBContainer(data: Uint8Array): boolean {
+  return data[0] === 0x67 && data[1] === 0x6C && data[2] === 0x54 && data[3] === 0x46;
+}
+
+/**
+ * Parse GLB container and extract KTX2 parts.
+ * GLB format: 12-byte header + JSON chunk + BIN chunk
+ */
+function parseGLBContainer(data: Uint8Array): GLBParseResult | null {
+  try {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    
+    // Verify GLB magic
+    if (!isGLBContainer(data)) {
+      return null;
+    }
+    
+    // Read header
+    const version = view.getUint32(4, true);
+    const totalLength = view.getUint32(8, true);
+    
+    if (version !== 2) {
+      console.warn('[KTX2PlayerView] Unsupported GLB version:', version);
+      return null;
+    }
+    
+    // Read JSON chunk (starts at byte 12)
+    let offset = 12;
+    const jsonChunkLength = view.getUint32(offset, true);
+    offset += 4;
+    const jsonChunkType = view.getUint32(offset, true);
+    offset += 4;
+    
+    if (jsonChunkType !== 0x4E4F534A) { // "JSON"
+      console.warn('[KTX2PlayerView] Expected JSON chunk, got:', jsonChunkType.toString(16));
+      return null;
+    }
+    
+    // Parse JSON metadata
+    const jsonData = new TextDecoder().decode(data.slice(offset, offset + jsonChunkLength));
+    const metadata = JSON.parse(jsonData.trim()) as Metadata;
+    offset += jsonChunkLength;
+    
+    // Read BIN chunk
+    const binChunkLength = view.getUint32(offset, true);
+    offset += 4;
+    const binChunkType = view.getUint32(offset, true);
+    offset += 4;
+    
+    if (binChunkType !== 0x004E4942) { // "BIN\0"
+      console.warn('[KTX2PlayerView] Expected BIN chunk, got:', binChunkType.toString(16));
+      return null;
+    }
+    
+    const binData = data.slice(offset, offset + binChunkLength);
+    
+    // Extract KTX2 parts from BIN chunk using ktx2Parts offsets
+    const ktx2Parts: Uint8Array[] = [];
+    const partsInfo = (metadata as any).ktx2Parts || [];
+    
+    for (const partInfo of partsInfo) {
+      const partData = binData.slice(partInfo.byteOffset, partInfo.byteOffset + partInfo.byteLength);
+      ktx2Parts.push(partData);
+    }
+    
+    console.log(`[KTX2PlayerView] Parsed GLB container: ${ktx2Parts.length} KTX2 parts`);
+    return { metadata, ktx2Parts };
+  } catch (error) {
+    console.warn('[KTX2PlayerView] Failed to parse GLB container:', error);
+    return null;
+  }
+}
+
 /**
  * Extract BasisPlayerMetadata from KTX2 key-value data section.
  * Returns null if not found.
@@ -550,7 +631,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const BasisModule = await initBasisTranscoder();
       const targetFormat = detectTextureFormat(gl, BasisModule);
       
-      // Fetch KTX2 file
+      // Fetch file
       const uri = src.uri;
       if (!uri) throw new Error('No source URI provided');
       
@@ -560,52 +641,29 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const arrayBuffer = await response.arrayBuffer();
       const data = new Uint8Array(arrayBuffer);
       
-      // Load metadata from embedded KTX2 key-value data
-      const metadata = extractKTX2Metadata(data);
-      
-      if (!metadata) {
-        throw new Error('No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.');
-      }
-      
-      console.log('[KTX2PlayerView] Using embedded KTX2 metadata');
-      metadataRef.current = metadata;
-      
       // Clean up old textures
       texturesRef.current.forEach(tex => gl.deleteTexture(tex));
       texturesRef.current = [];
       
-      // Load textures
-      const partCount = metadata.partCount || metadata.stripCount || 1;
-      
-      // Check if this is native ASTC (no transcoding needed)
-      const isNativeASTC = metadata.mode === 'astc';
-      
-      // Check if we have explicit parts from props
-      const useExplicitParts = parts && parts.length > 1;
-      const actualPartCount = useExplicitParts ? parts.length : partCount;
-      
-      if (actualPartCount > 1) {
-        const metadataParts = metadata.parts || metadata.strips || [];
-        const basePath = uri.replace(/(_\d+)?\.(ktx2|basis)$/i, '');
+      // Check if this is a GLB container
+      if (isGLBContainer(data)) {
+        console.log('[KTX2PlayerView] Detected GLB container');
+        const glbResult = parseGLBContainer(data);
         
-        // Load all parts
-        for (let i = 0; i < actualPartCount; i++) {
-          let partUrl: string;
-          
-          if (useExplicitParts && parts[i]?.uri) {
-            // Use explicit URI from parts prop
-            partUrl = parts[i].uri!;
-          } else {
-            // Use filename from metadata or construct from base path
-            const partFile = metadataParts[i]?.file || `${basePath}_${i}.ktx2`;
-            partUrl = partFile.startsWith('http') ? partFile : 
-              uri.substring(0, uri.lastIndexOf('/') + 1) + partFile;
-          }
-          
-          const partResponse = await fetch(partUrl);
-          const partData = new Uint8Array(await partResponse.arrayBuffer());
-          
+        if (!glbResult) {
+          throw new Error('Failed to parse GLB container');
+        }
+        
+        const { metadata, ktx2Parts } = glbResult;
+        metadataRef.current = metadata;
+        
+        const isNativeASTC = metadata.mode === 'astc';
+        
+        // Load all KTX2 parts from GLB
+        for (let i = 0; i < ktx2Parts.length; i++) {
+          const partData = ktx2Parts[i];
           let texture: WebGLTexture | null;
+          
           if (isNativeASTC) {
             texture = await loadNativeASTCKTX2(gl, partData);
           } else {
@@ -614,18 +672,66 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
           if (texture) texturesRef.current.push(texture);
         }
       } else {
-        let texture: WebGLTexture | null;
-        if (isNativeASTC) {
-          console.log('[KTX2PlayerView] Using native ASTC loader');
-          texture = await loadNativeASTCKTX2(gl, data);
-        } else {
-          texture = await transcodeKTX2(gl, BasisModule, data, targetFormat);
+        // Regular KTX2 file (single or multi-part with separate files)
+        const metadata = extractKTX2Metadata(data);
+        
+        if (!metadata) {
+          throw new Error('No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.');
         }
-        if (texture) texturesRef.current.push(texture);
+        
+        console.log('[KTX2PlayerView] Using embedded KTX2 metadata');
+        metadataRef.current = metadata;
+        
+        const partCount = metadata.partCount || metadata.stripCount || 1;
+        const isNativeASTC = metadata.mode === 'astc';
+        
+        // Check if we have explicit parts from props
+        const useExplicitParts = parts && parts.length > 1;
+        const actualPartCount = useExplicitParts ? parts.length : partCount;
+        
+        if (actualPartCount > 1) {
+          const metadataParts = metadata.parts || metadata.strips || [];
+          const basePath = uri.replace(/(_\d+)?\.(ktx2|basis)$/i, '');
+          
+          // Load all parts
+          for (let i = 0; i < actualPartCount; i++) {
+            let partUrl: string;
+            
+            if (useExplicitParts && parts[i]?.uri) {
+              // Use explicit URI from parts prop
+              partUrl = parts[i].uri!;
+            } else {
+              // Use filename from metadata or construct from base path
+              const partFile = metadataParts[i]?.file || `${basePath}_${i}.ktx2`;
+              partUrl = partFile.startsWith('http') ? partFile : 
+                uri.substring(0, uri.lastIndexOf('/') + 1) + partFile;
+            }
+            
+            const partResponse = await fetch(partUrl);
+            const partData = new Uint8Array(await partResponse.arrayBuffer());
+            
+            let texture: WebGLTexture | null;
+            if (isNativeASTC) {
+              texture = await loadNativeASTCKTX2(gl, partData);
+            } else {
+              texture = await transcodeKTX2(gl, BasisModule, partData, targetFormat);
+            }
+            if (texture) texturesRef.current.push(texture);
+          }
+        } else {
+          let texture: WebGLTexture | null;
+          if (isNativeASTC) {
+            console.log('[KTX2PlayerView] Using native ASTC loader');
+            texture = await loadNativeASTCKTX2(gl, data);
+          } else {
+            texture = await transcodeKTX2(gl, BasisModule, data, targetFormat);
+          }
+          if (texture) texturesRef.current.push(texture);
+        }
       }
       
-      // Calculate UVs
-      frameUVsRef.current = calculateFrameUVs(metadata);
+      // Calculate UVs (metadata is stored in metadataRef)
+      frameUVsRef.current = calculateFrameUVs(metadataRef.current!);
       currentFrameRef.current = 0;
       
       setPlayerState('ready');

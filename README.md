@@ -231,7 +231,51 @@ The first part (`source`) contains the animation metadata. The `parts` array pro
 
 Animation metadata (frame count, dimensions, layout) is embedded in the KTX2 file's key-value data section by the encoder. The player reads this automatically.
 
-For multi-part animations (large frame counts split across multiple textures), metadata includes part information:
+For multi-part animations (large frame counts split across multiple textures), the encoder packages all parts into a single **GLB container** by default. GLB is the Khronos Group's binary glTF format, used here as a convenient container for multiple KTX2 textures.
+
+### GLB Container Format
+
+The GLB container includes:
+- **JSON chunk**: Animation metadata with byte offsets for each KTX2 part
+- **BIN chunk**: Concatenated KTX2 texture data
+
+```json
+{
+  "frameCount": 120,
+  "frameWidth": 400,
+  "frameHeight": 400,
+  "frameRate": 30,
+  "framesPerRow": 4,
+  "framesPerPart": 64,
+  "partCount": 2,
+  "mode": "astc",
+  "container": "glb",
+  "ktx2Parts": [
+    { "byteOffset": 0, "byteLength": 1234567, "columns": 4, "rows": 16 },
+    { "byteOffset": 1234567, "byteLength": 987654, "columns": 4, "rows": 14 }
+  ]
+}
+```
+
+### Metro Configuration for GLB
+
+To use GLB files as bundled assets in React Native, add the extension to your `metro.config.js`:
+
+```javascript
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+const config = {
+  resolver: {
+    assetExts: [...getDefaultConfig(__dirname).resolver.assetExts, 'ktx2', 'glb'],
+  },
+};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+```
+
+### Legacy Multi-Part Format
+
+For separate KTX2 files (using `--no-glb` encoder flag), metadata is embedded in the first part:
 
 ```json
 {
@@ -252,21 +296,9 @@ For multi-part animations (large frame counts split across multiple textures), m
 
 ---
 
-## Platform Details
-
-| Platform | Renderer | Native Format | Fallback |
-|----------|----------|---------------|----------|
-| iOS Device | Metal | ASTC 4x4 | — |
-| iOS Simulator | Metal | — | RGBA (software decode) |
-| Android Device | OpenGL ES 3.0 | ASTC or ETC2 | RGBA (software decode) |
-| Android Emulator | OpenGL ES 3.0 | — | RGBA (software decode) |
-| Web | WebGL | ASTC/BC7/ETC2 | Error (no software fallback) |
-
----
-
 ## Web Support
 
-Works with React Native Web. Requires the Basis Universal transcoder for UASTC files:
+Works with React Native Web. Requires the Basis Universal transcoder for UASTC files. Copy the libs folder to your public directory of your web server:
 
 ```bash
 cp -r node_modules/react-native-ktx2player/web/libs public/

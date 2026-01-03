@@ -35,6 +35,10 @@
   
   BOOL _isNativeASTC;
   NSDictionary *_cachedMetadata;
+  
+  // GLB container support
+  BOOL _isGLBContainer;
+  NSArray<NSData *> *_glbKtx2Parts;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -434,6 +438,94 @@
   return nil;
 }
 
+/**
+ * Check if data is a GLB container (magic: "glTF" = 0x46546C67)
+ */
+- (BOOL)isGLBData:(NSData *)data
+{
+  if (data.length < 12) return NO;
+  const uint8_t *bytes = (const uint8_t *)[data bytes];
+  return bytes[0] == 0x67 && bytes[1] == 0x6C && bytes[2] == 0x54 && bytes[3] == 0x46;
+}
+
+/**
+ * Parse GLB container and extract metadata and KTX2 parts.
+ * Returns metadata dictionary, populates _glbKtx2Parts array.
+ */
+- (NSDictionary *)parseGLBContainer:(NSData *)data
+{
+  if (![self isGLBData:data]) return nil;
+  
+  const uint8_t *bytes = (const uint8_t *)[data bytes];
+  
+  // Read header (little-endian)
+  uint32_t version = *(uint32_t *)(bytes + 4);
+  uint32_t totalLength = *(uint32_t *)(bytes + 8);
+  
+  if (version != 2) {
+    NSLog(@"KTX2PlayerView: Unsupported GLB version: %u", version);
+    return nil;
+  }
+  
+  // Read JSON chunk (starts at byte 12)
+  uint32_t offset = 12;
+  uint32_t jsonChunkLength = *(uint32_t *)(bytes + offset);
+  offset += 4;
+  uint32_t jsonChunkType = *(uint32_t *)(bytes + offset);
+  offset += 4;
+  
+  if (jsonChunkType != 0x4E4F534A) { // "JSON"
+    NSLog(@"KTX2PlayerView: Expected JSON chunk, got: 0x%X", jsonChunkType);
+    return nil;
+  }
+  
+  // Parse JSON metadata
+  NSData *jsonData = [NSData dataWithBytes:(bytes + offset) length:jsonChunkLength];
+  NSError *jsonError = nil;
+  NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&jsonError];
+  if (jsonError || !metadata) {
+    NSLog(@"KTX2PlayerView: Failed to parse GLB JSON: %@", jsonError);
+    return nil;
+  }
+  offset += jsonChunkLength;
+  
+  // Read BIN chunk
+  uint32_t binChunkLength = *(uint32_t *)(bytes + offset);
+  offset += 4;
+  uint32_t binChunkType = *(uint32_t *)(bytes + offset);
+  offset += 4;
+  
+  if (binChunkType != 0x004E4942) { // "BIN\0"
+    NSLog(@"KTX2PlayerView: Expected BIN chunk, got: 0x%X", binChunkType);
+    return nil;
+  }
+  
+  uint32_t binDataStart = offset;
+  
+  // Extract KTX2 parts from BIN chunk using ktx2Parts offsets
+  NSArray *ktx2PartsInfo = metadata[@"ktx2Parts"];
+  if (!ktx2PartsInfo || ktx2PartsInfo.count == 0) {
+    NSLog(@"KTX2PlayerView: No ktx2Parts found in GLB metadata");
+    return nil;
+  }
+  
+  NSMutableArray<NSData *> *parts = [NSMutableArray array];
+  for (NSDictionary *partInfo in ktx2PartsInfo) {
+    uint32_t byteOffset = [partInfo[@"byteOffset"] unsignedIntValue];
+    uint32_t byteLength = [partInfo[@"byteLength"] unsignedIntValue];
+    
+    NSData *partData = [NSData dataWithBytes:(bytes + binDataStart + byteOffset) length:byteLength];
+    [parts addObject:partData];
+  }
+  
+  _glbKtx2Parts = [parts copy];
+  _isGLBContainer = YES;
+  
+  NSLog(@"KTX2PlayerView: Parsed GLB container: %lu KTX2 parts", (unsigned long)_glbKtx2Parts.count);
+  
+  return metadata;
+}
+
 - (void)loadKTX2WithSource:(NSDictionary *)source
 {
   NSString *uri = source[@"uri"];
@@ -441,36 +533,52 @@
   // Store base path for part file loading
   _basePath = [[uri stringByDeletingLastPathComponent] copy];
   
-  // Download the KTX2 file and extract embedded metadata
+  // Reset GLB state
+  _isGLBContainer = NO;
+  _glbKtx2Parts = nil;
+  
+  // Download the file and extract metadata
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    NSData *ktx2Data = nil;
+    NSData *fileData = nil;
     if ([uri hasPrefix:@"http://"] || [uri hasPrefix:@"https://"]) {
-      ktx2Data = [self loadDataFromURLWithCaching:uri partIndex:0];
+      fileData = [self loadDataFromURLWithCaching:uri partIndex:0];
     } else if ([uri hasPrefix:@"file://"]) {
       NSURL *fileURL = [NSURL URLWithString:uri];
-      ktx2Data = [NSData dataWithContentsOfURL:fileURL];
+      fileData = [NSData dataWithContentsOfURL:fileURL];
     } else {
-      ktx2Data = [NSData dataWithContentsOfFile:uri];
+      fileData = [NSData dataWithContentsOfFile:uri];
     }
     
-    if (!ktx2Data) {
+    if (!fileData) {
       dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"Failed to load KTX2 file"];
+        [self notifyError:@"Failed to load file"];
       });
       return;
     }
     
-    // Extract embedded metadata from KTX2 file (required)
-    NSDictionary *metadata = [self extractKTX2Metadata:ktx2Data];
+    NSDictionary *metadata = nil;
     
-    if (!metadata) {
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."];
-      });
-      return;
+    // Check if this is a GLB container or KTX2 file
+    if ([self isGLBData:fileData]) {
+      NSLog(@"KTX2PlayerView: Detected GLB container");
+      metadata = [self parseGLBContainer:fileData];
+      if (!metadata) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self notifyError:@"Failed to parse GLB container"];
+        });
+        return;
+      }
+    } else {
+      // Regular KTX2 file
+      metadata = [self extractKTX2Metadata:fileData];
+      if (!metadata) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self notifyError:@"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."];
+        });
+        return;
+      }
+      NSLog(@"KTX2PlayerView: Using embedded KTX2 metadata");
     }
-    
-    NSLog(@"KTX2PlayerView: Using embedded KTX2 metadata");
     
     // Continue on main thread with parsed metadata
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -710,128 +818,201 @@
     NSMutableArray<NSDictionary *> *loadedParts = [NSMutableArray array];
     NSArray *partsArray = metadata[@"parts"] ?: metadata[@"strips"];
     
-    // Check if we have explicit parts from React Native props
-    BOOL useExplicitParts = self.parts && self.parts.count > 1;
-    NSInteger actualPartCount = useExplicitParts ? self.parts.count : self.partCount;
-    
-    // Load all parts
-    for (NSInteger i = 0; i < actualPartCount; i++) {
-      NSString *partPath;
+    // Check if we're loading from GLB container
+    if (self->_isGLBContainer && self->_glbKtx2Parts && self->_glbKtx2Parts.count > 0) {
+      NSLog(@"KTX2PlayerView: Loading %lu KTX2 parts from GLB container...", (unsigned long)self->_glbKtx2Parts.count);
       
-      if (useExplicitParts && i < self.parts.count) {
-        // Use explicit URI from parts prop
-        NSDictionary *partDict = self.parts[i];
-        partPath = partDict[@"uri"];
-      } else if (self.partCount > 1 && partsArray && i < partsArray.count) {
-        NSString *partFilename = partsArray[i][@"file"];
-        if (partFilename) {
-          partPath = [basePath stringByAppendingPathComponent:partFilename];
-        } else {
-          NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
-          baseName = [baseName stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
-          partPath = [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld.ktx2", baseName, (long)i]];
-        }
-      } else {
-        partPath = sourceUri;
-      }
-      
-      NSLog(@"KTX2PlayerView: Loading part %ld: %@%@", (long)i, partPath, useExplicitParts ? @" (explicit)" : @"");
-      
-      // Load data from URL or file path (safe on background thread)
-      NSData *ktx2Data = nil;
-      if ([partPath hasPrefix:@"http://"] || [partPath hasPrefix:@"https://"]) {
-        // HTTP URL - use caching
-        ktx2Data = [self loadDataFromURLWithCaching:partPath partIndex:i];
-      } else if ([partPath hasPrefix:@"file://"]) {
-        NSURL *fileURL = [NSURL URLWithString:partPath];
-        ktx2Data = [NSData dataWithContentsOfURL:fileURL];
-      } else {
-        ktx2Data = [NSData dataWithContentsOfFile:partPath];
-      }
-      
-      if (!ktx2Data) {
-        NSLog(@"KTX2PlayerView: Failed to load part file: %@", partPath);
-        continue;
-      }
-      
-      NSLog(@"KTX2PlayerView: Part %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
-      
-      uint32_t width = 0, height = 0;
-      NSData *textureData = nil;
-      uint32_t blocksX = 0, blocksY = 0;
-      
-      if (isNativeASTC) {
-        // Native ASTC mode - load directly without transcoding
-        NSLog(@"KTX2PlayerView: Using native ASTC loader for part %ld", (long)i);
-        textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
+      for (NSInteger i = 0; i < (NSInteger)self->_glbKtx2Parts.count; i++) {
+        NSData *ktx2Data = self->_glbKtx2Parts[i];
+        NSLog(@"KTX2PlayerView: GLB part %ld size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
         
-        if (!textureData) {
-          NSLog(@"KTX2PlayerView: Failed to load native ASTC for part %ld", (long)i);
-          continue;
-        }
+        uint32_t width = 0, height = 0;
+        NSData *textureData = nil;
+        uint32_t blocksX = 0, blocksY = 0;
         
-        blocksX = (width + 3) / 4;
-        blocksY = (height + 3) / 4;
-        
-        // Check if we need to decode ASTC to RGBA (simulator or unsupported device)
-        if (!self->_useCompressedFormat) {
-          NSLog(@"KTX2PlayerView: ASTC not supported - decoding to RGBA (simulator/fallback mode)");
-          NSLog(@"KTX2PlayerView: Note: ASTC textures require a real device for optimal performance");
-          textureData = [self decodeASTCToRGBA:textureData width:width height:height];
+        if (isNativeASTC) {
+          NSLog(@"KTX2PlayerView: Using native ASTC loader for GLB part %ld", (long)i);
+          textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
+          
           if (!textureData) {
-            NSLog(@"KTX2PlayerView: Failed to decode ASTC to RGBA for part %ld", (long)i);
+            NSLog(@"KTX2PlayerView: Failed to load native ASTC for GLB part %ld", (long)i);
             continue;
           }
-        }
-      } else {
-        // UASTC mode - transcode using Basis Universal
-        basist::ktx2_transcoder transcoder;
-        if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
-          NSLog(@"KTX2PlayerView: Failed to init KTX2 transcoder for part %ld", (long)i);
-          continue;
-        }
-        
-        if (!transcoder.start_transcoding()) {
-          NSLog(@"KTX2PlayerView: Failed to start transcoding for part %ld", (long)i);
-          continue;
-        }
-        
-        width = transcoder.get_width();
-        height = transcoder.get_height();
-        NSLog(@"KTX2PlayerView: Part %ld dimensions: %dx%d", (long)i, width, height);
-        
-        // Calculate transcoded data size
-        uint32_t dataSize;
-        
-        if (self->_useCompressedFormat) {
+          
           blocksX = (width + 3) / 4;
           blocksY = (height + 3) / 4;
-          dataSize = blocksX * blocksY * 16;
+          
+          if (!self->_useCompressedFormat) {
+            NSLog(@"KTX2PlayerView: ASTC not supported - decoding to RGBA");
+            textureData = [self decodeASTCToRGBA:textureData width:width height:height];
+            if (!textureData) {
+              NSLog(@"KTX2PlayerView: Failed to decode ASTC to RGBA for GLB part %ld", (long)i);
+              continue;
+            }
+          }
         } else {
-          dataSize = width * height * 4;
+          basist::ktx2_transcoder transcoder;
+          if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
+            NSLog(@"KTX2PlayerView: Failed to init KTX2 transcoder for GLB part %ld", (long)i);
+            continue;
+          }
+          
+          if (!transcoder.start_transcoding()) {
+            NSLog(@"KTX2PlayerView: Failed to start transcoding for GLB part %ld", (long)i);
+            continue;
+          }
+          
+          width = transcoder.get_width();
+          height = transcoder.get_height();
+          
+          uint32_t dataSize;
+          if (self->_useCompressedFormat) {
+            blocksX = (width + 3) / 4;
+            blocksY = (height + 3) / 4;
+            dataSize = blocksX * blocksY * 16;
+          } else {
+            dataSize = width * height * 4;
+          }
+          
+          NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
+          if (!transcoder.transcode_image_level(0, 0, 0, (void *)[transcodedData mutableBytes], dataSize / (self->_useCompressedFormat ? 16 : 4), self->_targetFormat)) {
+            NSLog(@"KTX2PlayerView: Failed to transcode GLB part %ld", (long)i);
+            continue;
+          }
+          
+          textureData = transcodedData;
         }
         
-        // Allocate and transcode
-        NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
-        if (!transcoder.transcode_image_level(0, 0, 0, (uint8_t*)[transcodedData mutableBytes], dataSize, self->_targetFormat, 0)) {
-          NSLog(@"KTX2PlayerView: Failed to transcode part %ld", (long)i);
+        [loadedParts addObject:@{
+          @"data": textureData,
+          @"width": @(width),
+          @"height": @(height),
+          @"blocksX": @(blocksX),
+          @"blocksY": @(blocksY)
+        }];
+        
+        NSLog(@"KTX2PlayerView: Loaded GLB part %ld: %ux%u", (long)i, width, height);
+      }
+    } else {
+      // Load from separate files (original behavior)
+      BOOL useExplicitParts = self.parts && self.parts.count > 1;
+      NSInteger actualPartCount = useExplicitParts ? self.parts.count : self.partCount;
+      
+      for (NSInteger i = 0; i < actualPartCount; i++) {
+        NSString *partPath;
+        
+        if (useExplicitParts && i < self.parts.count) {
+          NSDictionary *partDict = self.parts[i];
+          partPath = partDict[@"uri"];
+        } else if (self.partCount > 1 && partsArray && i < partsArray.count) {
+          NSString *partFilename = partsArray[i][@"file"];
+          if (partFilename) {
+            partPath = [basePath stringByAppendingPathComponent:partFilename];
+          } else {
+            NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
+            baseName = [baseName stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
+            partPath = [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld.ktx2", baseName, (long)i]];
+          }
+        } else {
+          partPath = sourceUri;
+        }
+        
+        NSLog(@"KTX2PlayerView: Loading part %ld: %@%@", (long)i, partPath, useExplicitParts ? @" (explicit)" : @"");
+        
+        NSData *ktx2Data = nil;
+        if ([partPath hasPrefix:@"http://"] || [partPath hasPrefix:@"https://"]) {
+          ktx2Data = [self loadDataFromURLWithCaching:partPath partIndex:i];
+        } else if ([partPath hasPrefix:@"file://"]) {
+          NSURL *fileURL = [NSURL URLWithString:partPath];
+          ktx2Data = [NSData dataWithContentsOfURL:fileURL];
+        } else {
+          ktx2Data = [NSData dataWithContentsOfFile:partPath];
+        }
+        
+        if (!ktx2Data) {
+          NSLog(@"KTX2PlayerView: Failed to load part file: %@", partPath);
           continue;
         }
         
-        textureData = transcodedData;
+        NSLog(@"KTX2PlayerView: Part %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
+        
+        uint32_t width = 0, height = 0;
+        NSData *textureData = nil;
+        uint32_t blocksX = 0, blocksY = 0;
+        
+        if (isNativeASTC) {
+          // Native ASTC mode - load directly without transcoding
+          NSLog(@"KTX2PlayerView: Using native ASTC loader for part %ld", (long)i);
+          textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
+          
+          if (!textureData) {
+            NSLog(@"KTX2PlayerView: Failed to load native ASTC for part %ld", (long)i);
+            continue;
+          }
+          
+          blocksX = (width + 3) / 4;
+          blocksY = (height + 3) / 4;
+          
+          // Check if we need to decode ASTC to RGBA (simulator or unsupported device)
+          if (!self->_useCompressedFormat) {
+            NSLog(@"KTX2PlayerView: ASTC not supported - decoding to RGBA (simulator/fallback mode)");
+            NSLog(@"KTX2PlayerView: Note: ASTC textures require a real device for optimal performance");
+            textureData = [self decodeASTCToRGBA:textureData width:width height:height];
+            if (!textureData) {
+              NSLog(@"KTX2PlayerView: Failed to decode ASTC to RGBA for part %ld", (long)i);
+              continue;
+            }
+          }
+        } else {
+          // UASTC mode - transcode using Basis Universal
+          basist::ktx2_transcoder transcoder;
+          if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
+            NSLog(@"KTX2PlayerView: Failed to init KTX2 transcoder for part %ld", (long)i);
+            continue;
+          }
+          
+          if (!transcoder.start_transcoding()) {
+            NSLog(@"KTX2PlayerView: Failed to start transcoding for part %ld", (long)i);
+            continue;
+          }
+          
+          width = transcoder.get_width();
+          height = transcoder.get_height();
+          NSLog(@"KTX2PlayerView: Part %ld dimensions: %dx%d", (long)i, width, height);
+          
+          // Calculate transcoded data size
+          uint32_t dataSize;
+          
+          if (self->_useCompressedFormat) {
+            blocksX = (width + 3) / 4;
+            blocksY = (height + 3) / 4;
+            dataSize = blocksX * blocksY * 16;
+          } else {
+            dataSize = width * height * 4;
+          }
+          
+          // Allocate and transcode
+          NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
+          if (!transcoder.transcode_image_level(0, 0, 0, (uint8_t*)[transcodedData mutableBytes], dataSize, self->_targetFormat, 0)) {
+            NSLog(@"KTX2PlayerView: Failed to transcode part %ld", (long)i);
+            continue;
+          }
+          
+          textureData = transcodedData;
+        }
+        
+        // Store part info for main thread
+        [loadedParts addObject:@{
+          @"data": textureData,
+          @"width": @(width),
+          @"height": @(height),
+          @"blocksX": @(blocksX),
+          @"blocksY": @(blocksY),
+          @"isNativeASTC": @(isNativeASTC)
+        }];
+        
+        NSLog(@"KTX2PlayerView: %@ part %ld successfully", isNativeASTC ? @"Loaded native ASTC" : @"Transcoded", (long)i);
       }
-      
-      // Store part info for main thread
-      [loadedParts addObject:@{
-        @"data": textureData,
-        @"width": @(width),
-        @"height": @(height),
-        @"blocksX": @(blocksX),
-        @"blocksY": @(blocksY),
-        @"isNativeASTC": @(isNativeASTC)
-      }];
-      
-      NSLog(@"KTX2PlayerView: %@ part %ld successfully", isNativeASTC ? @"Loaded native ASTC" : @"Transcoded", (long)i);
     }
     
     // Dispatch to main thread for Metal texture creation and UI updates
