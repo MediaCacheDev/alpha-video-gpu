@@ -50,16 +50,8 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     @ReactProp(name = "source")
     public void setSource(KTX2TextureView view, @Nullable ReadableMap source) {
         String sourceUri = null;
-        String metadata = null;
-        if (source != null) {
-            if (source.hasKey("uri") && !source.isNull("uri")) {
-                sourceUri = source.getString("uri");
-            } else if (source.hasKey("path") && !source.isNull("path")) {
-                sourceUri = source.getString("path");
-            }
-            if (source.hasKey("metadata") && !source.isNull("metadata")) {
-                metadata = source.getString("metadata");
-            }
+        if (source != null && source.hasKey("uri") && !source.isNull("uri")) {
+            sourceUri = source.getString("uri");
         }
         
         if (sourceUri == null || sourceUri.isEmpty()) {
@@ -69,24 +61,24 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
         }
         
         Log.d(TAG, "setSource: " + sourceUri.substring(0, Math.min(80, sourceUri.length())) + "...");
-        if (metadata != null) {
-            Log.d(TAG, "metadata provided: " + metadata.substring(0, Math.min(80, metadata.length())) + "...");
-        }
         
-        // Handle different URI schemes like WebMAlpha
+        // Handle different URI schemes
         if (sourceUri.startsWith("http://") || sourceUri.startsWith("https://")) {
             // HTTP URLs are handled by the View's internal download logic
-            view.setSource(sourceUri, metadata);
+            view.setSource(sourceUri);
         } else if (sourceUri.startsWith("file://")) {
             // Strip file:// prefix for local files
             String path = sourceUri.substring(7);
-            view.setSource(path, metadata);
+            view.setSource(path);
         } else if (sourceUri.startsWith("asset://") || sourceUri.startsWith("asset:/")) {
             // Load from Android assets
-            loadFromAsset(view, sourceUri, metadata);
+            loadFromAsset(view, sourceUri);
+        } else if (isDrawableResourceName(sourceUri)) {
+            // Load from bundled assets (release build)
+            loadFromBundledAsset(view, sourceUri);
         } else {
             // Plain path - pass directly
-            view.setSource(sourceUri, metadata);
+            view.setSource(sourceUri);
         }
     }
 
@@ -117,36 +109,161 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
     
     /**
-     * Load KTX2 from Android assets by copying to cache first
+     * Set explicit part URIs for multi-part animations.
+     * This is needed for bundled assets where sibling files can't be auto-discovered.
      */
-    private void loadFromAsset(KTX2TextureView view, String assetUri, String metadata) {
-        final String assetPath = assetUri.replace("asset://", "").replace("asset:/", "")
-            .replaceFirst("^/", "");
+    @ReactProp(name = "parts")
+    public void setParts(KTX2TextureView view, @Nullable ReadableArray parts) {
+        if (parts == null || parts.size() == 0) {
+            view.setPartUris(null);
+            return;
+        }
         
+        String[] partUris = new String[parts.size()];
+        for (int i = 0; i < parts.size(); i++) {
+            ReadableMap part = parts.getMap(i);
+            if (part != null && part.hasKey("uri") && !part.isNull("uri")) {
+                String uri = part.getString("uri");
+                // Resolve the URI same as setSource
+                partUris[i] = resolveUri(uri);
+            }
+        }
+        view.setPartUris(partUris);
+    }
+    
+    /**
+     * Resolve a URI to a path that KTX2TextureView can load
+     */
+    private String resolveUri(String uri) {
+        if (uri == null || uri.isEmpty()) return null;
+        
+        if (uri.startsWith("http://") || uri.startsWith("https://")) {
+            return uri;
+        } else if (uri.startsWith("file://")) {
+            return uri.substring(7);
+        } else if (uri.startsWith("asset://") || uri.startsWith("asset:/")) {
+            return uri;
+        } else if (isDrawableResourceName(uri)) {
+            // For bundled assets, find the actual asset path
+            String foundPath = findKtx2Asset(uri, "");
+            if (foundPath != null) {
+                return "asset://" + foundPath;
+            }
+        }
+        return uri;
+    }
+    
+    /**
+     * Check if the URI looks like a bundled asset resource name (from release build)
+     * These look like: "funapp_assets_app_components_hg6rchz240x240" (no slashes, no scheme, no dots)
+     */
+    private boolean isDrawableResourceName(String uri) {
+        // Resource names don't have slashes, colons, or dots
+        // They also don't start with common path prefixes
+        if (uri == null || uri.isEmpty()) return false;
+        if (uri.contains("/") || uri.contains(":") || uri.contains(".")) return false;
+        // Check if it looks like a resource name (alphanumeric with underscores, starting with letter)
+        return uri.matches("^[a-zA-Z][a-zA-Z0-9_]*$");
+    }
+    
+    /**
+     * Load KTX2 from bundled assets (for release build)
+     * React Native bundles custom assets into the APK's assets folder.
+     * We pass asset:// URI directly - KTX2TextureView reads via AssetManager.
+     */
+    private void loadFromBundledAsset(KTX2TextureView view, String resourceName) {
         assetExecutor.execute(() -> {
             try {
-                // Copy KTX2 file
-                File tempKtx2File = new File(reactContext.getCacheDir(), 
-                    "ktx2_asset_" + assetPath.hashCode() + ".ktx2");
-                
-                if (!tempKtx2File.exists()) {
-                    InputStream is = reactContext.getAssets().open(assetPath);
-                    FileOutputStream fos = new FileOutputStream(tempKtx2File);
-                    byte[] buffer = new byte[8192];
-                    int read;
-                    while ((read = is.read(buffer)) != -1) {
-                        fos.write(buffer, 0, read);
-                    }
-                    fos.close();
-                    is.close();
-                    Log.d(TAG, "Copied KTX2 asset to cache: " + tempKtx2File.getAbsolutePath());
+                // Search assets folder for matching .ktx2 file
+                String foundPath = findKtx2Asset(resourceName, "");
+                if (foundPath != null) {
+                    // Pass asset:// URI - no copy needed, view reads directly via AssetManager
+                    view.post(() -> view.setSource("asset://" + foundPath));
+                    return;
                 }
                 
-                view.post(() -> view.setSource(tempKtx2File.getAbsolutePath(), metadata));
+                // Fallback: try raw resources (requires copy since Resources API differs)
+                int resourceId = reactContext.getResources().getIdentifier(
+                    resourceName, "raw", reactContext.getPackageName());
+                if (resourceId != 0) {
+                    copyResourceToCache(view, resourceName, resourceId);
+                    return;
+                }
+                
+                Log.e(TAG, "Bundled asset not found: " + resourceName);
             } catch (Exception e) {
-                Log.e(TAG, "Failed to load asset: " + assetPath, e);
+                Log.e(TAG, "Failed to load bundled asset: " + resourceName, e);
             }
         });
+    }
+    
+    /**
+     * Copy from res/raw to cache (only needed for raw resources, not assets)
+     */
+    private void copyResourceToCache(KTX2TextureView view, String resourceName, int resourceId) {
+        try {
+            File cacheFile = new File(reactContext.getCacheDir(), 
+                "ktx2_" + resourceName.hashCode() + ".ktx2");
+            
+            if (!cacheFile.exists()) {
+                InputStream is = reactContext.getResources().openRawResource(resourceId);
+                FileOutputStream fos = new FileOutputStream(cacheFile);
+                byte[] buffer = new byte[16384];
+                int read;
+                while ((read = is.read(buffer)) != -1) {
+                    fos.write(buffer, 0, read);
+                }
+                fos.close();
+                is.close();
+            }
+            
+            view.post(() -> view.setSource(cacheFile.getAbsolutePath()));
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to copy resource to cache", e);
+        }
+    }
+    
+    /**
+     * Search assets folder for a .ktx2 file matching the resource name
+     */
+    private String findKtx2Asset(String resourceName, String path) {
+        try {
+            String[] files = reactContext.getAssets().list(path);
+            if (files == null) return null;
+            
+            String searchKey = resourceName.substring(resourceName.lastIndexOf("_") + 1).toLowerCase();
+            
+            for (String file : files) {
+                String fullPath = path.isEmpty() ? file : path + "/" + file;
+                
+                if (file.endsWith(".ktx2")) {
+                    // Normalize filename for comparison
+                    String normalized = file.replace(".ktx2", "").replace("-", "").toLowerCase();
+                    if (normalized.contains(searchKey) || searchKey.contains(normalized)) {
+                        return fullPath;
+                    }
+                }
+                
+                // Recurse into directories
+                String[] subFiles = reactContext.getAssets().list(fullPath);
+                if (subFiles != null && subFiles.length > 0) {
+                    String found = findKtx2Asset(resourceName, fullPath);
+                    if (found != null) return found;
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+    
+    /**
+     * Load KTX2 from Android assets (asset:// URI scheme)
+     * No copy needed - KTX2TextureView reads directly via AssetManager
+     */
+    private void loadFromAsset(KTX2TextureView view, String assetUri) {
+        // Normalize to asset:// format and pass directly to view
+        String normalizedUri = assetUri.startsWith("asset://") ? assetUri : 
+            "asset://" + assetUri.replace("asset:/", "").replaceFirst("^/", "");
+        view.setSource(normalizedUri);
     }
 
     @Override

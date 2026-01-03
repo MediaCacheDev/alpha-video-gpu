@@ -1,7 +1,7 @@
 {
   "name": "react-native-ktx2player",
-  "version": "1.0.0",
-  "description": "React Native module for playing KTX2 animated textures with 2D grid layout and multi-strip support",
+  "version": "1.0.1",
+  "description": "React Native module for playing KTX2 animated textures with GPU acceleration on iOS, Android, and Web",
   "main": "index.js",
   "types": "src/index.d.ts",
   "scripts": {
@@ -20,6 +20,7 @@
   },
   "keywords": [
     "react-native",
+    "react-native-web",
     "ktx2",
     "basis-universal",
     "animation",
@@ -29,7 +30,8 @@
     "uastc",
     "gpu-texture",
     "metal",
-    "opengl"
+    "opengl",
+    "webgl"
   ],
   "author": "",
   "license": "MIT",
@@ -45,20 +47,28 @@
     "android/",
     "ios/",
     "src/",
-    "vendor/",
     "scripts/",
+    "web/",
     "index.js",
+    "react-native.config.js",
     "react-native-ktx2player.podspec",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "peerDependencies": {
     "react": ">=16.8.0",
     "react-native": ">=0.60.0"
   },
+  "peerDependenciesMeta": {
+    "react-native-web": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@types/react": "^18.0.0",
     "react": "^18.0.0",
     "react-native": "^0.72.0",
-    "@types/react": "^18.0.0",
+    "react-native-web": "^0.19.0",
     "typescript": "^5.0.0"
   }
 }

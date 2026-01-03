@@ -1,0 +1,59 @@
+# Development files
+node_modules/
+*.tgz
+package-lock.json
+
+# Root vendor folder (iOS/Android have their own copies)
+vendor/
+
+# Test files from basis_universal (huge, not needed for runtime)
+# Must use explicit paths since globs don't work well with 'files' array
+ios/vendor/basis_universal/test_files/
+ios/vendor/basis_universal/webgl/
+ios/vendor/basis_universal/webgl_videotest/
+ios/vendor/basis_universal/bin/
+ios/vendor/basis_universal/encoder/
+ios/vendor/basis_universal/OpenCL/
+ios/vendor/basis_universal/spec/
+ios/vendor/basis_universal/contrib/
+ios/vendor/basis_universal/LICENSES/
+ios/vendor/basis_universal/.git*
+ios/vendor/basis_universal/*.md
+ios/vendor/basis_universal/CMakeLists.txt
+
+android/src/main/cpp/basis_universal/test_files/
+android/src/main/cpp/basis_universal/webgl/
+android/src/main/cpp/basis_universal/webgl_videotest/
+android/src/main/cpp/basis_universal/bin/
+android/src/main/cpp/basis_universal/encoder/
+android/src/main/cpp/basis_universal/OpenCL/
+android/src/main/cpp/basis_universal/spec/
+android/src/main/cpp/basis_universal/contrib/
+android/src/main/cpp/basis_universal/LICENSES/
+android/src/main/cpp/basis_universal/.git*
+android/src/main/cpp/basis_universal/*.md
+android/src/main/cpp/basis_universal/CMakeLists.txt
+
+# Build artifacts
+build/
+dist/
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local config
+.env
+.env.*

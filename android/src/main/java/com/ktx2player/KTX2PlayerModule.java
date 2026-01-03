@@ -45,5 +45,8 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     // Native methods used by KTX2TextureView
     private static native void nativeInit();
     public static native int[] nativeTranscodeKTX2(byte[] ktx2Data, int textureFormat);
+    public static native byte[] nativeTranscodeKTX2NoUpload(byte[] ktx2Data, int textureFormat);
     public static native void nativeDeleteTexture(int textureId);
+    public static native byte[] nativeDecompressZstd(byte[] data, int offset, int compressedLength, int uncompressedLength);
+    public static native int[] nativeDecodeASTCToRGBA(byte[] astcData, int width, int height);
 }

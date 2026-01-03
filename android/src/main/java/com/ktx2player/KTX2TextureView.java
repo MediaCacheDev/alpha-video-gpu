@@ -57,9 +57,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     // React Native context
     private ReactContext mReactContext;
     
-    // Source and metadata
+    // Source
     private String mSource;
-    private String mMetadata;
     private String mCacheKey;
     private boolean mSourceLoaded = false;
     
@@ -94,10 +93,15 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     }
     private List<PartInfo> partInfoList = new ArrayList<>();
     
+    // Explicit part URIs (for bundled assets where sibling files can't be auto-discovered)
+    private String[] explicitPartUris = null;
+    
+    
     // OpenGL resources
     private EGLDisplay eglDisplay;
     private EGLContext eglContext;
     private EGLSurface eglSurface;
+    
     private int program = 0;
     private int[] textureIds = new int[0];
     private int[] textureWidths = new int[0];
@@ -109,6 +113,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     // Cached texture format
     private int cachedTextureFormat = -1;
+    
+    // Native ASTC mode flag
+    private boolean isNativeASTC = false;
     
     // Threading
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -206,7 +213,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     private synchronized ExecutorService getOrCreateExecutor() {
         if (executor == null || executor.isShutdown()) {
-            executor = Executors.newSingleThreadExecutor();
+            // Use a thread pool with 2 threads to allow preloading while playback runs
+            executor = Executors.newFixedThreadPool(2);
         }
         return executor;
     }
@@ -252,15 +260,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     // Public API
     public void setSource(String source) {
-        setSource(source, null);
-    }
-    
-    public void setSource(String source, String metadata) {
         Log.d(TAG, "setSource: " + (source != null ? source.substring(0, Math.min(80, source.length())) : "null"));
         
         stopPlayback();
         mSource = source;
-        mMetadata = metadata;
         mSourceLoaded = false;
         
         if (source != null && isAvailable()) {
@@ -287,6 +290,15 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     public void setEnableFrameEvents(boolean enable) {
         this.enableFrameEvents = enable;
+    }
+    
+    /**
+     * Set explicit part URIs for multi-part animations.
+     * Used when bundled assets can't be auto-discovered from sibling files.
+     */
+    public void setPartUris(String[] partUris) {
+        this.explicitPartUris = partUris;
+        Log.d(TAG, "setPartUris: " + (partUris != null ? partUris.length + " parts" : "null"));
     }
     
     public void play() {
@@ -380,16 +392,35 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return;
         }
         
+        // Detect texture format first (needed for transcoding)
+        detectAndCacheTextureFormat();
+        
+        // Extract embedded metadata from KTX2 file (required)
+        byte[] ktx2Data = null;
+        try {
+            ktx2Data = readFileBytes(localPath);
+        } catch (IOException e) {
+            mainHandler.post(() -> notifyError("Failed to read KTX2 file: " + e.getMessage()));
+            return;
+        }
+        
+        String metadataJson = extractKTX2Metadata(ktx2Data);
+        
+        if (metadataJson == null) {
+            mainHandler.post(() -> notifyError("No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."));
+            return;
+        }
+        
+        Log.i(TAG, "Using embedded KTX2 metadata");
+        
         // Parse metadata
         try {
-            parseMetadata(mMetadata);
+            parseMetadata(metadataJson);
+            Log.i(TAG, "isNativeASTC: " + isNativeASTC);
         } catch (Exception e) {
             mainHandler.post(() -> notifyError("Failed to parse metadata: " + e.getMessage()));
             return;
         }
-        
-        // Detect texture format
-        detectAndCacheTextureFormat();
         
         // Load textures
         try {
@@ -521,8 +552,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         // Enable blending for transparency
+        // Use premultiplied alpha blending (RGB is pre-multiplied by alpha in encoder)
         GLES30.glEnable(GLES30.GL_BLEND);
-        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA);
+        GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE_MINUS_SRC_ALPHA);
         
         Log.d(TAG, "OpenGL ES 3.0 initialized successfully");
         return true;
@@ -597,6 +629,76 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         return shader;
     }
     
+    /**
+     * Extract BasisPlayerMetadata from KTX2 key-value data section.
+     * Returns null if not found.
+     */
+    private String extractKTX2Metadata(byte[] ktx2Data) {
+        try {
+            if (ktx2Data == null || ktx2Data.length < 80) return null;
+            
+            // Check KTX2 magic: «KTX 20»
+            if (ktx2Data[0] != (byte)0xAB || ktx2Data[1] != 0x4B || ktx2Data[2] != 0x54 || ktx2Data[3] != 0x58) {
+                return null;
+            }
+            
+            // Read KVD offset and length from header (bytes 56-63, little-endian)
+            ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
+            int kvdByteOffset = header.getInt(56);
+            int kvdByteLength = header.getInt(60);
+            
+            if (kvdByteLength == 0 || kvdByteOffset + kvdByteLength > ktx2Data.length) {
+                return null;
+            }
+            
+            // Parse key-value entries
+            int pos = kvdByteOffset;
+            int kvdEnd = kvdByteOffset + kvdByteLength;
+            
+            while (pos < kvdEnd) {
+                if (pos + 4 > ktx2Data.length) break;
+                
+                ByteBuffer entryBuf = ByteBuffer.wrap(ktx2Data, pos, 4).order(ByteOrder.LITTLE_ENDIAN);
+                int entryLength = entryBuf.getInt();
+                pos += 4;
+                
+                if (entryLength == 0 || pos + entryLength > ktx2Data.length) break;
+                
+                // Find key (NUL-terminated string)
+                int keyEnd = pos;
+                while (keyEnd < pos + entryLength && ktx2Data[keyEnd] != 0) {
+                    keyEnd++;
+                }
+                
+                String key = new String(ktx2Data, pos, keyEnd - pos, "UTF-8");
+                
+                if ("BasisPlayerMetadata".equals(key)) {
+                    // Value starts after key's NUL terminator
+                    int valueStart = keyEnd + 1;
+                    int valueEnd = pos + entryLength;
+                    
+                    // Find actual value end (may have NUL terminator)
+                    while (valueEnd > valueStart && ktx2Data[valueEnd - 1] == 0) {
+                        valueEnd--;
+                    }
+                    
+                    String metadataJson = new String(ktx2Data, valueStart, valueEnd - valueStart, "UTF-8");
+                    Log.d(TAG, "Extracted embedded metadata from KTX2: " + metadataJson.substring(0, Math.min(200, metadataJson.length())) + "...");
+                    return metadataJson;
+                }
+                
+                // Move to next entry (with padding to 4-byte alignment)
+                pos += entryLength;
+                pos += (4 - (entryLength % 4)) % 4;
+            }
+            
+            return null;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to extract KTX2 metadata: " + e.getMessage());
+            return null;
+        }
+    }
+    
     private void parseMetadata(String json) throws Exception {
         if (json == null || json.isEmpty()) {
             throw new Exception("Metadata is null or empty");
@@ -635,8 +737,231 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             }
         }
         
+        // Check if this is native ASTC mode
+        String mode = metadata.optString("mode", "uastc");
+        isNativeASTC = "astc".equals(mode);
+        
         Log.i(TAG, "Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
                 ", " + frameRate + " fps, " + partCount + " parts");
+        Log.i(TAG, "Mode: '" + mode + "', isNativeASTC=" + isNativeASTC);
+    }
+    
+    /**
+     * Check if ASTC texture compression is supported by the GPU.
+     */
+    private boolean isASTCSupported() {
+        return cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    }
+    
+    /**
+     * Decompress ASTC data from KTX2 without uploading to GPU.
+     * Used for background thread preloading - upload happens on render thread.
+     * Returns Object[] { byte[] textureData, int width, int height } or null on failure.
+     */
+    private Object[] decompressASTCFromKTX2(byte[] ktx2Data) {
+        try {
+            if (ktx2Data == null || ktx2Data.length < 80) return null;
+            
+            ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
+            
+            int pixelWidth = header.getInt(20);
+            int pixelHeight = header.getInt(24);
+            int supercompressionScheme = header.getInt(44);
+            
+            long level0ByteOffset = header.getLong(80);
+            long level0ByteLength = header.getLong(88);
+            long level0UncompressedLength = header.getLong(96);
+            
+            byte[] textureData;
+            
+            if (supercompressionScheme == 2) {
+                textureData = KTX2PlayerModule.nativeDecompressZstd(
+                    ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, (int)level0UncompressedLength);
+                if (textureData == null) {
+                    return null;
+                }
+            } else if (supercompressionScheme == 0) {
+                textureData = new byte[(int)level0ByteLength];
+                System.arraycopy(ktx2Data, (int)level0ByteOffset, textureData, 0, (int)level0ByteLength);
+            } else {
+                return null;
+            }
+            
+            return new Object[] { textureData, pixelWidth, pixelHeight };
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to decompress ASTC: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Upload decompressed ASTC data to GPU. Must be called on render thread.
+     */
+    private int[] uploadASTCToGPU(byte[] textureData, int pixelWidth, int pixelHeight) {
+        try {
+            if (!isASTCSupported()) {
+                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight);
+            }
+            
+            int[] textureIds = new int[1];
+            GLES30.glGenTextures(1, textureIds, 0);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[0]);
+            
+            ByteBuffer textureBuffer = ByteBuffer.allocateDirect(textureData.length)
+                .order(ByteOrder.nativeOrder());
+            textureBuffer.put(textureData);
+            textureBuffer.position(0);
+            
+            GLES30.glCompressedTexImage2D(
+                GLES30.GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                pixelWidth, pixelHeight, 0, textureData.length, textureBuffer);
+            
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
+            
+            Log.d(TAG, "ASTC uploaded on render thread: ID=" + textureIds[0] + ", " + pixelWidth + "x" + pixelHeight);
+            return new int[] { textureIds[0], pixelWidth, pixelHeight };
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to upload ASTC: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Upload transcoded texture data to GPU. Must be called on render thread.
+     * Handles both compressed (ASTC/ETC2) and uncompressed (RGBA) formats.
+     */
+    private int[] uploadTranscodedToGPU(byte[] textureData, int pixelWidth, int pixelHeight, boolean isCompressed) {
+        try {
+            int[] textureIds = new int[1];
+            GLES30.glGenTextures(1, textureIds, 0);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[0]);
+            
+            ByteBuffer textureBuffer = ByteBuffer.allocateDirect(textureData.length)
+                .order(ByteOrder.nativeOrder());
+            textureBuffer.put(textureData);
+            textureBuffer.position(0);
+            
+            if (isCompressed) {
+                // Use cached format (ASTC or ETC2)
+                GLES30.glCompressedTexImage2D(
+                    GLES30.GL_TEXTURE_2D, 0, cachedTextureFormat,
+                    pixelWidth, pixelHeight, 0, textureData.length, textureBuffer);
+            } else {
+                // RGBA uncompressed
+                GLES30.glTexImage2D(
+                    GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA,
+                    pixelWidth, pixelHeight, 0,
+                    GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, textureBuffer);
+            }
+            
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
+            
+            Log.d(TAG, "Transcoded texture uploaded on render thread: ID=" + textureIds[0] + 
+                    ", " + pixelWidth + "x" + pixelHeight + ", compressed=" + isCompressed);
+            return new int[] { textureIds[0], pixelWidth, pixelHeight };
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to upload transcoded texture: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Load native ASTC data directly from KTX2 file without transcoding.
+     * Handles Zstandard decompression if needed.
+     * Falls back to software ASTC->RGBA decoding on emulator/unsupported devices.
+     * Returns [textureId, width, height] or null on failure.
+     */
+    private int[] loadNativeASTCFromKTX2(byte[] ktx2Data) {
+        try {
+            if (ktx2Data == null || ktx2Data.length < 80) return null;
+            
+            ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
+            
+            // Parse KTX2 header
+            int vkFormat = header.getInt(12);
+            int pixelWidth = header.getInt(20);
+            int pixelHeight = header.getInt(24);
+            int supercompressionScheme = header.getInt(44);
+            
+            Log.d(TAG, "Native ASTC - VkFormat=" + vkFormat + ", " + pixelWidth + "x" + pixelHeight + 
+                  ", supercompression=" + supercompressionScheme);
+            
+            // Read level index (after 80-byte header)
+            long level0ByteOffset = header.getLong(80);
+            long level0ByteLength = header.getLong(88);
+            long level0UncompressedLength = header.getLong(96);
+            
+            Log.d(TAG, "Level 0 - offset=" + level0ByteOffset + ", length=" + level0ByteLength + 
+                  ", uncompressed=" + level0UncompressedLength);
+            
+            byte[] textureData;
+            
+            if (supercompressionScheme == 2) {
+                // Zstandard compression - use native decompression
+                Log.d(TAG, "Decompressing Zstandard data...");
+                textureData = KTX2PlayerModule.nativeDecompressZstd(
+                    ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, (int)level0UncompressedLength);
+                if (textureData == null) {
+                    Log.e(TAG, "Zstd decompression failed");
+                    return null;
+                }
+                Log.d(TAG, "Decompressed " + textureData.length + " bytes");
+            } else if (supercompressionScheme == 0) {
+                // No supercompression
+                textureData = new byte[(int)level0ByteLength];
+                System.arraycopy(ktx2Data, (int)level0ByteOffset, textureData, 0, (int)level0ByteLength);
+            } else {
+                Log.e(TAG, "Unsupported supercompression scheme: " + supercompressionScheme);
+                return null;
+            }
+            
+            // Check if ASTC is supported
+            if (!isASTCSupported()) {
+                // Fallback: decode ASTC to RGBA in software (for emulator)
+                Log.w(TAG, "ASTC not supported - using software decode fallback (emulator mode)");
+                Log.w(TAG, "Note: ASTC textures require a real device for optimal performance");
+                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight);
+            }
+            
+            // Upload to GPU as compressed texture
+            int[] textureIds = new int[1];
+            GLES30.glGenTextures(1, textureIds, 0);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[0]);
+            
+            ByteBuffer textureBuffer = ByteBuffer.allocateDirect(textureData.length)
+                .order(ByteOrder.nativeOrder());
+            textureBuffer.put(textureData);
+            textureBuffer.position(0);
+            
+            GLES30.glCompressedTexImage2D(
+                GLES30.GL_TEXTURE_2D,
+                0,
+                GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                pixelWidth,
+                pixelHeight,
+                0,
+                textureData.length,
+                textureBuffer
+            );
+            
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
+            
+            Log.d(TAG, "Native ASTC texture uploaded: ID=" + textureIds[0] + ", " + pixelWidth + "x" + pixelHeight);
+            
+            return new int[] { textureIds[0], pixelWidth, pixelHeight };
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to load native ASTC: " + e.getMessage());
+            return null;
+        }
     }
     
     private void loadPartTextures(String ktx2Path) throws Exception {
@@ -646,59 +971,48 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         List<Integer> loadedTextureWidths = new ArrayList<>();
         List<Integer> loadedTextureHeights = new ArrayList<>();
         
-        if (partCount > 1 && !partInfoList.isEmpty()) {
-            Log.d(TAG, "Loading " + partCount + " part files...");
+        // Check if we have explicit part URIs (from React Native parts prop)
+        boolean useExplicitParts = explicitPartUris != null && explicitPartUris.length > 1;
+        int actualPartCount = useExplicitParts ? explicitPartUris.length : partCount;
+        
+        if (actualPartCount > 1 && (useExplicitParts || !partInfoList.isEmpty())) {
+            // Load all parts
+            Log.d(TAG, "Loading " + actualPartCount + " part files" + (useExplicitParts ? " (explicit URIs)" : "") + "...");
             
-            for (int i = 0; i < partCount; i++) {
-                String partPath;
-                if (i < partInfoList.size() && partInfoList.get(i).file != null) {
-                    File ktx2File = new File(ktx2Path);
-                    File parentDir = ktx2File.getParentFile();
-                    if (parentDir != null) {
-                        partPath = new File(parentDir, partInfoList.get(i).file).getAbsolutePath();
-                    } else {
-                        partPath = partInfoList.get(i).file;
-                    }
-                } else {
-                    partPath = basePath + "_" + i + ".ktx2";
+            for (int i = 0; i < actualPartCount; i++) {
+                int[] result = loadSinglePart(i, ktx2Path, basePath, useExplicitParts);
+                if (result != null) {
+                    loadedTextureIds.add(result[0]);
+                    loadedTextureWidths.add(result[1]);
+                    loadedTextureHeights.add(result[2]);
                 }
-                
-                Log.d(TAG, "Loading part " + i + ": " + partPath);
-                
-                byte[] ktx2Data = readFileBytes(partPath);
-                if (ktx2Data == null) {
-                    throw new Exception("Failed to read part file: " + partPath);
-                }
-                
-                int[] result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
-                if (result == null || result.length < 3) {
-                    throw new Exception("Failed to transcode part " + i);
-                }
-                
-                loadedTextureIds.add(result[0]);
-                loadedTextureWidths.add(result[1]);
-                loadedTextureHeights.add(result[2]);
-                
-                Log.d(TAG, "Loaded part " + i + " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
             }
         } else {
-            Log.d(TAG, "Loading single KTX2 file: " + ktx2Path);
+            Log.d(TAG, "Loading single KTX2 file: " + ktx2Path + (isNativeASTC ? " (native ASTC)" : ""));
             
             byte[] ktx2Data = readFileBytes(ktx2Path);
             if (ktx2Data == null) {
                 throw new Exception("Failed to read KTX2 file: " + ktx2Path);
             }
             
-            int[] result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+            int[] result;
+            if (isNativeASTC) {
+                Log.d(TAG, "Using native ASTC loader");
+                result = loadNativeASTCFromKTX2(ktx2Data);
+            } else {
+                result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+            }
+            
             if (result == null || result.length < 3) {
-                throw new Exception("Failed to transcode KTX2 file");
+                throw new Exception("Failed to " + (isNativeASTC ? "load native ASTC" : "transcode") + " KTX2 file");
             }
             
             loadedTextureIds.add(result[0]);
             loadedTextureWidths.add(result[1]);
             loadedTextureHeights.add(result[2]);
             
-            Log.d(TAG, "Loaded texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
+            Log.d(TAG, (isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " texture ID " + 
+                  result[0] + " (" + result[1] + "x" + result[2] + ")");
         }
         
         textureIds = new int[loadedTextureIds.size()];
@@ -711,6 +1025,59 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         Log.d(TAG, "Loaded " + textureIds.length + " textures");
+    }
+    
+    /**
+     * Get the path/URL for a specific part file.
+     */
+    private String getPartPath(int partIndex, String ktx2Path, String basePath, boolean useExplicitParts) {
+        if (useExplicitParts && partIndex < explicitPartUris.length && explicitPartUris[partIndex] != null) {
+            // Use explicit URI from parts prop
+            return explicitPartUris[partIndex];
+        } else if (partIndex < partInfoList.size() && partInfoList.get(partIndex).file != null) {
+            // Use filename from metadata
+            File ktx2File = new File(ktx2Path);
+            File parentDir = ktx2File.getParentFile();
+            if (parentDir != null) {
+                return new File(parentDir, partInfoList.get(partIndex).file).getAbsolutePath();
+            } else {
+                return partInfoList.get(partIndex).file;
+            }
+        } else {
+            // Fallback: construct path from base name
+            return basePath + "_" + partIndex + ".ktx2";
+        }
+    }
+    
+    /**
+     * Load a single part texture. Used by both normal and stream mode.
+     */
+    private int[] loadSinglePart(int partIndex, String ktx2Path, String basePath, boolean useExplicitParts) throws Exception {
+        String partPath = getPartPath(partIndex, ktx2Path, basePath, useExplicitParts);
+        
+        Log.d(TAG, "Loading part " + partIndex + ": " + partPath);
+        
+        byte[] ktx2Data = readFileBytes(partPath);
+        if (ktx2Data == null) {
+            throw new Exception("Failed to read part file: " + partPath);
+        }
+        
+        int[] result;
+        if (isNativeASTC) {
+            Log.d(TAG, "Using native ASTC loader for part " + partIndex);
+            result = loadNativeASTCFromKTX2(ktx2Data);
+        } else {
+            result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+        }
+        
+        if (result == null || result.length < 3) {
+            throw new Exception("Failed to " + (isNativeASTC ? "load native ASTC" : "transcode") + " part " + partIndex);
+        }
+        
+        Log.d(TAG, (isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " part " + partIndex + 
+              " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
+        
+        return result;
     }
     
     private void renderFrame() {
@@ -730,6 +1097,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // Bind texture
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
         int partIndex = getCurrentPartIndex();
+        
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[partIndex]);
         GLES30.glUniform1i(uniformTextureLocation, 0);
         
@@ -756,8 +1124,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return new float[]{0, 0, 1, 1};
         }
 
-        int partIndex = currentFrame / framesPerPart;
-        int frameInPart = currentFrame % framesPerPart;
+        int frameToRender = currentFrame;
+
+        int partIndex = frameToRender / framesPerPart;
+        int frameInPart = frameToRender % framesPerPart;
 
         int col = frameInPart % framesPerRow;
         int row = frameInPart / framesPerRow;
@@ -785,7 +1155,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     private int getCurrentPartIndex() {
         if (framesPerPart <= 0) return 0;
-        return Math.min(currentFrame / framesPerPart, textureIds.length - 1);
+        int partIndex = currentFrame / framesPerPart;
+        return Math.min(partIndex, textureIds.length - 1);
     }
     
     private void cleanupGL() {
@@ -825,6 +1196,29 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private byte[] readFileBytes(String path) throws IOException {
         InputStream is = null;
         
+        // Handle HTTP URLs (e.g., from Metro bundler in debug mode)
+        // Download and CACHE to avoid re-downloading during playback
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+            String cachedPath = downloadPartToCache(path);
+            if (cachedPath == null) {
+                throw new IOException("Failed to download and cache: " + path);
+            }
+            // Now read from the cached file
+            File cachedFile = new File(cachedPath);
+            is = new FileInputStream(cachedFile);
+            try {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int len;
+                while ((len = is.read(buffer)) != -1) {
+                    bos.write(buffer, 0, len);
+                }
+                return bos.toByteArray();
+            } finally {
+                is.close();
+            }
+        }
+        
         if (path.startsWith("assets://") || path.startsWith("asset://")) {
             String assetPath = path.replaceFirst("assets?://", "");
             is = getContext().getAssets().open(assetPath);
@@ -853,6 +1247,107 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return bos.toByteArray();
         } finally {
             is.close();
+        }
+    }
+    
+    /**
+     * Download bytes from an HTTP URL (used for Metro bundler in debug mode)
+     */
+    private byte[] downloadBytes(String urlString) throws IOException {
+        java.net.URL url = new java.net.URL(urlString);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+        conn.setRequestProperty("User-Agent", "KTX2Player/1.0");
+        
+        int responseCode = conn.getResponseCode();
+        if (responseCode != java.net.HttpURLConnection.HTTP_OK) {
+            Log.e(TAG, "Download failed: HTTP " + responseCode + " for " + urlString);
+            throw new IOException("HTTP " + responseCode);
+        }
+        
+        Log.d(TAG, "Downloaded " + conn.getContentLength() + " bytes from " + urlString.substring(0, Math.min(80, urlString.length())));
+        
+        try (InputStream in = conn.getInputStream();
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = in.read(buffer)) != -1) {
+                bos.write(buffer, 0, len);
+            }
+            return bos.toByteArray();
+        }
+    }
+    
+    /**
+     * Download a part file to cache. Uses URL hash as cache key.
+     * Returns the cached file path, or null on failure.
+     */
+    private String downloadPartToCache(String urlString) {
+        try {
+            // Generate hash from URL for cache key
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] hashBytes = md.digest(urlString.getBytes());
+            StringBuilder sb = new StringBuilder();
+            for (byte b : hashBytes) {
+                sb.append(String.format("%02x", b));
+            }
+            String hash = sb.toString().substring(0, 16);
+            
+            File cacheDir = new File(getContext().getCacheDir(), "ktx2-parts-cache");
+            if (!cacheDir.exists()) {
+                cacheDir.mkdirs();
+            }
+            
+            File cacheFile = new File(cacheDir, hash + ".ktx2");
+            
+            // Return cached file if it exists
+            if (cacheFile.exists()) {
+                Log.d(TAG, "Using cached part: " + cacheFile.getAbsolutePath());
+                return cacheFile.getAbsolutePath();
+            }
+            
+            // Download to cache
+            Log.d(TAG, "Downloading part to cache: " + urlString.substring(0, Math.min(80, urlString.length())));
+            
+            java.net.URL url = new java.net.URL(urlString);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(30000);
+            conn.setRequestProperty("User-Agent", "KTX2Player/1.0");
+            
+            int responseCode = conn.getResponseCode();
+            if (responseCode != java.net.HttpURLConnection.HTTP_OK) {
+                Log.e(TAG, "Part download failed: HTTP " + responseCode);
+                return null;
+            }
+            
+            // Download to temp file first, then rename
+            File tempFile = new File(cacheDir, hash + ".tmp");
+            
+            try (InputStream in = conn.getInputStream();
+                 FileOutputStream out = new FileOutputStream(tempFile)) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                int totalBytes = 0;
+                while ((bytesRead = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, bytesRead);
+                    totalBytes += bytesRead;
+                }
+                Log.d(TAG, "Downloaded " + totalBytes + " bytes to cache");
+            }
+            
+            // Rename temp to final
+            if (tempFile.renameTo(cacheFile)) {
+                return cacheFile.getAbsolutePath();
+            } else {
+                // Fallback: copy if rename fails
+                tempFile.delete();
+                return null;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to download part to cache: " + e.getMessage());
+            return null;
         }
     }
     

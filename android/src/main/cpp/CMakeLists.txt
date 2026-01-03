@@ -26,6 +26,7 @@ target_compile_definitions(basis_transcoder PRIVATE
 # Add native library
 add_library(ktx2player SHARED
     ktx2player_jni.cpp
+    astc_decomp.cpp
 )
 
 target_include_directories(ktx2player PRIVATE

@@ -18,7 +18,7 @@
 
 // React Native props
 @property (nonatomic, copy) NSDictionary *source;
-@property (nonatomic, copy) NSString *metadata;
+@property (nonatomic, copy) NSArray *parts;  // For multi-part animations: array of source dictionaries
 @property (nonatomic, copy) NSString *cacheKey;
 @property (nonatomic, assign) BOOL autoPlay;
 @property (nonatomic, assign) BOOL enableFrameEvents;

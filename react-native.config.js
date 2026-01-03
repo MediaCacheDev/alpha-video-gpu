@@ -7,7 +7,7 @@ module.exports = {
         packageInstance: 'new KTX2PlayerPackage()',
       },
       ios: {
-        podspecPath: './ios/KTX2Player.podspec',
+        podspecPath: './react-native-ktx2player.podspec',
       },
     },
   },

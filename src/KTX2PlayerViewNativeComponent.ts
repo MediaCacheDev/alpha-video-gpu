@@ -2,20 +2,18 @@ import type { ViewProps, HostComponent } from 'react-native';
 import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';
 
 import type {
-  Float,
-  Int32,
-  // DirectEventHandler,
+  Float
 } from 'react-native/Libraries/Types/CodegenTypes';
 
 export interface SourceType {
   uri?: string;
-  path?: string;
   cacheKey?: string;
-  metadata?: string;
 }
 
 export interface NativeProps extends ViewProps {
   source?: SourceType | null;
+  /** For multi-part animations: array of all part sources (first part contains metadata) */
+  parts?: ReadonlyArray<SourceType> | null;
   autoPlay?: boolean;
   loop?: boolean;
   playbackSpeed?: Float;
