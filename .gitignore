@@ -29,6 +29,7 @@ ios/*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
 # Android
 android/.gradle/
 android/build/
+android/.cxx/
 android/app/build/
 android/local.properties
 *.apk

@@ -1,9 +1,5 @@
 import type { ViewProps, HostComponent } from 'react-native';
-import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';
-
-import type {
-  Float
-} from 'react-native/Libraries/Types/CodegenTypes';
+import { requireNativeComponent } from 'react-native';
 
 export interface SourceType {
   uri?: string;
@@ -16,12 +12,10 @@ export interface NativeProps extends ViewProps {
   parts?: ReadonlyArray<SourceType> | null;
   autoPlay?: boolean;
   loop?: boolean;
-  playbackSpeed?: Float;
+  playbackSpeed?: number;
   cacheKey?: string;
 }
 
-// codegenNativeComponent uses Fabric on New Architecture
-// and auto-falls back to requireNativeComponent on Legacy Architecture
-export default codegenNativeComponent<NativeProps>(
+export default requireNativeComponent<NativeProps>(
   'KTX2PlayerView'
 ) as HostComponent<NativeProps>;

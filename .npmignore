@@ -39,6 +39,17 @@ build/
 dist/
 coverage/
 
+# Android build artifacts
+android/build/
+android/.cxx/
+android/.gradle/
+android/local.properties
+
+# iOS build artifacts
+ios/build/
+ios/Pods/
+*.xcworkspace
+
 # IDE
 .idea/
 .vscode/
