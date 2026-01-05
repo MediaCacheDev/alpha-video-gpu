@@ -67,6 +67,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private boolean loop = true;
     private float playbackSpeed = 1.0f;
     private boolean enableFrameEvents = false;  // Disabled by default for performance
+    private boolean gpuPlayback = false;  // GPU-controlled frame timing (experimental)
     
     // Animation state
     private int currentFrame = 0;
@@ -112,6 +113,18 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private int[] textureHeights = new int[0];
     private int uniformFrameUVLocation = -1;
     private int uniformTextureLocation = -1;
+    
+    // GPU playback uniforms
+    private int uniformElapsedTimeLocation = -1;
+    private int uniformFpsLocation = -1;
+    private int uniformTotalFramesLocation = -1;
+    private int uniformFramesPerRowLocation = -1;
+    private int uniformFramesPerPartLocation = -1;
+    private int uniformFrameWidthLocation = -1;
+    private int uniformFrameHeightLocation = -1;
+    private int uniformTextureWidthLocation = -1;
+    private int uniformTextureHeightLocation = -1;
+    private int uniformGpuPlaybackLocation = -1;
     private FloatBuffer vertexBuffer;
     private FloatBuffer texCoordBuffer;
     
@@ -150,8 +163,34 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         "varying vec2 vTexCoord;\n" +
         "uniform sampler2D uTexture;\n" +
         "uniform vec4 uFrameUV;\n" +
+        "// GPU playback uniforms\n" +
+        "uniform float uElapsedTime;\n" +
+        "uniform float uFps;\n" +
+        "uniform float uTotalFrames;\n" +
+        "uniform float uFramesPerRow;\n" +
+        "uniform float uFramesPerPart;\n" +
+        "uniform float uFrameWidth;\n" +
+        "uniform float uFrameHeight;\n" +
+        "uniform float uTextureWidth;\n" +
+        "uniform float uTextureHeight;\n" +
+        "uniform int uGpuPlayback;\n" +
         "void main() {\n" +
-        "  vec2 uv = mix(uFrameUV.xy, uFrameUV.zw, vTexCoord);\n" +
+        "  vec2 uv;\n" +
+        "  if (uGpuPlayback == 1) {\n" +
+        "    // GPU-controlled frame calculation\n" +
+        "    float frameIndex = floor(mod(uElapsedTime * uFps, uTotalFrames));\n" +
+        "    float frameInPart = floor(mod(frameIndex, uFramesPerPart));\n" +
+        "    float col = floor(mod(frameInPart, uFramesPerRow));\n" +
+        "    float row = floor(frameInPart / uFramesPerRow);\n" +
+        "    float minU = (col * uFrameWidth) / uTextureWidth;\n" +
+        "    float maxU = ((col + 1.0) * uFrameWidth) / uTextureWidth;\n" +
+        "    float minV = (row * uFrameHeight) / uTextureHeight;\n" +
+        "    float maxV = ((row + 1.0) * uFrameHeight) / uTextureHeight;\n" +
+        "    uv = vec2(mix(minU, maxU, vTexCoord.x), mix(minV, maxV, vTexCoord.y));\n" +
+        "  } else {\n" +
+        "    // CPU-controlled frame (original behavior)\n" +
+        "    uv = mix(uFrameUV.xy, uFrameUV.zw, vTexCoord);\n" +
+        "  }\n" +
         "  vec4 color = texture2D(uTexture, uv);\n" +
         "  gl_FragColor = color;\n" +
         "}\n";
@@ -294,6 +333,11 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     public void setEnableFrameEvents(boolean enable) {
         this.enableFrameEvents = enable;
+    }
+    
+    public void setGpuPlayback(boolean gpuPlayback) {
+        this.gpuPlayback = gpuPlayback;
+        Log.d(TAG, "setGpuPlayback: " + gpuPlayback);
     }
     
     /**
@@ -466,54 +510,100 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // Render loop
         long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
         
+        // GPU playback: use elapsed time instead of frame counting
+        long gpuPlaybackStartTime = System.nanoTime();
+        gpuElapsedTime = 0.0f;
+        
+        Log.d(TAG, "Starting render loop (gpuPlayback=" + gpuPlayback + ")");
+        
         do {
             long loopStartTime = System.nanoTime();
             currentFrame = 0;
             
-            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
-                if (isPlaying.get()) {
-                    renderFrame();
-                    if (enableFrameEvents) {
-                        mainHandler.post(() -> notifyFrameUpdate());
-                    }
-                    
-                    currentFrame++;
-                    if (currentFrame >= totalFrames) {
-                        if (loop) {
-                            currentFrame = 0;
-                            loopStartTime = System.nanoTime();
-                        } else {
+            if (gpuPlayback) {
+                // GPU playback mode: simpler loop, GPU calculates frame from elapsed time
+                while (!shouldStop.get() && !isDestroyed.get()) {
+                    if (isPlaying.get()) {
+                        // Update elapsed time
+                        gpuElapsedTime = (System.nanoTime() - gpuPlaybackStartTime) / 1_000_000_000.0f;
+                        
+                        // Handle looping
+                        float animDuration = totalFrames / (frameRate * playbackSpeed);
+                        if (!loop && gpuElapsedTime >= animDuration) {
                             mainHandler.post(() -> {
                                 notifyFinished();
                                 notifyStateChange("stopped");
                             });
                             break;
                         }
-                    }
-                    
-                    long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
-                    long sleepNs = targetTimeNs - System.nanoTime();
-                    
-                    if (sleepNs > 1_000_000) {
+                        
+                        renderFrame();
+                        
+                        // Sleep to target ~60fps render rate (GPU handles frame timing)
                         try {
-                            Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
+                            Thread.sleep(16);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    } else {
+                        // Paused - render current frame, don't advance time
+                        renderFrame();
+                        try {
+                            Thread.sleep(50);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                             return;
                         }
                     }
-                } else {
-                    // Paused - still render current frame but sleep longer
-                    renderFrame();
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
+                }
+            } else {
+                // CPU playback mode: original frame-by-frame loop
+                while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
+                    if (isPlaying.get()) {
+                        renderFrame();
+                        if (enableFrameEvents) {
+                            mainHandler.post(() -> notifyFrameUpdate());
+                        }
+                        
+                        currentFrame++;
+                        if (currentFrame >= totalFrames) {
+                            if (loop) {
+                                currentFrame = 0;
+                                loopStartTime = System.nanoTime();
+                            } else {
+                                mainHandler.post(() -> {
+                                    notifyFinished();
+                                    notifyStateChange("stopped");
+                                });
+                                break;
+                            }
+                        }
+                        
+                        long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
+                        long sleepNs = targetTimeNs - System.nanoTime();
+                        
+                        if (sleepNs > 1_000_000) {
+                            try {
+                                Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            }
+                        }
+                    } else {
+                        // Paused - still render current frame but sleep longer
+                        renderFrame();
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                     }
                 }
             }
-        } while (loop && !shouldStop.get() && !isDestroyed.get());
+        } while (loop && !shouldStop.get() && !isDestroyed.get() && !gpuPlayback);
     }
     
     private boolean initGL(SurfaceTexture surfaceTexture) {
@@ -627,7 +717,20 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         uniformTextureLocation = GLES30.glGetUniformLocation(program, "uTexture");
         uniformFrameUVLocation = GLES30.glGetUniformLocation(program, "uFrameUV");
         
-        Log.d(TAG, "Shaders initialized successfully");
+        // GPU playback uniforms
+        uniformElapsedTimeLocation = GLES30.glGetUniformLocation(program, "uElapsedTime");
+        uniformFpsLocation = GLES30.glGetUniformLocation(program, "uFps");
+        uniformTotalFramesLocation = GLES30.glGetUniformLocation(program, "uTotalFrames");
+        uniformFramesPerRowLocation = GLES30.glGetUniformLocation(program, "uFramesPerRow");
+        uniformFramesPerPartLocation = GLES30.glGetUniformLocation(program, "uFramesPerPart");
+        uniformFrameWidthLocation = GLES30.glGetUniformLocation(program, "uFrameWidth");
+        uniformFrameHeightLocation = GLES30.glGetUniformLocation(program, "uFrameHeight");
+        uniformTextureWidthLocation = GLES30.glGetUniformLocation(program, "uTextureWidth");
+        uniformTextureHeightLocation = GLES30.glGetUniformLocation(program, "uTextureHeight");
+        uniformGpuPlaybackLocation = GLES30.glGetUniformLocation(program, "uGpuPlayback");
+        
+        Log.d(TAG, "Shaders initialized successfully (gpuPlayback uniforms: " + 
+              (uniformGpuPlaybackLocation >= 0 ? "found" : "not found") + ")");
         return true;
     }
     
@@ -1212,6 +1315,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         return result;
     }
     
+    // GPU playback elapsed time (in seconds)
+    private float gpuElapsedTime = 0.0f;
+    
     private void renderFrame() {
         if (eglDisplay == null || eglSurface == null || textureIds == null || textureIds.length == 0) {
             return;
@@ -1222,13 +1328,34 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         GLES30.glViewport(0, 0, getWidth(), getHeight());
         GLES30.glUseProgram(program);
         
-        // Calculate frame UV
-        float[] uv = calculateFrameUV();
-        GLES30.glUniform4f(uniformFrameUVLocation, uv[0], uv[1], uv[2], uv[3]);
+        // Set GPU playback mode
+        GLES30.glUniform1i(uniformGpuPlaybackLocation, gpuPlayback ? 1 : 0);
+        
+        if (gpuPlayback) {
+            // GPU-controlled playback: pass elapsed time and animation parameters to shader
+            GLES30.glUniform1f(uniformElapsedTimeLocation, gpuElapsedTime);
+            GLES30.glUniform1f(uniformFpsLocation, frameRate * playbackSpeed);
+            GLES30.glUniform1f(uniformTotalFramesLocation, (float) totalFrames);
+            GLES30.glUniform1f(uniformFramesPerRowLocation, (float) framesPerRow);
+            GLES30.glUniform1f(uniformFramesPerPartLocation, (float) framesPerPart);
+            GLES30.glUniform1f(uniformFrameWidthLocation, (float) frameWidth);
+            GLES30.glUniform1f(uniformFrameHeightLocation, (float) frameHeight);
+            
+            // Get texture dimensions for current part
+            int partIndex = getCurrentPartIndexForGpu();
+            int texW = partIndex < textureWidths.length ? textureWidths[partIndex] : framesPerRow * frameWidth;
+            int texH = partIndex < textureHeights.length ? textureHeights[partIndex] : ((framesPerPart + framesPerRow - 1) / framesPerRow) * frameHeight;
+            GLES30.glUniform1f(uniformTextureWidthLocation, (float) texW);
+            GLES30.glUniform1f(uniformTextureHeightLocation, (float) texH);
+        } else {
+            // CPU-controlled playback: calculate frame UV on CPU
+            float[] uv = calculateFrameUV();
+            GLES30.glUniform4f(uniformFrameUVLocation, uv[0], uv[1], uv[2], uv[3]);
+        }
         
         // Bind texture
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
-        int partIndex = getCurrentPartIndex();
+        int partIndex = gpuPlayback ? getCurrentPartIndexForGpu() : getCurrentPartIndex();
         
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[partIndex]);
         GLES30.glUniform1i(uniformTextureLocation, 0);
@@ -1249,6 +1376,14 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         GLES30.glDisableVertexAttribArray(texCoordHandle);
         
         EGL14.eglSwapBuffers(eglDisplay, eglSurface);
+    }
+    
+    private int getCurrentPartIndexForGpu() {
+        // Calculate current frame from elapsed time for GPU playback
+        int frameIndex = (int) (gpuElapsedTime * frameRate * playbackSpeed) % totalFrames;
+        if (framesPerPart <= 0) return 0;
+        int partIndex = frameIndex / framesPerPart;
+        return Math.min(partIndex, textureIds.length - 1);
     }
     
     private float[] calculateFrameUV() {

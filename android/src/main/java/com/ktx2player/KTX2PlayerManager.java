@@ -108,6 +108,11 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
         view.setEnableFrameEvents(enable);
     }
     
+    @ReactProp(name = "gpuPlayback", defaultBoolean = false)
+    public void setGpuPlayback(KTX2TextureView view, boolean gpuPlayback) {
+        view.setGpuPlayback(gpuPlayback);
+    }
+    
     /**
      * Set explicit part URIs for multi-part animations.
      * This is needed for bundled assets where sibling files can't be auto-discovered.

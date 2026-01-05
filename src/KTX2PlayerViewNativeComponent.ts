@@ -14,6 +14,13 @@ export interface NativeProps extends ViewProps {
   loop?: boolean;
   playbackSpeed?: number;
   cacheKey?: string;
+  /**
+   * Enable GPU-controlled playback timing (experimental).
+   * When true: GPU calculates frame index from elapsed time in shader.
+   * When false (default): CPU controls frame timing in render loop.
+   * GPU mode may improve performance with many simultaneous animations.
+   */
+  gpuPlayback?: boolean;
 }
 
 export default requireNativeComponent<NativeProps>(

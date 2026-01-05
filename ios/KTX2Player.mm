@@ -39,6 +39,10 @@
   // GLB container support
   BOOL _isGLBContainer;
   NSArray<NSData *> *_glbKtx2Parts;
+  
+  // GPU playback support
+  CFTimeInterval _gpuPlaybackStartTime;
+  float _gpuElapsedTime;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -288,7 +292,7 @@
                                   "  return out;\n"
                                   "}";
   
-  // Create fragment shader with grid support (must include VertexOut struct since shaders compile separately)
+  // Create fragment shader with grid support and GPU playback (must include VertexOut struct since shaders compile separately)
   NSString *fragmentShaderSource = @"#include <metal_stdlib>\n"
                                     "using namespace metal;\n"
                                     "struct VertexOut {\n"
@@ -297,12 +301,35 @@
                                     "};\n"
                                     "struct Uniforms {\n"
                                     "  float4 frameUV;\n"
+                                    "  float elapsedTime;\n"
+                                    "  float fps;\n"
+                                    "  float totalFrames;\n"
+                                    "  float framesPerRow;\n"
+                                    "  float framesPerPart;\n"
+                                    "  float frameWidth;\n"
+                                    "  float frameHeight;\n"
+                                    "  float textureWidth;\n"
+                                    "  float textureHeight;\n"
+                                    "  int gpuPlayback;\n"
                                     "};\n"
                                     "fragment float4 fragment_main(VertexOut in [[stage_in]],\n"
                                     "                             texture2d<float> tex [[texture(0)]],\n"
                                     "                             sampler s [[sampler(0)]],\n"
                                     "                             constant Uniforms &uniforms [[buffer(0)]]) {\n"
-                                    "  float2 uv = mix(uniforms.frameUV.xy, uniforms.frameUV.zw, in.texCoord);\n"
+                                    "  float2 uv;\n"
+                                    "  if (uniforms.gpuPlayback == 1) {\n"
+                                    "    float frameIndex = floor(fmod(uniforms.elapsedTime * uniforms.fps, uniforms.totalFrames));\n"
+                                    "    float frameInPart = floor(fmod(frameIndex, uniforms.framesPerPart));\n"
+                                    "    float col = floor(fmod(frameInPart, uniforms.framesPerRow));\n"
+                                    "    float row = floor(frameInPart / uniforms.framesPerRow);\n"
+                                    "    float minU = (col * uniforms.frameWidth) / uniforms.textureWidth;\n"
+                                    "    float maxU = ((col + 1.0) * uniforms.frameWidth) / uniforms.textureWidth;\n"
+                                    "    float minV = (row * uniforms.frameHeight) / uniforms.textureHeight;\n"
+                                    "    float maxV = ((row + 1.0) * uniforms.frameHeight) / uniforms.textureHeight;\n"
+                                    "    uv = float2(mix(minU, maxU, in.texCoord.x), mix(minV, maxV, in.texCoord.y));\n"
+                                    "  } else {\n"
+                                    "    uv = mix(uniforms.frameUV.xy, uniforms.frameUV.zw, in.texCoord);\n"
+                                    "  }\n"
                                     "  return tex.sample(s, uv);\n"
                                     "}";
   
@@ -356,8 +383,9 @@
 
 - (void)setupVertexData
 {
-  // Create uniform buffer for frame UVs
-  self.uniformBuffer = [self.device newBufferWithLength:sizeof(float) * 4 options:MTLResourceStorageModeShared];
+  // Create uniform buffer for frame UVs and GPU playback parameters
+  // Uniforms struct: float4 frameUV (16 bytes) + 9 floats (36 bytes) + 1 int (4 bytes) = 56 bytes, aligned to 64
+  self.uniformBuffer = [self.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
   
   // Create sampler state
   MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
@@ -1079,16 +1107,21 @@
 
 - (void)play
 {
-  NSLog(@"KTX2PlayerView: play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu", 
-        self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count);
+  NSLog(@"KTX2PlayerView: play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu, gpuPlayback=%d", 
+        self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count, self.gpuPlayback);
   
   if (!self.isPlaying && self.totalFrames > 0) {
     NSLog(@"KTX2PlayerView: Starting playback...");
     self.isPlaying = YES;
     self.lastFrameTime = CACurrentMediaTime();
     
+    // Initialize GPU playback timing
+    _gpuPlaybackStartTime = CACurrentMediaTime();
+    _gpuElapsedTime = 0.0f;
+    
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
-    self.displayLink.preferredFramesPerSecond = (NSInteger)self.frameRate;
+    // For GPU playback, use 60fps render rate (GPU handles frame timing)
+    self.displayLink.preferredFramesPerSecond = self.gpuPlayback ? 60 : (NSInteger)self.frameRate;
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     
     [self notifyStateChange:@"playing"];
@@ -1134,32 +1167,54 @@
   if (!self.isPlaying) return;
   
   CFTimeInterval currentTime = CACurrentMediaTime();
-  CFTimeInterval elapsed = currentTime - self.lastFrameTime;
   
-  if (elapsed >= self.frameInterval / self.playbackSpeed) {
-    self.lastFrameTime = currentTime - fmod(elapsed, self.frameInterval / self.playbackSpeed);
+  if (self.gpuPlayback) {
+    // GPU playback mode: update elapsed time, GPU calculates frame in shader
+    _gpuElapsedTime = (float)(currentTime - _gpuPlaybackStartTime);
     
-    self.currentFrame++;
-    
-    if (self.currentFrame >= self.totalFrames) {
-      if (self.loop) {
-        self.currentFrame = 0;
-      } else {
-        self.isPlaying = NO;
-        if (self.displayLink) {
-          [self.displayLink invalidate];
-          self.displayLink = nil;
-        }
-        [self notifyFinished];
-        return;
+    // Handle non-looping end condition
+    float animDuration = self.totalFrames / (self.frameRate * self.playbackSpeed);
+    if (!self.loop && _gpuElapsedTime >= animDuration) {
+      self.isPlaying = NO;
+      if (self.displayLink) {
+        [self.displayLink invalidate];
+        self.displayLink = nil;
       }
+      [self notifyFinished];
+      return;
     }
     
-    if (self.enableFrameEvents) {
-      [self notifyFrameUpdate];
-    }
     [self updateUniforms];
     [self setNeedsDisplay];
+  } else {
+    // CPU playback mode: original frame-by-frame logic
+    CFTimeInterval elapsed = currentTime - self.lastFrameTime;
+    
+    if (elapsed >= self.frameInterval / self.playbackSpeed) {
+      self.lastFrameTime = currentTime - fmod(elapsed, self.frameInterval / self.playbackSpeed);
+      
+      self.currentFrame++;
+      
+      if (self.currentFrame >= self.totalFrames) {
+        if (self.loop) {
+          self.currentFrame = 0;
+        } else {
+          self.isPlaying = NO;
+          if (self.displayLink) {
+            [self.displayLink invalidate];
+            self.displayLink = nil;
+          }
+          [self notifyFinished];
+          return;
+        }
+      }
+      
+      if (self.enableFrameEvents) {
+        [self notifyFrameUpdate];
+      }
+      [self updateUniforms];
+      [self setNeedsDisplay];
+    }
   }
 }
 
@@ -1168,6 +1223,12 @@
   // Calculate frame UV based on 2D grid layout
   NSInteger partIndex = self.framesPerPart > 0 ? self.currentFrame / self.framesPerPart : 0;
   NSInteger frameToRender = self.currentFrame;
+  
+  // For GPU playback, calculate part index from elapsed time
+  if (self.gpuPlayback) {
+    NSInteger frameIndex = (NSInteger)(_gpuElapsedTime * self.frameRate * self.playbackSpeed) % self.totalFrames;
+    partIndex = self.framesPerPart > 0 ? frameIndex / self.framesPerPart : 0;
+  }
   
   partIndex = MIN(partIndex, (NSInteger)self.partTextures.count - 1);
   NSInteger frameInPart = self.framesPerPart > 0 ? frameToRender % self.framesPerPart : frameToRender;
@@ -1205,11 +1266,30 @@
   float minV = (row * self.frameHeight) / (float)partHeight;
   float maxV = ((row + 1) * self.frameHeight) / (float)partHeight;
   
+  // Uniform buffer layout (must match Metal shader struct):
+  // float4 frameUV (16 bytes)
+  // float elapsedTime, fps, totalFrames, framesPerRow, framesPerPart (20 bytes)
+  // float frameWidth, frameHeight, textureWidth, textureHeight (16 bytes)
+  // int gpuPlayback (4 bytes)
   float *uniforms = (float *)[self.uniformBuffer contents];
   uniforms[0] = minU;
   uniforms[1] = minV;
   uniforms[2] = maxU;
   uniforms[3] = maxV;
+  
+  // GPU playback uniforms
+  uniforms[4] = _gpuElapsedTime;                           // elapsedTime
+  uniforms[5] = (float)(self.frameRate * self.playbackSpeed); // fps
+  uniforms[6] = (float)self.totalFrames;                   // totalFrames
+  uniforms[7] = (float)self.framesPerRow;                  // framesPerRow
+  uniforms[8] = (float)self.framesPerPart;                 // framesPerPart
+  uniforms[9] = (float)self.frameWidth;                    // frameWidth
+  uniforms[10] = (float)self.frameHeight;                  // frameHeight
+  uniforms[11] = (float)partWidth;                         // textureWidth
+  uniforms[12] = (float)partHeight;                        // textureHeight
+  
+  int *gpuPlaybackFlag = (int *)&uniforms[13];
+  *gpuPlaybackFlag = self.gpuPlayback ? 1 : 0;
   
   // Update current texture based on part index
   if (partIndex < (NSInteger)self.partTextures.count) {

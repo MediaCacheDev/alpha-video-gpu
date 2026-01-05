@@ -22,6 +22,7 @@
 @property (nonatomic, copy) NSString *cacheKey;
 @property (nonatomic, assign) BOOL autoPlay;
 @property (nonatomic, assign) BOOL enableFrameEvents;
+@property (nonatomic, assign) BOOL gpuPlayback;  // GPU-controlled frame timing (experimental)
 
 // Animation properties
 @property (nonatomic, assign) NSInteger currentFrame;
