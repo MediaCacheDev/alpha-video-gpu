@@ -10,6 +10,9 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <atomic>
 
 #include "basisu_transcoder.h"
 
@@ -701,6 +704,489 @@ Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass 
     env->SetIntArrayRegion(result, 0, 4, values);
     
     return result;
+}
+
+/**
+ * Streaming decompression support using ZSTD_DStream.
+ * This allows progressive decompression of .ktx2.zst files.
+ * Per-instance state management for multiple concurrent streams.
+ * 
+ * Memory optimization: Uses memory-mapped files to avoid copying
+ * compressed data into Java heap and C++ heap.
+ */
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+// Per-instance streaming decompression state
+struct StreamingDecompressState {
+    ZSTD_DStream* dstream = nullptr;
+    
+    // Memory-mapped file (preferred - zero copy)
+    int fd = -1;
+    void* mmap_ptr = nullptr;
+    size_t mmap_size = 0;
+    
+    // Fallback: heap-allocated input (for byte array init)
+    std::vector<uint8_t> input_heap;
+    
+    // Unified input pointer and size
+    const uint8_t* input_data = nullptr;
+    size_t input_size = 0;
+    size_t input_pos = 0;
+    
+    // Output buffer (reused across calls)
+    std::vector<uint8_t> output;
+    
+    ~StreamingDecompressState() {
+        if (dstream) {
+            ZSTD_freeDStream(dstream);
+            dstream = nullptr;
+        }
+        if (mmap_ptr && mmap_ptr != MAP_FAILED) {
+            munmap(mmap_ptr, mmap_size);
+            mmap_ptr = nullptr;
+        }
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+};
+
+// Map of instance ID -> streaming state
+static std::map<jlong, std::unique_ptr<StreamingDecompressState>> g_streaming_states;
+static std::mutex g_streaming_mutex;
+static std::atomic<jlong> g_next_stream_id{1};
+
+/**
+ * Initialize streaming decompression with a file path (memory-mapped).
+ * This is the preferred method - avoids copying data to Java/C++ heap.
+ * Returns a unique stream ID (> 0), or 0 on error.
+ */
+JNIEXPORT jlong JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressInitFromFile(JNIEnv *env, jclass clazz,
+                                                                            jstring file_path) {
+    const char* path = env->GetStringUTFChars(file_path, nullptr);
+    if (!path) {
+        LOGE("Failed to get file path string");
+        return 0;
+    }
+    
+    // Create new per-instance state
+    auto state = std::make_unique<StreamingDecompressState>();
+    
+    // Open file
+    state->fd = open(path, O_RDONLY);
+    if (state->fd < 0) {
+        LOGE("Failed to open file: %s (errno=%d)", path, errno);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Get file size
+    struct stat st;
+    if (fstat(state->fd, &st) < 0) {
+        LOGE("Failed to stat file: %s", path);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    state->mmap_size = st.st_size;
+    
+    // Memory-map the file (read-only, private)
+    state->mmap_ptr = mmap(nullptr, state->mmap_size, PROT_READ, MAP_PRIVATE, state->fd, 0);
+    if (state->mmap_ptr == MAP_FAILED) {
+        LOGE("Failed to mmap file: %s (errno=%d)", path, errno);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Advise kernel we'll read sequentially
+    madvise(state->mmap_ptr, state->mmap_size, MADV_SEQUENTIAL);
+    
+    // Set up unified input pointer
+    state->input_data = static_cast<const uint8_t*>(state->mmap_ptr);
+    state->input_size = state->mmap_size;
+    state->input_pos = 0;
+    
+    // Create decompression stream
+    state->dstream = ZSTD_createDStream();
+    if (!state->dstream) {
+        LOGE("Failed to create ZSTD_DStream");
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    size_t initResult = ZSTD_initDStream(state->dstream);
+    if (ZSTD_isError(initResult)) {
+        LOGE("Failed to init ZSTD_DStream: %s", ZSTD_getErrorName(initResult));
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Allocate output buffer
+    state->output.resize(64 * 1024);
+    
+    // Generate unique stream ID and store state
+    jlong streamId = g_next_stream_id.fetch_add(1);
+    
+    LOGI("Streaming decompression initialized from mmap: stream %lld, %zu bytes from %s", 
+         (long long)streamId, state->mmap_size, path);
+    
+    env->ReleaseStringUTFChars(file_path, path);
+    
+    {
+        std::lock_guard<std::mutex> lock(g_streaming_mutex);
+        g_streaming_states[streamId] = std::move(state);
+    }
+    
+    return streamId;
+}
+
+/**
+ * Initialize streaming decompression with compressed data (fallback).
+ * Use nativeStreamingDecompressInitFromFile when possible for better memory efficiency.
+ * Returns a unique stream ID (> 0), or 0 on error.
+ */
+JNIEXPORT jlong JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressInit(JNIEnv *env, jclass clazz,
+                                                                     jbyteArray compressed_data) {
+    // Create new per-instance state
+    auto state = std::make_unique<StreamingDecompressState>();
+    
+    // Create decompression stream
+    state->dstream = ZSTD_createDStream();
+    if (!state->dstream) {
+        LOGE("Failed to create ZSTD_DStream");
+        return 0;
+    }
+    
+    size_t initResult = ZSTD_initDStream(state->dstream);
+    if (ZSTD_isError(initResult)) {
+        LOGE("Failed to init ZSTD_DStream: %s", ZSTD_getErrorName(initResult));
+        return 0;
+    }
+    
+    // Copy compressed data to heap (fallback path)
+    jsize data_length = env->GetArrayLength(compressed_data);
+    jbyte* data = env->GetByteArrayElements(compressed_data, nullptr);
+    if (!data) {
+        LOGE("Failed to get compressed data");
+        return 0;
+    }
+    
+    state->input_heap.assign((uint8_t*)data, (uint8_t*)data + data_length);
+    env->ReleaseByteArrayElements(compressed_data, data, JNI_ABORT);
+    
+    // Set up unified input pointer
+    state->input_data = state->input_heap.data();
+    state->input_size = state->input_heap.size();
+    state->input_pos = 0;
+    
+    // Allocate output buffer
+    state->output.resize(64 * 1024);
+    
+    // Generate unique stream ID and store state
+    jlong streamId = g_next_stream_id.fetch_add(1);
+    
+    {
+        std::lock_guard<std::mutex> lock(g_streaming_mutex);
+        g_streaming_states[streamId] = std::move(state);
+    }
+    
+    LOGI("Streaming decompression initialized (heap): stream %lld, %zu bytes input", (long long)streamId, data_length);
+    
+    return streamId;
+}
+
+/**
+ * Continue streaming decompression for a specific stream.
+ * Returns decompressed chunk, or null if done/error.
+ * The returned array format: [status(1 byte), data...]
+ * Status: 0 = more data available, 1 = done, 2 = error
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressContinue(JNIEnv *env, jclass clazz,
+                                                                         jlong stream_id,
+                                                                         jint max_output_bytes) {
+    StreamingDecompressState* state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_streaming_mutex);
+        auto it = g_streaming_states.find(stream_id);
+        if (it == g_streaming_states.end()) {
+            LOGE("Streaming decompression not found for stream %lld", (long long)stream_id);
+            return nullptr;
+        }
+        state = it->second.get();
+    }
+    
+    if (!state || !state->dstream) {
+        LOGE("Streaming decompression not initialized for stream %lld", (long long)stream_id);
+        return nullptr;
+    }
+    
+    // Check if we've consumed all input
+    if (state->input_pos >= state->input_size) {
+        // Return done status
+        jbyteArray result = env->NewByteArray(1);
+        jbyte status = 1; // done
+        env->SetByteArrayRegion(result, 0, 1, &status);
+        return result;
+    }
+    
+    // Ensure output buffer is large enough
+    if (state->output.size() < (size_t)max_output_bytes) {
+        state->output.resize(max_output_bytes);
+    }
+    
+    // Setup input/output buffers (using unified input_data pointer)
+    ZSTD_inBuffer input = {
+        state->input_data + state->input_pos,
+        state->input_size - state->input_pos,
+        0
+    };
+    
+    ZSTD_outBuffer output = {
+        state->output.data(),
+        (size_t)max_output_bytes,
+        0
+    };
+    
+    // Decompress
+    size_t result = ZSTD_decompressStream(state->dstream, &output, &input);
+    
+    if (ZSTD_isError(result)) {
+        LOGE("Streaming decompression error for stream %lld: %s", (long long)stream_id, ZSTD_getErrorName(result));
+        jbyteArray errorResult = env->NewByteArray(1);
+        jbyte status = 2; // error
+        env->SetByteArrayRegion(errorResult, 0, 1, &status);
+        return errorResult;
+    }
+    
+    // Update input position
+    state->input_pos += input.pos;
+    
+    // Check if done
+    bool isDone = (state->input_pos >= state->input_size) && (result == 0);
+    
+    // Return result: [status, data...]
+    jbyteArray resultArray = env->NewByteArray(1 + output.pos);
+    jbyte statusByte = isDone ? 1 : 0;
+    env->SetByteArrayRegion(resultArray, 0, 1, &statusByte);
+    if (output.pos > 0) {
+        env->SetByteArrayRegion(resultArray, 1, output.pos, (jbyte*)state->output.data());
+    }
+    
+    return resultArray;
+}
+
+/**
+ * Continue streaming decompression into a direct ByteBuffer (zero-copy).
+ * This avoids allocating new byte arrays on each call.
+ * 
+ * @param stream_id The stream ID from init
+ * @param output_buffer A direct ByteBuffer to write decompressed data into
+ * @param max_output_bytes Maximum bytes to decompress
+ * @return Status: -1 = error, 0 = more data, 1 = done, or positive = bytes written
+ *         High 32 bits = status, low 32 bits = bytes written
+ */
+JNIEXPORT jlong JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressContinueToBuffer(JNIEnv *env, jclass clazz,
+                                                                                 jlong stream_id,
+                                                                                 jobject output_buffer,
+                                                                                 jint max_output_bytes) {
+    StreamingDecompressState* state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_streaming_mutex);
+        auto it = g_streaming_states.find(stream_id);
+        if (it == g_streaming_states.end()) {
+            LOGE("Streaming decompression not found for stream %lld", (long long)stream_id);
+            return -1;  // Error
+        }
+        state = it->second.get();
+    }
+    
+    if (!state || !state->dstream) {
+        LOGE("Streaming decompression not initialized for stream %lld", (long long)stream_id);
+        return -1;  // Error
+    }
+    
+    // Check if we've consumed all input
+    if (state->input_pos >= state->input_size) {
+        return (1LL << 32);  // Done, 0 bytes written
+    }
+    
+    // Get direct buffer address
+    void* buffer_ptr = env->GetDirectBufferAddress(output_buffer);
+    if (!buffer_ptr) {
+        LOGE("Failed to get direct buffer address");
+        return -1;  // Error
+    }
+    
+    // Setup input/output buffers
+    ZSTD_inBuffer input = {
+        state->input_data + state->input_pos,
+        state->input_size - state->input_pos,
+        0
+    };
+    
+    ZSTD_outBuffer output = {
+        buffer_ptr,
+        (size_t)max_output_bytes,
+        0
+    };
+    
+    // Decompress
+    size_t result = ZSTD_decompressStream(state->dstream, &output, &input);
+    
+    if (ZSTD_isError(result)) {
+        LOGE("Streaming decompression error for stream %lld: %s", (long long)stream_id, ZSTD_getErrorName(result));
+        return -1;  // Error
+    }
+    
+    // Update input position
+    state->input_pos += input.pos;
+    
+    // Check if done
+    bool isDone = (state->input_pos >= state->input_size) && (result == 0);
+    
+    // Return: high 32 bits = status (0=more, 1=done), low 32 bits = bytes written
+    jlong status = isDone ? 1 : 0;
+    return (status << 32) | (jlong)output.pos;
+}
+
+/**
+ * Clean up streaming decompression resources for a specific stream.
+ */
+JNIEXPORT void JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressEnd(JNIEnv *env, jclass clazz,
+                                                                    jlong stream_id) {
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    auto it = g_streaming_states.find(stream_id);
+    if (it != g_streaming_states.end()) {
+        g_streaming_states.erase(it);
+        LOGI("Streaming decompression ended: stream %lld", (long long)stream_id);
+    }
+}
+
+/**
+ * Upload a single layer to an existing texture array.
+ * Used for streaming mode where layers are uploaded progressively.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayer(JNIEnv *env, jclass clazz,
+                                                                     jint texture_id,
+                                                                     jint layer,
+                                                                     jint width, jint height,
+                                                                     jbyteArray astc_data,
+                                                                     jboolean use_astc) {
+    jsize data_length = env->GetArrayLength(astc_data);
+    jbyte* data = env->GetByteArrayElements(astc_data, nullptr);
+    if (!data) {
+        LOGE("Failed to get layer data");
+        return JNI_FALSE;
+    }
+    
+    glBindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)texture_id);
+    
+    GLenum bindError = glGetError();
+    if (bindError != GL_NO_ERROR) {
+        LOGE("glBindTexture error: 0x%x", bindError);
+        env->ReleaseByteArrayElements(astc_data, data, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    
+    if (use_astc) {
+        // Upload compressed ASTC data
+        glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                                   0, 0, layer,
+                                   width, height, 1,
+                                   GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                   data_length, data);
+    } else {
+        // Decode ASTC to RGBA and upload
+        std::vector<uint8_t> rgbaData;
+        if (!decode_astc_to_rgba((const uint8_t*)data, data_length, width, height, rgbaData)) {
+            LOGE("Failed to decode ASTC for layer %d", layer);
+            env->ReleaseByteArrayElements(astc_data, data, JNI_ABORT);
+            return JNI_FALSE;
+        }
+        
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                        0, 0, layer,
+                        width, height, 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, rgbaData.data());
+    }
+    
+    env->ReleaseByteArrayElements(astc_data, data, JNI_ABORT);
+    
+    GLenum texError = glGetError();
+    if (texError != GL_NO_ERROR) {
+        LOGE("Texture layer upload error: 0x%x", texError);
+        return JNI_FALSE;
+    }
+    
+    return JNI_TRUE;
+}
+
+/**
+ * Create an empty texture array for streaming mode.
+ * Returns texture ID, or 0 on error.
+ */
+JNIEXPORT jint JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeCreateTextureArray(JNIEnv *env, jclass clazz,
+                                                                jint width, jint height,
+                                                                jint layer_count,
+                                                                jboolean use_astc) {
+    // Clear any pending GL errors
+    while (glGetError() != GL_NO_ERROR) {}
+    
+    GLuint textureId;
+    glGenTextures(1, &textureId);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textureId);
+    
+    GLenum bindError = glGetError();
+    if (bindError != GL_NO_ERROR) {
+        LOGE("glBindTexture GL_TEXTURE_2D_ARRAY error: 0x%x", bindError);
+        glDeleteTextures(1, &textureId);
+        return 0;
+    }
+    
+    if (use_astc) {
+        // Allocate compressed texture storage
+        // Calculate total size for all layers
+        uint32_t blocksX = (width + 3) / 4;
+        uint32_t blocksY = (height + 3) / 4;
+        uint32_t bytesPerLayer = blocksX * blocksY * 16;
+        
+        // Use glTexStorage3D for immutable storage
+        glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                       width, height, layer_count);
+    } else {
+        // Allocate RGBA texture storage
+        glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8,
+                       width, height, layer_count);
+    }
+    
+    GLenum texError = glGetError();
+    if (texError != GL_NO_ERROR) {
+        LOGE("Texture array allocation error: 0x%x", texError);
+        glDeleteTextures(1, &textureId);
+        return 0;
+    }
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    LOGI("Created empty texture array: ID=%d (%dx%d, %d layers, astc=%d)",
+         textureId, width, height, layer_count, use_astc);
+    
+    return (jint)textureId;
 }
 
 } // extern "C"

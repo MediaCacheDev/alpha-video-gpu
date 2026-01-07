@@ -50,4 +50,15 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     public static native byte[] nativeDecompressZstd(byte[] data, int offset, int compressedLength, int uncompressedLength);
     public static native int[] nativeDecodeASTCToRGBA(byte[] astcData, int width, int height);
     public static native int[] nativeLoadTextureArray(byte[] ktx2Data, boolean useAstc);
+    
+    // Streaming decompression methods (per-instance, returns/accepts stream ID)
+    public static native long nativeStreamingDecompressInit(byte[] compressedData);
+    public static native long nativeStreamingDecompressInitFromFile(String filePath);  // Memory-mapped, preferred
+    public static native byte[] nativeStreamingDecompressContinue(long streamId, int maxOutputBytes);
+    public static native long nativeStreamingDecompressContinueToBuffer(long streamId, java.nio.ByteBuffer outputBuffer, int maxOutputBytes);  // Zero-copy
+    public static native void nativeStreamingDecompressEnd(long streamId);
+    
+    // Streaming texture array methods
+    public static native int nativeCreateTextureArray(int width, int height, int layerCount, boolean useAstc);
+    public static native boolean nativeUploadTextureArrayLayer(int textureId, int layer, int width, int height, byte[] astcData, boolean useAstc);
 }

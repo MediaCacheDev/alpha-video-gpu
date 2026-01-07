@@ -68,6 +68,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private float playbackSpeed = 1.0f;
     private boolean enableFrameEvents = false;  // Disabled by default for performance
     private boolean gpuPlayback = false;  // GPU-controlled frame timing (experimental)
+    private final AtomicBoolean isPaused = new AtomicBoolean(false);  // Pause from React prop
     
     // Animation state
     private int currentFrame = 0;
@@ -138,6 +139,13 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private boolean useTextureArray = false;
     private int textureArrayId = 0;
     private int textureArrayLayerCount = 0;
+    private boolean streamingRingBufferMode = false; // True when using ring buffer for streaming
+    private int streamingRingSize = 0; // Size of ring buffer (for layer index calculation)
+    
+    // Configurable streaming parameters (set via props)
+    private int configStreamingRingSize = 16;      // GPU ring buffer slots (VRAM)
+    private int configStreamingCacheSize = 60;     // CPU frame cache size (RAM)
+    private int configStreamingPrefetchAhead = 30; // Frames to decode ahead of playback
     
     // Threading
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -377,6 +385,41 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         Log.d(TAG, "setGpuPlayback: " + gpuPlayback);
     }
     
+    public void setStreamingRingSize(int size) {
+        this.configStreamingRingSize = Math.max(4, Math.min(64, size));
+        Log.d(TAG, "setStreamingRingSize: " + this.configStreamingRingSize);
+    }
+    
+    public void setStreamingCacheSize(int size) {
+        this.configStreamingCacheSize = Math.max(10, Math.min(200, size));
+        Log.d(TAG, "setStreamingCacheSize: " + this.configStreamingCacheSize);
+    }
+    
+    public void setStreamingPrefetchAhead(int frames) {
+        this.configStreamingPrefetchAhead = Math.max(5, Math.min(100, frames));
+        Log.d(TAG, "setStreamingPrefetchAhead: " + this.configStreamingPrefetchAhead);
+    }
+    
+    /**
+     * Set paused state from React prop.
+     * When paused, playback stops but resources are retained.
+     */
+    public void setPaused(boolean paused) {
+        boolean wasPaused = isPaused.getAndSet(paused);
+        if (paused != wasPaused) {
+            Log.d(TAG, "setPaused: " + paused);
+            if (paused) {
+                // Stop playback
+                isPlaying.set(false);
+            } else {
+                // Resume playback if we were playing before and source is loaded
+                if (mSourceLoaded && autoPlay) {
+                    isPlaying.set(true);
+                }
+            }
+        }
+    }
+    
     /**
      * Set explicit part URIs for multi-part animations.
      * Used when bundled assets can't be auto-discovered from sibling files.
@@ -479,6 +522,15 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Detect texture format first (needed for transcoding)
         detectAndCacheTextureFormat();
+        
+        // Check for streaming mode (.ktx2.zst files)
+        boolean isStreamingZst = localPath.endsWith(".zst") || localPath.contains(".zst?") || 
+                                  localPath.matches(".*\\.ktx2\\.[a-f0-9]+\\.zst.*");
+        if (isStreamingZst) {
+            Log.i(TAG, "Detected streaming mode (.zst): " + localPath);
+            playStreamingAnimation(localPath);
+            return;
+        }
         
         // Read file data
         byte[] fileData = null;
@@ -641,6 +693,480 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 }
             }
         } while (loop && !shouldStop.get() && !isDestroyed.get() && !gpuPlayback);
+    }
+    
+    /**
+     * Play streaming animation from .ktx2.zst file.
+     * Uses progressive decompression and ring buffer for memory efficiency.
+     */
+    private void playStreamingAnimation(String localPath) {
+        Log.i(TAG, "Starting streaming animation: " + localPath);
+        
+        // Try to use memory-mapped file init (preferred - avoids copying to Java heap)
+        // Falls back to byte array init for HTTP URLs or assets
+        final long[] streamId = {0};
+        final String[] effectivePath = {localPath};
+        boolean useMmap = false;
+        
+        // Check if this is a local file path that can be memory-mapped
+        if (!localPath.startsWith("http://") && !localPath.startsWith("https://") &&
+            !localPath.startsWith("asset://") && !localPath.startsWith("assets://")) {
+            
+            // For file:// URLs, strip the prefix
+            String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
+            File file = new File(filePath);
+            
+            if (file.exists() && file.canRead()) {
+                Log.i(TAG, "Using memory-mapped file init: " + filePath);
+                streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInitFromFile(filePath);
+                effectivePath[0] = filePath;
+                useMmap = true;
+            }
+        }
+        
+        // Fallback: download/read to byte array (for HTTP URLs, assets, or if mmap failed)
+        byte[] compressedData = null;
+        if (streamId[0] == 0) {
+            try {
+                // For HTTP URLs, download to cache first
+                String pathToRead = localPath;
+                if (localPath.startsWith("http://") || localPath.startsWith("https://")) {
+                    pathToRead = downloadToCache(localPath);
+                    if (pathToRead == null) {
+                        mainHandler.post(() -> notifyError("Failed to download streaming file"));
+                        return;
+                    }
+                    effectivePath[0] = pathToRead;
+                    
+                    // Try mmap on the cached file
+                    File cachedFile = new File(pathToRead);
+                    if (cachedFile.exists() && cachedFile.canRead()) {
+                        Log.i(TAG, "Using memory-mapped cached file: " + pathToRead);
+                        streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInitFromFile(pathToRead);
+                        useMmap = true;
+                    }
+                }
+                
+                // If still no stream ID, fall back to byte array
+                if (streamId[0] == 0) {
+                    compressedData = readFileBytes(pathToRead);
+                    Log.i(TAG, "Using byte array init (fallback): " + compressedData.length + " bytes");
+                    streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInit(compressedData);
+                }
+            } catch (IOException e) {
+                mainHandler.post(() -> notifyError("Failed to read streaming file: " + e.getMessage()));
+                return;
+            }
+        }
+        
+        if (streamId[0] == 0) {
+            mainHandler.post(() -> notifyError("Failed to initialize streaming decompression"));
+            return;
+        }
+        
+        // For loop restart, we need to remember the path (mmap) or keep the data (fallback)
+        final boolean finalUseMmap = useMmap;
+        final String finalPath = effectivePath[0];
+        final byte[] finalCompressedData = useMmap ? null : compressedData;  // Only keep if not using mmap
+        
+        // Buffer size for decompression chunks
+        final int bufferSize = 64 * 1024; // 64KB chunks
+        
+        // Decompress header first to get dimensions
+        ByteArrayOutputStream headerStream = new ByteArrayOutputStream();
+        int width = 0, height = 0, layerCount = 0;
+        long level0Offset = 0;
+        boolean headerParsed = false;
+        
+        while (!headerParsed) {
+            byte[] chunk = KTX2PlayerModule.nativeStreamingDecompressContinue(streamId[0], bufferSize);
+            if (chunk == null || chunk.length == 0) {
+                mainHandler.post(() -> notifyError("Streaming decompression failed"));
+                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                return;
+            }
+            
+            byte status = chunk[0];
+            if (status == 2) { // error
+                mainHandler.post(() -> notifyError("Streaming decompression error"));
+                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                return;
+            }
+            
+            // Append data (skip status byte)
+            if (chunk.length > 1) {
+                headerStream.write(chunk, 1, chunk.length - 1);
+            }
+            
+            // Try to parse header once we have enough data
+            byte[] headerData = headerStream.toByteArray();
+            if (headerData.length >= 104 && !headerParsed) {
+                // Check KTX2 magic
+                if (headerData[0] == (byte)0xAB && headerData[1] == 0x4B) {
+                    ByteBuffer bb = ByteBuffer.wrap(headerData).order(ByteOrder.LITTLE_ENDIAN);
+                    width = bb.getInt(20);
+                    height = bb.getInt(24);
+                    layerCount = bb.getInt(32);
+                    level0Offset = bb.getLong(80);
+                    headerParsed = true;
+                    Log.i(TAG, "Streaming texture: " + width + "x" + height + ", " + layerCount + " layers, offset=" + level0Offset);
+                }
+            }
+            
+            if (status == 1) { // done
+                break;
+            }
+        }
+        
+        if (!headerParsed || layerCount == 0) {
+            mainHandler.post(() -> notifyError("Failed to parse KTX2 header from stream"));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        
+        // Extract metadata from header
+        byte[] headerData = headerStream.toByteArray();
+        String metadataJson = extractKTX2Metadata(headerData);
+        if (metadataJson == null) {
+            mainHandler.post(() -> notifyError("No metadata found in streaming KTX2"));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        
+        // Parse metadata
+        try {
+            parseMetadata(metadataJson);
+        } catch (Exception e) {
+            mainHandler.post(() -> notifyError("Failed to parse metadata: " + e.getMessage()));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        
+        // Use texture array mode
+        useTextureArray = true;
+        totalFrames = layerCount;
+        frameWidth = width;
+        frameHeight = height;
+        
+        // Check for ASTC support
+        boolean useAstc = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
+        
+        // Streaming parameters (from props or defaults)
+        final int RING_BUFFER_SIZE = configStreamingRingSize;
+        final int CPU_CACHE_SIZE = configStreamingCacheSize;
+        final int PREFETCH_AHEAD = configStreamingPrefetchAhead;
+        
+        Log.i(TAG, "Streaming params: ring=" + RING_BUFFER_SIZE + ", cache=" + CPU_CACHE_SIZE + ", prefetch=" + PREFETCH_AHEAD);
+        
+        // Create ring buffer texture array (smaller than total frames to save VRAM)
+        int ringSize = Math.min(RING_BUFFER_SIZE, layerCount);
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(width, height, ringSize, useAstc);
+        if (textureArrayId == 0) {
+            mainHandler.post(() -> notifyError("Failed to create texture array"));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        textureArrayLayerCount = ringSize;
+        
+        Log.i(TAG, "Created streaming ring buffer: ID=" + textureArrayId + ", " + width + "x" + height + ", " + ringSize + " slots (total frames: " + layerCount + ")");
+        
+        // Set streaming ring buffer mode for proper rendering
+        streamingRingBufferMode = true;
+        streamingRingSize = ringSize;
+        
+        // Initialize shaders
+        if (!initShaders()) {
+            mainHandler.post(() -> notifyError("Failed to initialize shaders"));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        
+        // Calculate bytes per layer
+        int blocksX = (width + 3) / 4;
+        int blocksY = (height + 3) / 4;
+        int bytesPerLayer = blocksX * blocksY * 16;
+        
+        // Pre-allocated buffer pool for frame cache (reduces GC pressure)
+        // Pool size = cache size + some extra for concurrent access
+        final int POOL_SIZE = CPU_CACHE_SIZE + 5;
+        final java.util.Queue<byte[]> bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        for (int i = 0; i < POOL_SIZE; i++) {
+            bufferPool.offer(new byte[bytesPerLayer]);
+        }
+        Log.i(TAG, "Pre-allocated buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
+              (POOL_SIZE * bytesPerLayer / 1024) + " KB");
+        
+        // CPU frame cache (sliding window) - Map<virtualFrameIndex, pooledBuffer>
+        java.util.Map<Integer, byte[]> frameCache = new java.util.concurrent.ConcurrentHashMap<>();
+        int[] ringSlots = new int[ringSize]; // Track which frame is in each ring slot
+        java.util.Arrays.fill(ringSlots, -1);
+        
+        // Decompression state - pre-allocate accumulator with expected size
+        ByteArrayOutputStream frameAccumulator = new ByteArrayOutputStream(bytesPerLayer + bufferSize);
+        final int[] decodePos = {0};  // Current sequential decode position
+        final int[] bytesToSkip = {(int) level0Offset};
+        final boolean[] decompressEnded = {false};
+        
+        // Pre-allocated direct ByteBuffer for zero-copy decompression (Fix 3)
+        final ByteBuffer decompressBuffer = ByteBuffer.allocateDirect(bufferSize);
+        Log.i(TAG, "Pre-allocated direct decompression buffer: " + bufferSize + " bytes");
+        
+        // Skip header bytes from already-read data
+        byte[] existingData = headerStream.toByteArray();
+        if (existingData.length > bytesToSkip[0]) {
+            frameAccumulator.write(existingData, bytesToSkip[0], existingData.length - bytesToSkip[0]);
+            bytesToSkip[0] = 0;
+        } else {
+            bytesToSkip[0] -= existingData.length;
+        }
+        
+        final int finalWidth = width;
+        final int finalHeight = height;
+        final int finalBytesPerLayer = bytesPerLayer;
+        final boolean finalUseAstc = useAstc;
+        final int finalRingSize = ringSize;
+        final long finalLevel0Offset = level0Offset;
+        
+        mSourceLoaded = true;
+        mainHandler.post(() -> notifyStateChange("ready"));
+        
+        if (autoPlay && !isPaused.get()) {
+            isPlaying.set(true);
+            mainHandler.post(() -> notifyStateChange("playing"));
+        }
+        
+        // Track which "loop iteration" the decoder is on (for wrap-around prefetching)
+        final int[] decoderLoopIteration = {0};
+        
+        // Helper: Decode frames into CPU cache (up to prefetch ahead, with wrap-around)
+        // virtualPlaybackPos = loopIteration * totalFrames + currentFrame
+        java.util.function.IntConsumer decodeFrames = (virtualPlaybackPos) -> {
+            int targetVirtualPos = virtualPlaybackPos + PREFETCH_AHEAD;
+            
+            while (true) {
+                int currentVirtualDecodePos = decoderLoopIteration[0] * totalFrames + decodePos[0];
+                if (currentVirtualDecodePos >= targetVirtualPos) break;
+                
+                // If decompression ended for current loop, restart for next loop (if looping)
+                if (decompressEnded[0]) {
+                    if (!loop) break;
+                    // Restart decompression for next loop
+                    decoderLoopIteration[0]++;
+                    decodePos[0] = 0;
+                    decompressEnded[0] = false;
+                    frameAccumulator.reset();
+                    bytesToSkip[0] = (int) finalLevel0Offset;
+                    KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                    // Use mmap if available, otherwise fall back to byte array
+                    if (finalUseMmap) {
+                        streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInitFromFile(finalPath);
+                    } else {
+                        streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInit(finalCompressedData);
+                    }
+                    Log.i(TAG, "Prefetch wrap-around: restarting decompression for loop " + decoderLoopIteration[0]);
+                    continue;
+                }
+                
+                // Skip header bytes if needed (using zero-copy ByteBuffer)
+                while (bytesToSkip[0] > 0 && !decompressEnded[0]) {
+                    decompressBuffer.clear();
+                    long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    if (result == -1) { decompressEnded[0] = true; break; }
+                    int status = (int)(result >> 32);
+                    int bytesWritten = (int)(result & 0xFFFFFFFFL);
+                    if (bytesWritten >= bytesToSkip[0]) {
+                        decompressBuffer.position(bytesToSkip[0]);
+                        decompressBuffer.limit(bytesWritten);
+                        byte[] temp = new byte[bytesWritten - bytesToSkip[0]];
+                        decompressBuffer.get(temp);
+                        frameAccumulator.write(temp, 0, temp.length);
+                        bytesToSkip[0] = 0;
+                    } else {
+                        bytesToSkip[0] -= bytesWritten;
+                    }
+                    if (status == 1) { decompressEnded[0] = true; break; }
+                }
+                
+                if (decompressEnded[0]) continue; // Will restart on next iteration if looping
+                
+                // Decompress until we have a full frame (using zero-copy ByteBuffer)
+                while (frameAccumulator.size() < finalBytesPerLayer && !decompressEnded[0]) {
+                    decompressBuffer.clear();
+                    long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    if (result == -1) { decompressEnded[0] = true; break; }
+                    int status = (int)(result >> 32);
+                    int bytesWritten = (int)(result & 0xFFFFFFFFL);
+                    if (bytesWritten > 0) {
+                        decompressBuffer.limit(bytesWritten);
+                        byte[] temp = new byte[bytesWritten];
+                        decompressBuffer.get(temp);
+                        frameAccumulator.write(temp, 0, temp.length);
+                    }
+                    if (status == 1) { decompressEnded[0] = true; break; }
+                }
+                
+                if (frameAccumulator.size() >= finalBytesPerLayer) {
+                    // Get buffer from pool (or allocate if pool empty - shouldn't happen normally)
+                    byte[] frameData = bufferPool.poll();
+                    if (frameData == null) {
+                        frameData = new byte[finalBytesPerLayer];
+                        Log.w(TAG, "Buffer pool exhausted, allocating new buffer");
+                    }
+                    
+                    // Extract frame data directly from accumulator's internal buffer
+                    byte[] accData = frameAccumulator.toByteArray();
+                    System.arraycopy(accData, 0, frameData, 0, finalBytesPerLayer);
+                    int virtualPos = decoderLoopIteration[0] * totalFrames + decodePos[0];
+                    frameCache.put(virtualPos, frameData);
+                    decodePos[0]++;
+                    
+                    // Keep remaining data
+                    frameAccumulator.reset();
+                    if (accData.length > finalBytesPerLayer) {
+                        frameAccumulator.write(accData, finalBytesPerLayer, accData.length - finalBytesPerLayer);
+                    }
+                } else if (!decompressEnded[0]) {
+                    break; // No more data available right now
+                }
+            }
+        };
+        
+        // Helper: Evict old frames from CPU cache and return buffers to pool
+        java.util.function.IntConsumer evictOldFrames = (virtualPlaybackPos) -> {
+            int keepFrom = Math.max(0, virtualPlaybackPos - 2);
+            int keepTo = virtualPlaybackPos + CPU_CACHE_SIZE;
+            
+            // Collect buffers to return to pool before removing from cache
+            java.util.List<Integer> toRemove = new java.util.ArrayList<>();
+            for (Integer virtualPos : frameCache.keySet()) {
+                if (virtualPos < keepFrom || virtualPos > keepTo) {
+                    toRemove.add(virtualPos);
+                }
+            }
+            
+            // Return buffers to pool and remove from cache
+            for (Integer virtualPos : toRemove) {
+                byte[] buffer = frameCache.remove(virtualPos);
+                if (buffer != null && buffer.length == finalBytesPerLayer) {
+                    bufferPool.offer(buffer);  // Return to pool for reuse
+                }
+            }
+        };
+        
+        // Helper: Ensure frame is in GPU ring buffer - takes virtual position
+        java.util.function.IntConsumer ensureFrameInRingBuffer = (virtualPos) -> {
+            int actualFrame = virtualPos % totalFrames;
+            int ringSlot = actualFrame % finalRingSize;
+            // Check if this exact virtual position is already loaded
+            // (ringSlots stores virtual positions to handle wrap-around correctly)
+            if (ringSlots[ringSlot] == virtualPos) return; // Already loaded
+            
+            byte[] frameData = frameCache.get(virtualPos);
+            if (frameData == null) return; // Not in cache yet
+            
+            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
+                textureArrayId, ringSlot, finalWidth, finalHeight, frameData, finalUseAstc);
+            if (uploaded) {
+                ringSlots[ringSlot] = virtualPos;
+            }
+        };
+        
+        // Note: restartDecompression is now handled inside decodeFrames for wrap-around prefetching
+        
+        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
+        long loopStartTime = System.nanoTime();
+        int playbackLoopIteration = 0;
+        
+        // Main playback loop - uses virtual frame positions for seamless looping
+        while (!shouldStop.get() && !isDestroyed.get()) {
+            currentFrame = 0;
+            loopStartTime = System.nanoTime();
+            
+            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
+                // Virtual position = which frame we're at across all loops
+                int virtualPlaybackPos = playbackLoopIteration * totalFrames + currentFrame;
+                
+                // Check paused state
+                if (isPaused.get()) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        return;
+                    }
+                    continue;
+                }
+                
+                // Decode frames ahead (prefetch with wrap-around)
+                decodeFrames.accept(virtualPlaybackPos);
+                
+                // Evict old frames from CPU cache
+                evictOldFrames.accept(virtualPlaybackPos);
+                
+                // Check if current frame is ready (using virtual position)
+                if (frameCache.containsKey(virtualPlaybackPos)) {
+                    // Ensure current frame + next few are in GPU ring buffer
+                    ensureFrameInRingBuffer.accept(virtualPlaybackPos);
+                    for (int i = 1; i <= 2; i++) {
+                        int nextVirtualPos = virtualPlaybackPos + i;
+                        if (frameCache.containsKey(nextVirtualPos)) {
+                            ensureFrameInRingBuffer.accept(nextVirtualPos);
+                        }
+                    }
+                    
+                    if (isPlaying.get()) {
+                        renderFrame();
+                        if (enableFrameEvents) {
+                            mainHandler.post(() -> notifyFrameUpdate());
+                        }
+                        
+                        currentFrame++;
+                        if (currentFrame >= totalFrames) {
+                            if (loop) {
+                                break; // Will continue in outer loop with incremented playbackLoopIteration
+                            } else {
+                                mainHandler.post(() -> {
+                                    notifyFinished();
+                                    notifyStateChange("stopped");
+                                });
+                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                return;
+                            }
+                        }
+                        
+                        long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
+                        long sleepNs = targetTimeNs - System.nanoTime();
+                        
+                        if (sleepNs > 1_000_000) {
+                            try {
+                                Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    // Frame not ready yet - wait for decompression
+                    try {
+                        Thread.sleep(8);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        return;
+                    }
+                }
+            }
+            
+            // End of one loop iteration
+            if (!loop) break;
+            playbackLoopIteration++;
+        }
+        
+        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+        Log.i(TAG, "Streaming animation ended");
     }
     
     private boolean initGL(SurfaceTexture surfaceTexture) {
@@ -1517,8 +2043,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         GLES30.glViewport(0, 0, getWidth(), getHeight());
         GLES30.glUseProgram(arrayProgram);
         
-        // Set layer uniform (current frame index)
-        GLES30.glUniform1f(arrayUniformLayerLocation, (float) currentFrame);
+        // Set layer uniform - use ring buffer slot in streaming mode, otherwise frame index
+        int layerIndex = streamingRingBufferMode ? (currentFrame % streamingRingSize) : currentFrame;
+        GLES30.glUniform1f(arrayUniformLayerLocation, (float) layerIndex);
         
         // Bind texture array
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
@@ -1610,6 +2137,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 GLES30.glDeleteProgram(program);
                 program = 0;
             }
+            
+            // Reset streaming ring buffer mode
+            streamingRingBufferMode = false;
+            streamingRingSize = 0;
             
             if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglDestroySurface(eglDisplay, eglSurface);
@@ -1811,7 +2342,12 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     cacheDir.mkdirs();
                 }
                 
-                cacheFile = new File(cacheDir, hash + ".ktx2");
+                // Preserve .zst extension for streaming files
+                String extension = ".ktx2";
+                if (urlString.contains(".zst")) {
+                    extension = ".ktx2.zst";
+                }
+                cacheFile = new File(cacheDir, hash + extension);
                 tempSuffix = hash;
             }
             
@@ -1832,7 +2368,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 return null;
             }
             
-            File tempFile = new File(getContext().getCacheDir(), "ktx2_tmp_" + tempSuffix + ".ktx2");
+            // Preserve extension for temp file (matches cacheFile extension)
+            String tempExtension = urlString.contains(".zst") ? ".ktx2.zst" : ".ktx2";
+            File tempFile = new File(getContext().getCacheDir(), "ktx2_tmp_" + tempSuffix + tempExtension);
             
             try (InputStream in = conn.getInputStream();
                  FileOutputStream out = new FileOutputStream(tempFile)) {
