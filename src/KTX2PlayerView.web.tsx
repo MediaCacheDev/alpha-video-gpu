@@ -12,8 +12,12 @@ import { View, StyleSheet, Platform } from 'react-native';
 declare global {
   interface Window {
     BASIS: any;
+    ZSTDDecoder: any;
+    fzstd: any;
   }
   var BASIS: any;
+  var ZSTDDecoder: any;
+  var fzstd: any;
 }
 
 export interface SourceType {
@@ -41,6 +45,7 @@ interface FrameUV {
   minV: number;
   maxU: number;
   maxV: number;
+  layer?: number; // For texture array mode
 }
 
 interface Metadata {
@@ -56,6 +61,8 @@ interface Metadata {
   parts?: Array<{ file: string; columns: number; rows: number }>;
   strips?: Array<{ file: string; columns: number; rows: number }>;
   mode?: string;
+  packingMode?: string; // 'atlas' or 'array'
+  layerCount?: number;
 }
 
 interface GLBParseResult {
@@ -261,6 +268,12 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   const currentFrameRef = useRef<number>(0);
   const stateRef = useRef<string>('idle');
   
+  // Texture array support (WebGL2 only)
+  const arrayProgramRef = useRef<WebGLProgram | null>(null);
+  const textureArrayRef = useRef<WebGLTexture | null>(null);
+  const useTextureArrayRef = useRef<boolean>(false);
+  const zstdDecoderRef = useRef<any>(null);
+  
   const [state, setState] = useState<string>('idle');
   const loadedSourceRef = useRef<string | null>(null);
   
@@ -324,6 +337,61 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     gl.attachShader(program, vertexShader);
     gl.attachShader(program, fragmentShader);
     gl.linkProgram(program);
+    
+    // Texture array shader (WebGL2 only)
+    if (gl instanceof WebGL2RenderingContext) {
+      const arrayVertexShaderSource = `#version 300 es
+        in vec2 a_position;
+        in vec2 a_texCoord;
+        out vec2 v_texCoord;
+        
+        void main() {
+          gl_Position = vec4(a_position, 0.0, 1.0);
+          v_texCoord = a_texCoord;
+        }
+      `;
+
+      const arrayFragmentShaderSource = `#version 300 es
+        precision mediump float;
+        precision mediump sampler2DArray;
+        in vec2 v_texCoord;
+        out vec4 fragColor;
+        uniform sampler2DArray u_textureArray;
+        uniform float u_layer;
+        
+        void main() {
+          fragColor = texture(u_textureArray, vec3(v_texCoord, u_layer));
+        }
+      `;
+
+      const arrayVertexShader = gl.createShader(gl.VERTEX_SHADER)!;
+      gl.shaderSource(arrayVertexShader, arrayVertexShaderSource);
+      gl.compileShader(arrayVertexShader);
+      
+      if (!gl.getShaderParameter(arrayVertexShader, gl.COMPILE_STATUS)) {
+        console.warn('[KTX2PlayerView] Array vertex shader compile error:', gl.getShaderInfoLog(arrayVertexShader));
+      }
+
+      const arrayFragmentShader = gl.createShader(gl.FRAGMENT_SHADER)!;
+      gl.shaderSource(arrayFragmentShader, arrayFragmentShaderSource);
+      gl.compileShader(arrayFragmentShader);
+      
+      if (!gl.getShaderParameter(arrayFragmentShader, gl.COMPILE_STATUS)) {
+        console.warn('[KTX2PlayerView] Array fragment shader compile error:', gl.getShaderInfoLog(arrayFragmentShader));
+      }
+
+      const arrayProgram = gl.createProgram()!;
+      gl.attachShader(arrayProgram, arrayVertexShader);
+      gl.attachShader(arrayProgram, arrayFragmentShader);
+      gl.linkProgram(arrayProgram);
+
+      if (!gl.getProgramParameter(arrayProgram, gl.LINK_STATUS)) {
+        console.warn('[KTX2PlayerView] Array program link error:', gl.getProgramInfoLog(arrayProgram));
+      } else {
+        arrayProgramRef.current = arrayProgram;
+        console.log('[KTX2PlayerView] Texture array shader compiled successfully');
+      }
+    }
     
     // Create buffers
     const positions = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
@@ -415,12 +483,25 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     // Handle supercompression (Zstandard)
     let textureData: Uint8Array;
     if (supercompressionScheme === 2) {
-      // Zstandard compression - need fzstd library
-      if (typeof (window as any).fzstd === 'undefined') {
-        throw new Error('Zstandard decompression required but fzstd not loaded.');
-      }
+      // Zstandard compression - prefer WASM decoder for large files
       const compressedData = new Uint8Array(data.buffer, data.byteOffset + level0ByteOffset, level0ByteLength);
-      textureData = (window as any).fzstd.decompress(compressedData);
+      const level0UncompressedLength = Number(view.getBigUint64(levelIndexOffset + 16, true));
+      
+      if (typeof ZSTDDecoder !== 'undefined') {
+        // Use WASM-based decoder (more reliable for large files)
+        if (!zstdDecoderRef.current) {
+          zstdDecoderRef.current = new ZSTDDecoder();
+          await zstdDecoderRef.current.init();
+        }
+        textureData = zstdDecoderRef.current.decode(compressedData, level0UncompressedLength);
+        console.log(`[KTX2PlayerView] WASM zstd decompressed ${level0ByteLength} -> ${textureData.length} bytes`);
+      } else if (typeof fzstd !== 'undefined') {
+        // Fallback to fzstd (JS-based, may have issues with large files)
+        textureData = fzstd.decompress(compressedData);
+        console.log(`[KTX2PlayerView] fzstd decompressed ${level0ByteLength} -> ${textureData.length} bytes`);
+      } else {
+        throw new Error('Zstandard decompression required but no decoder loaded. Include zstddec.js or fzstd.');
+      }
     } else if (supercompressionScheme === 0) {
       textureData = new Uint8Array(data.buffer, data.byteOffset + level0ByteOffset, level0ByteLength);
     } else {
@@ -534,6 +615,109 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     return uvs;
   }, []);
 
+  // Load texture array (packingMode: 'array')
+  const loadTextureArray = useCallback(async (
+    gl: WebGL2RenderingContext,
+    ktx2Data: Uint8Array,
+    metadata: Metadata
+  ): Promise<boolean> => {
+    try {
+      const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
+      
+      // Parse KTX2 header
+      const vkFormat = view.getUint32(12, true);
+      const width = view.getUint32(20, true);
+      const height = view.getUint32(24, true);
+      const layerCount = view.getUint32(32, true);
+      const supercompressionScheme = view.getUint32(44, true);
+      
+      console.log(`[KTX2PlayerView] Texture array: ${width}x${height}, ${layerCount} layers, vkFormat=${vkFormat}`);
+      
+      // Level 0 index (at byte 80)
+      const level0Offset = Number(view.getBigUint64(80, true));
+      const level0Length = Number(view.getBigUint64(88, true));
+      const level0UncompressedLength = Number(view.getBigUint64(96, true));
+      
+      let compressedData: Uint8Array;
+      
+      if (supercompressionScheme === 2) {
+        // Zstd compressed
+        const zstdData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
+        
+        if (typeof ZSTDDecoder !== 'undefined') {
+          if (!zstdDecoderRef.current) {
+            zstdDecoderRef.current = new ZSTDDecoder();
+            await zstdDecoderRef.current.init();
+          }
+          compressedData = zstdDecoderRef.current.decode(zstdData, level0UncompressedLength);
+          console.log(`[KTX2PlayerView] WASM zstd decompressed ${level0Length} -> ${compressedData.length} bytes`);
+        } else if (typeof fzstd !== 'undefined') {
+          compressedData = fzstd.decompress(zstdData);
+          console.log(`[KTX2PlayerView] fzstd decompressed ${level0Length} -> ${compressedData.length} bytes`);
+        } else {
+          throw new Error('No zstd decoder available');
+        }
+      } else {
+        compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
+      }
+      
+      // Check for ASTC support
+      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
+      if (!astcExt) {
+        throw new Error('ASTC texture compression not supported. Texture arrays require ASTC support.');
+      }
+      
+      // Determine ASTC format
+      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
+      if (vkFormat === 158) {
+        astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      }
+      
+      // Create texture array
+      const textureArray = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, textureArray);
+      
+      // Upload all layers at once
+      gl.compressedTexImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,
+        astcFormat,
+        width,
+        height,
+        layerCount,
+        0,
+        compressedData
+      );
+      
+      const glError = gl.getError();
+      if (glError !== gl.NO_ERROR) {
+        console.error('[KTX2PlayerView] WebGL error after texture array upload:', glError);
+        return false;
+      }
+      
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      
+      textureArrayRef.current = textureArray;
+      useTextureArrayRef.current = true;
+      
+      // Setup frame UVs for texture array (each frame is a full layer)
+      const uvs: FrameUV[] = [];
+      for (let i = 0; i < metadata.frameCount; i++) {
+        uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
+      }
+      frameUVsRef.current = uvs;
+      
+      console.log(`[KTX2PlayerView] ✓ Texture array loaded: ${width}x${height}, ${layerCount} layers`);
+      return true;
+    } catch (error) {
+      console.error('[KTX2PlayerView] Failed to load texture array:', error);
+      return false;
+    }
+  }, []);
+
   // Render frame
   const render = useCallback(() => {
     const gl = glRef.current;
@@ -542,19 +726,52 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     const textures = texturesRef.current;
     const metadata = metadataRef.current;
     
-    if (!gl || !program || !frameUVs.length || !textures.length || !metadata) return;
+    if (!gl || !frameUVs.length || !metadata) return;
     
     const currentFrame = currentFrameRef.current;
     const frameUV = frameUVs[currentFrame];
     if (!frameUV) return;
+    
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    
+    // Use texture array rendering if available
+    if (useTextureArrayRef.current && arrayProgramRef.current && textureArrayRef.current) {
+      const arrayProgram = arrayProgramRef.current;
+      const gl2 = gl as WebGL2RenderingContext;
+      
+      gl2.useProgram(arrayProgram);
+      
+      gl2.activeTexture(gl2.TEXTURE0);
+      gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, textureArrayRef.current);
+      gl2.uniform1i(gl2.getUniformLocation(arrayProgram, 'u_textureArray'), 0);
+      
+      // Layer index for current frame
+      const layerIndex = frameUV.layer !== undefined ? frameUV.layer : currentFrame;
+      gl2.uniform1f(gl2.getUniformLocation(arrayProgram, 'u_layer'), layerIndex);
+      
+      const positionLoc = gl2.getAttribLocation(arrayProgram, 'a_position');
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, positionBufferRef.current);
+      gl2.enableVertexAttribArray(positionLoc);
+      gl2.vertexAttribPointer(positionLoc, 2, gl2.FLOAT, false, 0, 0);
+      
+      const texCoordLoc = gl2.getAttribLocation(arrayProgram, 'a_texCoord');
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, texCoordBufferRef.current);
+      gl2.enableVertexAttribArray(texCoordLoc);
+      gl2.vertexAttribPointer(texCoordLoc, 2, gl2.FLOAT, false, 0, 0);
+      
+      gl2.drawArrays(gl2.TRIANGLES, 0, 6);
+      return;
+    }
+    
+    // Standard 2D texture rendering (atlas mode)
+    if (!program || !textures.length) return;
     
     // Determine which texture to use
     const framesPerPart = metadata.framesPerPart || metadata.framesPerStrip || metadata.frameCount;
     const partIndex = Math.floor(currentFrame / framesPerPart);
     const texture = textures[partIndex] || textures[0];
     
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(program);
     
     gl.activeTexture(gl.TEXTURE0);
@@ -642,9 +859,14 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const arrayBuffer = await response.arrayBuffer();
       const data = new Uint8Array(arrayBuffer);
       
-      // Clean up old textures
+      // Clean up old textures and texture array
       texturesRef.current.forEach(tex => gl.deleteTexture(tex));
       texturesRef.current = [];
+      if (textureArrayRef.current) {
+        gl.deleteTexture(textureArrayRef.current);
+        textureArrayRef.current = null;
+      }
+      useTextureArrayRef.current = false;
       
       // Check if this is a GLB container
       if (isGLBContainer(data)) {
@@ -659,18 +881,32 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         metadataRef.current = metadata;
         
         const isNativeASTC = metadata.mode === 'astc';
+        const isTextureArray = metadata.packingMode === 'array';
         
-        // Load all KTX2 parts from GLB
-        for (let i = 0; i < ktx2Parts.length; i++) {
-          const partData = ktx2Parts[i];
-          let texture: WebGLTexture | null;
-          
-          if (isNativeASTC) {
-            texture = await loadNativeASTCKTX2(gl, partData);
-          } else {
-            texture = await transcodeKTX2(gl, BasisModule, partData, targetFormat);
+        console.log(`[KTX2PlayerView] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
+        
+        // Check for texture array mode (WebGL2 required)
+        if (isTextureArray && gl instanceof WebGL2RenderingContext && arrayProgramRef.current) {
+          console.log('[KTX2PlayerView] Using texture array mode');
+          const success = await loadTextureArray(gl, ktx2Parts[0], metadata);
+          if (!success) {
+            throw new Error('Failed to load texture array');
           }
-          if (texture) texturesRef.current.push(texture);
+          // Add a dummy texture to satisfy the textures.length check
+          texturesRef.current.push(gl.createTexture()!);
+        } else {
+          // Load all KTX2 parts from GLB (atlas mode)
+          for (let i = 0; i < ktx2Parts.length; i++) {
+            const partData = ktx2Parts[i];
+            let texture: WebGLTexture | null;
+            
+            if (isNativeASTC) {
+              texture = await loadNativeASTCKTX2(gl, partData);
+            } else {
+              texture = await transcodeKTX2(gl, BasisModule, partData, targetFormat);
+            }
+            if (texture) texturesRef.current.push(texture);
+          }
         }
       } else {
         // Regular KTX2 file (single or multi-part with separate files)
@@ -681,58 +917,73 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         }
         
         console.log('[KTX2PlayerView] Using embedded KTX2 metadata');
+        console.log(`[KTX2PlayerView] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
         metadataRef.current = metadata;
         
         const partCount = metadata.partCount || metadata.stripCount || 1;
         const isNativeASTC = metadata.mode === 'astc';
+        const isTextureArray = metadata.packingMode === 'array';
         
-        // Check if we have explicit parts from props
-        const useExplicitParts = parts && parts.length > 1;
-        const actualPartCount = useExplicitParts ? parts.length : partCount;
-        
-        if (actualPartCount > 1) {
-          const metadataParts = metadata.parts || metadata.strips || [];
-          const basePath = uri.replace(/(_\d+)?\.(ktx2|basis)$/i, '');
+        // Check for texture array mode (WebGL2 required)
+        if (isTextureArray && gl instanceof WebGL2RenderingContext && arrayProgramRef.current) {
+          console.log('[KTX2PlayerView] Using texture array mode');
+          const success = await loadTextureArray(gl, data, metadata);
+          if (!success) {
+            throw new Error('Failed to load texture array');
+          }
+          // Add a dummy texture to satisfy the textures.length check
+          texturesRef.current.push(gl.createTexture()!);
+        } else {
+          // Check if we have explicit parts from props
+          const useExplicitParts = parts && parts.length > 1;
+          const actualPartCount = useExplicitParts ? parts.length : partCount;
           
-          // Load all parts
-          for (let i = 0; i < actualPartCount; i++) {
-            let partUrl: string;
+          if (actualPartCount > 1) {
+            const metadataParts = metadata.parts || metadata.strips || [];
+            const basePath = uri.replace(/(_\d+)?\.(ktx2|basis)$/i, '');
             
-            if (useExplicitParts && parts[i]?.uri) {
-              // Use explicit URI from parts prop
-              partUrl = parts[i].uri!;
-            } else {
-              // Use filename from metadata or construct from base path
-              const partFile = metadataParts[i]?.file || `${basePath}_${i}.ktx2`;
-              partUrl = partFile.startsWith('http') ? partFile : 
-                uri.substring(0, uri.lastIndexOf('/') + 1) + partFile;
+            // Load all parts
+            for (let i = 0; i < actualPartCount; i++) {
+              let partUrl: string;
+              
+              if (useExplicitParts && parts[i]?.uri) {
+                // Use explicit URI from parts prop
+                partUrl = parts[i].uri!;
+              } else {
+                // Use filename from metadata or construct from base path
+                const partFile = metadataParts[i]?.file || `${basePath}_${i}.ktx2`;
+                partUrl = partFile.startsWith('http') ? partFile : 
+                  uri.substring(0, uri.lastIndexOf('/') + 1) + partFile;
+              }
+              
+              const partResponse = await fetch(partUrl);
+              const partData = new Uint8Array(await partResponse.arrayBuffer());
+              
+              let texture: WebGLTexture | null;
+              if (isNativeASTC) {
+                texture = await loadNativeASTCKTX2(gl, partData);
+              } else {
+                texture = await transcodeKTX2(gl, BasisModule, partData, targetFormat);
+              }
+              if (texture) texturesRef.current.push(texture);
             }
-            
-            const partResponse = await fetch(partUrl);
-            const partData = new Uint8Array(await partResponse.arrayBuffer());
-            
+          } else {
             let texture: WebGLTexture | null;
             if (isNativeASTC) {
-              texture = await loadNativeASTCKTX2(gl, partData);
+              console.log('[KTX2PlayerView] Using native ASTC loader');
+              texture = await loadNativeASTCKTX2(gl, data);
             } else {
-              texture = await transcodeKTX2(gl, BasisModule, partData, targetFormat);
+              texture = await transcodeKTX2(gl, BasisModule, data, targetFormat);
             }
             if (texture) texturesRef.current.push(texture);
           }
-        } else {
-          let texture: WebGLTexture | null;
-          if (isNativeASTC) {
-            console.log('[KTX2PlayerView] Using native ASTC loader');
-            texture = await loadNativeASTCKTX2(gl, data);
-          } else {
-            texture = await transcodeKTX2(gl, BasisModule, data, targetFormat);
-          }
-          if (texture) texturesRef.current.push(texture);
         }
       }
       
-      // Calculate UVs (metadata is stored in metadataRef)
-      frameUVsRef.current = calculateFrameUVs(metadataRef.current!);
+      // Calculate UVs only if not using texture array (texture array sets its own UVs)
+      if (!useTextureArrayRef.current) {
+        frameUVsRef.current = calculateFrameUVs(metadataRef.current!);
+      }
       currentFrameRef.current = 0;
       
       setPlayerState('ready');
@@ -749,7 +1000,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       setPlayerState('error');
       onError?.(error as Error);
     }
-  }, [initGL, detectTextureFormat, transcodeKTX2, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError]);
+  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
 
   // Effect: Load source when it changes
   useEffect(() => {
@@ -791,7 +1042,9 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const gl = glRef.current;
       if (gl) {
         texturesRef.current.forEach(tex => gl.deleteTexture(tex));
+        if (textureArrayRef.current) gl.deleteTexture(textureArrayRef.current);
         if (programRef.current) gl.deleteProgram(programRef.current);
+        if (arrayProgramRef.current) gl.deleteProgram(arrayProgramRef.current);
         if (positionBufferRef.current) gl.deleteBuffer(positionBufferRef.current);
         if (texCoordBufferRef.current) gl.deleteBuffer(texCoordBufferRef.current);
       }
