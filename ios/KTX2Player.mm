@@ -31,6 +31,7 @@
   NSArray<NSNumber *> *_partWidths;
   NSArray<NSNumber *> *_partHeights;
   BOOL _isSourceLoaded;
+  BOOL _isSourceLoading;
   BOOL _isDestroyed;
   
   BOOL _isNativeASTC;
@@ -43,6 +44,13 @@
   // GPU playback support
   CFTimeInterval _gpuPlaybackStartTime;
   float _gpuElapsedTime;
+  
+  // Texture array support (for packingMode: 'array')
+  BOOL _useTextureArray;
+  id<MTLTexture> _textureArray;
+  NSInteger _textureArrayLayerCount;
+  id<MTLRenderPipelineState> _arrayPipelineState;
+  id<MTLBuffer> _arrayUniformBuffer;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -76,6 +84,7 @@
     self.frameInterval = 1.0 / self.frameRate;
     self.enableFrameEvents = NO;  // Disabled by default for performance
     _isSourceLoaded = NO;
+    _isSourceLoading = NO;
     _isDestroyed = NO;
     
     // Initialize Basis transcoder (only once)
@@ -145,14 +154,15 @@
   }
   
   // Check if source changed
-  if ([_sourceUri isEqualToString:uri] && _isSourceLoaded) {
-    NSLog(@"KTX2PlayerView: Source unchanged and already loaded, skipping");
+  if ([_sourceUri isEqualToString:uri] && (_isSourceLoaded || _isSourceLoading)) {
+    NSLog(@"KTX2PlayerView: Source unchanged and already loaded/loading, skipping");
     return;
   }
   
   _source = [source copy];
   _sourceUri = [uri copy];
   _isSourceLoaded = NO;
+  _isSourceLoading = YES;
   _isDestroyed = NO;
   
   NSLog(@"KTX2PlayerView: Loading source...");
@@ -186,6 +196,7 @@
 
 - (void)notifyError:(NSString *)error
 {
+  _isSourceLoading = NO;
   if (self.onError) {
     self.onError(@{@"error": error ?: @"Unknown error"});
   }
@@ -379,6 +390,55 @@
   } else {
     NSLog(@"KTX2PlayerView: Pipeline state created successfully: %p", self.pipelineState);
   }
+  
+  // Create texture array shader for packingMode: 'array'
+  NSString *arrayFragmentShaderSource = @"#include <metal_stdlib>\n"
+                                         "using namespace metal;\n"
+                                         "struct VertexOut {\n"
+                                         "  float4 position [[position]];\n"
+                                         "  float2 texCoord;\n"
+                                         "};\n"
+                                         "struct ArrayUniforms {\n"
+                                         "  float layer;\n"
+                                         "};\n"
+                                         "fragment float4 fragment_array(VertexOut in [[stage_in]],\n"
+                                         "                               texture2d_array<float> tex [[texture(0)]],\n"
+                                         "                               sampler s [[sampler(0)]],\n"
+                                         "                               constant ArrayUniforms &uniforms [[buffer(0)]]) {\n"
+                                         "  return tex.sample(s, in.texCoord, uint(uniforms.layer));\n"
+                                         "}";
+  
+  error = nil;
+  id<MTLLibrary> arrayFragmentLibrary = [self.device newLibraryWithSource:arrayFragmentShaderSource options:nil error:&error];
+  if (error) {
+    NSLog(@"KTX2PlayerView: Array fragment shader compilation error: %@", error);
+  }
+  id<MTLFunction> arrayFragmentFunction = [arrayFragmentLibrary newFunctionWithName:@"fragment_array"];
+  
+  if (arrayFragmentFunction) {
+    MTLRenderPipelineDescriptor *arrayPipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    arrayPipelineDescriptor.vertexFunction = vertexFunction;
+    arrayPipelineDescriptor.fragmentFunction = arrayFragmentFunction;
+    arrayPipelineDescriptor.colorAttachments[0].pixelFormat = self.colorPixelFormat;
+    arrayPipelineDescriptor.colorAttachments[0].blendingEnabled = YES;
+    arrayPipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    arrayPipelineDescriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    arrayPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    arrayPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    arrayPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    arrayPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    
+    error = nil;
+    _arrayPipelineState = [self.device newRenderPipelineStateWithDescriptor:arrayPipelineDescriptor error:&error];
+    if (error) {
+      NSLog(@"KTX2PlayerView: Failed to create array pipeline state: %@", error);
+    } else {
+      NSLog(@"KTX2PlayerView: Array pipeline state created successfully");
+    }
+  }
+  
+  // Create uniform buffer for texture array (just layer index)
+  _arrayUniformBuffer = [self.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
 }
 
 - (void)setupVertexData
@@ -633,12 +693,21 @@
   NSString *mode = metadata[@"mode"];
   BOOL isNativeASTC = [mode isEqualToString:@"astc"];
   
-  NSLog(@"KTX2PlayerView: Metadata: %ld frames, %ldx%ld, %.1f fps, %ld parts, mode=%@",
-        (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight,
-        self.frameRate, (long)self.partCount, mode ?: @"uastc");
+  // Check for texture array packing mode
+  NSString *packingMode = metadata[@"packingMode"];
+  _useTextureArray = [packingMode isEqualToString:@"array"];
+  _textureArrayLayerCount = [metadata[@"layerCount"] integerValue] ?: self.totalFrames;
   
-  // Load part textures
-  [self loadPartTextures:metadata basePath:basePath sourceUri:sourceUri isNativeASTC:isNativeASTC];
+  NSLog(@"KTX2PlayerView: Metadata: %ld frames, %ldx%ld, %.1f fps, %ld parts, mode=%@, packing=%@",
+        (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight,
+        self.frameRate, (long)self.partCount, mode ?: @"uastc", packingMode ?: @"atlas");
+  
+  // Load textures based on packing mode
+  if (_useTextureArray) {
+    [self loadTextureArray:metadata sourceUri:sourceUri isNativeASTC:isNativeASTC];
+  } else {
+    [self loadPartTextures:metadata basePath:basePath sourceUri:sourceUri isNativeASTC:isNativeASTC];
+  }
 }
 
 /**
@@ -834,6 +903,156 @@
   } else {
     return sourceUri;
   }
+}
+
+#pragma mark - Texture Array Loading
+
+/**
+ * Load a KTX2 texture array (one frame per layer).
+ * Uses Metal's MTLTextureType2DArray for efficient frame switching.
+ */
+- (void)loadTextureArray:(NSDictionary *)metadata sourceUri:(NSString *)sourceUri isNativeASTC:(BOOL)isNativeASTC
+{
+  _cachedMetadata = metadata;
+  _isNativeASTC = isNativeASTC;
+  
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    // Load the KTX2 file
+    NSData *ktx2Data = nil;
+    if ([sourceUri hasPrefix:@"http://"] || [sourceUri hasPrefix:@"https://"]) {
+      ktx2Data = [self loadDataFromURLWithCaching:sourceUri partIndex:0];
+    } else if ([sourceUri hasPrefix:@"file://"]) {
+      NSURL *fileURL = [NSURL URLWithString:sourceUri];
+      ktx2Data = [NSData dataWithContentsOfURL:fileURL];
+    } else {
+      ktx2Data = [NSData dataWithContentsOfFile:sourceUri];
+    }
+    
+    if (!ktx2Data || ktx2Data.length < 104) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"Failed to load texture array KTX2 file"];
+      });
+      return;
+    }
+    
+    // Parse KTX2 header
+    const uint8_t *bytes = (const uint8_t *)[ktx2Data bytes];
+    uint32_t width = *(uint32_t *)(bytes + 20);
+    uint32_t height = *(uint32_t *)(bytes + 24);
+    uint32_t layerCount = *(uint32_t *)(bytes + 32);
+    uint32_t supercompressionScheme = *(uint32_t *)(bytes + 44);
+    
+    // Level 0 index (at byte 80)
+    uint64_t level0Offset = *(uint64_t *)(bytes + 80);
+    uint64_t level0Length = *(uint64_t *)(bytes + 88);
+    uint64_t level0UncompressedLength = *(uint64_t *)(bytes + 96);
+    
+    NSLog(@"KTX2PlayerView: Texture array: %ux%u, %u layers, supercompression=%u",
+          width, height, layerCount, supercompressionScheme);
+    
+    // Extract ASTC data
+    NSData *astcData = nil;
+    
+    if (supercompressionScheme == 2) {
+      // Zstd compressed - decompress using zstd
+      const void *compressedData = bytes + level0Offset;
+      size_t compressedSize = (size_t)level0Length;
+      size_t decompressedSize = (size_t)level0UncompressedLength;
+      
+      NSMutableData *decompressedData = [NSMutableData dataWithLength:decompressedSize];
+      size_t result = ZSTD_decompress([decompressedData mutableBytes], decompressedSize,
+                                       compressedData, compressedSize);
+      
+      if (ZSTD_isError(result)) {
+        NSLog(@"KTX2PlayerView: Zstd decompression failed: %s", ZSTD_getErrorName(result));
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self notifyError:@"Failed to decompress texture array"];
+        });
+        return;
+      }
+      
+      astcData = decompressedData;
+      NSLog(@"KTX2PlayerView: Decompressed %llu -> %zu bytes", level0Length, result);
+    } else {
+      // Uncompressed
+      astcData = [NSData dataWithBytes:bytes + level0Offset length:(NSUInteger)level0Length];
+    }
+    
+    // Calculate bytes per layer
+    uint32_t blocksX = (width + 3) / 4;
+    uint32_t blocksY = (height + 3) / 4;
+    uint32_t bytesPerLayer = blocksX * blocksY * 16;
+    
+    NSLog(@"KTX2PlayerView: ASTC data: %lu bytes, %u bytes/layer, %u layers",
+          (unsigned long)astcData.length, bytesPerLayer, layerCount);
+    
+    // Create texture array on main thread
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (self->_isDestroyed) return;
+      
+      // Create texture array descriptor
+      MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+      descriptor.textureType = MTLTextureType2DArray;
+      descriptor.pixelFormat = self->_useCompressedFormat ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatRGBA8Unorm;
+      descriptor.width = width;
+      descriptor.height = height;
+      descriptor.arrayLength = layerCount;
+      descriptor.mipmapLevelCount = 1;
+      descriptor.usage = MTLTextureUsageShaderRead;
+      descriptor.storageMode = MTLStorageModeShared;
+      
+      self->_textureArray = [self.device newTextureWithDescriptor:descriptor];
+      
+      if (!self->_textureArray) {
+        [self notifyError:@"Failed to create texture array"];
+        return;
+      }
+      
+      // Upload each layer
+      const uint8_t *astcBytes = (const uint8_t *)[astcData bytes];
+      
+      for (uint32_t layer = 0; layer < layerCount; layer++) {
+        const uint8_t *layerData = astcBytes + (layer * bytesPerLayer);
+        
+        if (self->_useCompressedFormat) {
+          // Upload compressed ASTC directly
+          MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+          [self->_textureArray replaceRegion:region
+                                 mipmapLevel:0
+                                       slice:layer
+                                   withBytes:layerData
+                                 bytesPerRow:blocksX * 16
+                               bytesPerImage:bytesPerLayer];
+        } else {
+          // Decode ASTC to RGBA for simulator
+          NSData *layerASTCData = [NSData dataWithBytesNoCopy:(void *)layerData length:bytesPerLayer freeWhenDone:NO];
+          NSData *rgbaData = [self decodeASTCToRGBA:layerASTCData width:width height:height];
+          
+          if (rgbaData) {
+            MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+            [self->_textureArray replaceRegion:region
+                                   mipmapLevel:0
+                                         slice:layer
+                                     withBytes:[rgbaData bytes]
+                                   bytesPerRow:width * 4
+                                 bytesPerImage:width * height * 4];
+          }
+        }
+      }
+      
+      self->_textureArrayLayerCount = layerCount;
+      self->_isSourceLoaded = YES;
+      self->_isSourceLoading = NO;
+      
+      NSLog(@"KTX2PlayerView: ✓ Texture array loaded: %ux%u, %u layers", width, height, layerCount);
+      
+      [self notifyStateChange:@"ready"];
+      
+      if (self.autoPlay) {
+        [self play];
+      }
+    });
+  });
 }
 
 - (void)loadPartTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri isNativeASTC:(BOOL)isNativeASTC
@@ -1094,6 +1313,7 @@
       }
       
       self->_isSourceLoaded = YES;
+      self->_isSourceLoading = NO;
       self.currentTexture = self.partTextures[0];
       [self updateUniforms];
       [self notifyStateChange:@"ready"];
@@ -1301,6 +1521,39 @@
 {
   static int drawCount = 0;
   
+  // Check for texture array mode
+  if (_useTextureArray && _textureArray && _arrayPipelineState) {
+    if (drawCount < 5) {
+      NSLog(@"KTX2PlayerView: drawInMTKView - rendering texture array frame %ld", (long)self.currentFrame);
+      drawCount++;
+    }
+    
+    // Update layer uniform
+    float layer = (float)self.currentFrame;
+    memcpy([_arrayUniformBuffer contents], &layer, sizeof(float));
+    
+    id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+    MTLRenderPassDescriptor *renderPassDescriptor = view.currentRenderPassDescriptor;
+    
+    if (renderPassDescriptor) {
+      id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+      
+      [renderEncoder setRenderPipelineState:_arrayPipelineState];
+      [renderEncoder setFragmentTexture:_textureArray atIndex:0];
+      [renderEncoder setFragmentSamplerState:_samplerState atIndex:0];
+      [renderEncoder setFragmentBuffer:_arrayUniformBuffer offset:0 atIndex:0];
+      
+      [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+      [renderEncoder endEncoding];
+      
+      [commandBuffer presentDrawable:view.currentDrawable];
+    }
+    
+    [commandBuffer commit];
+    return;
+  }
+  
+  // Standard atlas mode rendering
   if (!self.currentTexture || !self.pipelineState) {
     if (drawCount < 5) {
       NSLog(@"KTX2PlayerView: drawInMTKView - skipping (texture=%p, pipeline=%p)", self.currentTexture, self.pipelineState);
@@ -1346,6 +1599,7 @@
   NSLog(@"KTX2PlayerView: cleanup");
   _isDestroyed = YES;
   _isSourceLoaded = NO;
+  _isSourceLoading = NO;
   
   // Stop playback
   self.isPlaying = NO;
@@ -1373,9 +1627,10 @@
     NSLog(@"KTX2PlayerView: willMoveToSuperview - view added");
     _isDestroyed = NO;
     
-    // If we have a source but it's not loaded, reload it
-    if (_source && !_isSourceLoaded) {
+    // If we have a source but it's not loaded or loading, reload it
+    if (_source && !_isSourceLoaded && !_isSourceLoading) {
       NSLog(@"KTX2PlayerView: Restarting playback after view re-added");
+      _isSourceLoading = YES;
       [self loadKTX2WithSource:_source];
     }
   }

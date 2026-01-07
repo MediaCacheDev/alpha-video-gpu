@@ -570,4 +570,137 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass 
     return result;
 }
 
+/**
+ * Load a KTX2 texture array (one frame per layer).
+ * Uses OpenGL ES 3.0 GL_TEXTURE_2D_ARRAY for efficient frame switching.
+ * Returns [textureId, width, height, layerCount]
+ */
+JNIEXPORT jintArray JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass clazz,
+                                                             jbyteArray ktx2_data,
+                                                             jboolean use_astc) {
+    init_transcoder();
+    
+    jsize data_length = env->GetArrayLength(ktx2_data);
+    jbyte* data = env->GetByteArrayElements(ktx2_data, nullptr);
+    
+    if (!data || data_length < 104) {
+        LOGE("Invalid KTX2 data for texture array");
+        if (data) env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
+        return nullptr;
+    }
+    
+    const uint8_t* bytes = (const uint8_t*)data;
+    
+    // Parse KTX2 header
+    uint32_t width = *(uint32_t*)(bytes + 20);
+    uint32_t height = *(uint32_t*)(bytes + 24);
+    uint32_t layerCount = *(uint32_t*)(bytes + 32);
+    uint32_t supercompressionScheme = *(uint32_t*)(bytes + 44);
+    
+    // Level 0 index (at byte 80)
+    uint64_t level0Offset = *(uint64_t*)(bytes + 80);
+    uint64_t level0Length = *(uint64_t*)(bytes + 88);
+    uint64_t level0UncompressedLength = *(uint64_t*)(bytes + 96);
+    
+    LOGI("Texture array: %ux%u, %u layers, supercompression=%u",
+         width, height, layerCount, supercompressionScheme);
+    
+    // Extract ASTC data
+    std::vector<uint8_t> astcData;
+    
+    if (supercompressionScheme == 2) {
+        // Zstd compressed - decompress
+        const void* compressedData = bytes + level0Offset;
+        size_t compressedSize = (size_t)level0Length;
+        size_t decompressedSize = (size_t)level0UncompressedLength;
+        
+        astcData.resize(decompressedSize);
+        size_t result = ZSTD_decompress(astcData.data(), decompressedSize,
+                                         compressedData, compressedSize);
+        
+        if (ZSTD_isError(result)) {
+            LOGE("Zstd decompression failed: %s", ZSTD_getErrorName(result));
+            env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
+            return nullptr;
+        }
+        
+        LOGI("Decompressed %llu -> %zu bytes", (unsigned long long)level0Length, result);
+    } else {
+        // Uncompressed
+        astcData.assign(bytes + level0Offset, bytes + level0Offset + level0Length);
+    }
+    
+    env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
+    
+    // Calculate bytes per layer
+    uint32_t blocksX = (width + 3) / 4;
+    uint32_t blocksY = (height + 3) / 4;
+    uint32_t bytesPerLayer = blocksX * blocksY * 16;
+    
+    LOGI("ASTC data: %zu bytes, %u bytes/layer, %u layers",
+         astcData.size(), bytesPerLayer, layerCount);
+    
+    // Clear any pending GL errors
+    while (glGetError() != GL_NO_ERROR) {}
+    
+    // Create texture array
+    GLuint textureId;
+    glGenTextures(1, &textureId);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textureId);
+    
+    GLenum bindError = glGetError();
+    if (bindError != GL_NO_ERROR) {
+        LOGE("glBindTexture GL_TEXTURE_2D_ARRAY error: 0x%x", bindError);
+        glDeleteTextures(1, &textureId);
+        return nullptr;
+    }
+    
+    if (use_astc) {
+        // Upload compressed ASTC data directly
+        glCompressedTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                width, height, layerCount, 0,
+                                astcData.size(), astcData.data());
+    } else {
+        // Decode ASTC to RGBA for each layer and upload
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+                     width, height, layerCount, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        
+        for (uint32_t layer = 0; layer < layerCount; layer++) {
+            const uint8_t* layerData = astcData.data() + (layer * bytesPerLayer);
+            std::vector<uint8_t> rgbaData;
+            
+            if (decode_astc_to_rgba(layerData, bytesPerLayer, width, height, rgbaData)) {
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                                0, 0, layer,
+                                width, height, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, rgbaData.data());
+            }
+        }
+    }
+    
+    GLenum texError = glGetError();
+    if (texError != GL_NO_ERROR) {
+        LOGE("Texture array upload error: 0x%x", texError);
+        glDeleteTextures(1, &textureId);
+        return nullptr;
+    }
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    LOGI("Created texture array: ID=%d (%ux%u, %u layers)", textureId, width, height, layerCount);
+    
+    // Return [textureId, width, height, layerCount]
+    jintArray result = env->NewIntArray(4);
+    jint values[4] = { (jint)textureId, (jint)width, (jint)height, (jint)layerCount };
+    env->SetIntArrayRegion(result, 0, 4, values);
+    
+    return result;
+}
+
 } // extern "C"

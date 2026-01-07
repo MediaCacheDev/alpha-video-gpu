@@ -134,6 +134,11 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     // Native ASTC mode flag
     private boolean isNativeASTC = false;
     
+    // Texture array mode (for packingMode: 'array')
+    private boolean useTextureArray = false;
+    private int textureArrayId = 0;
+    private int textureArrayLayerCount = 0;
+    
     // Threading
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private ExecutorService executor;
@@ -194,6 +199,38 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         "  vec4 color = texture2D(uTexture, uv);\n" +
         "  gl_FragColor = color;\n" +
         "}\n";
+    
+    // Texture array shader (for packingMode: 'array')
+    private static final String TEXTURE_ARRAY_FRAGMENT_SHADER =
+        "#version 300 es\n" +
+        "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
+        "precision highp float;\n" +
+        "precision highp sampler2DArray;\n" +
+        "#else\n" +
+        "precision mediump float;\n" +
+        "precision mediump sampler2DArray;\n" +
+        "#endif\n" +
+        "in vec2 vTexCoord;\n" +
+        "out vec4 fragColor;\n" +
+        "uniform sampler2DArray uTextureArray;\n" +
+        "uniform float uLayer;\n" +
+        "void main() {\n" +
+        "  fragColor = texture(uTextureArray, vec3(vTexCoord, uLayer));\n" +
+        "}\n";
+    
+    private static final String TEXTURE_ARRAY_VERTEX_SHADER =
+        "#version 300 es\n" +
+        "in vec4 aPosition;\n" +
+        "in vec2 aTexCoord;\n" +
+        "out vec2 vTexCoord;\n" +
+        "void main() {\n" +
+        "  gl_Position = aPosition;\n" +
+        "  vTexCoord = aTexCoord;\n" +
+        "}\n";
+    
+    // Texture array shader program and uniforms
+    private int arrayProgram = 0;
+    private int arrayUniformLayerLocation = -1;
     
     private static final float[] VERTEX_DATA = {
         -1.0f, -1.0f,
@@ -731,7 +768,49 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         Log.d(TAG, "Shaders initialized successfully (gpuPlayback uniforms: " + 
               (uniformGpuPlaybackLocation >= 0 ? "found" : "not found") + ")");
+        
+        // Initialize texture array shader (for packingMode: 'array')
+        initTextureArrayShader();
+        
         return true;
+    }
+    
+    /**
+     * Initialize the texture array shader program for packingMode: 'array'.
+     */
+    private void initTextureArrayShader() {
+        int vertexShader = compileShader(GLES30.GL_VERTEX_SHADER, TEXTURE_ARRAY_VERTEX_SHADER);
+        if (vertexShader == 0) {
+            Log.e(TAG, "Failed to compile texture array vertex shader");
+            return;
+        }
+        
+        int fragmentShader = compileShader(GLES30.GL_FRAGMENT_SHADER, TEXTURE_ARRAY_FRAGMENT_SHADER);
+        if (fragmentShader == 0) {
+            GLES30.glDeleteShader(vertexShader);
+            Log.e(TAG, "Failed to compile texture array fragment shader");
+            return;
+        }
+        
+        arrayProgram = GLES30.glCreateProgram();
+        GLES30.glAttachShader(arrayProgram, vertexShader);
+        GLES30.glAttachShader(arrayProgram, fragmentShader);
+        GLES30.glLinkProgram(arrayProgram);
+        
+        int[] linkStatus = new int[1];
+        GLES30.glGetProgramiv(arrayProgram, GLES30.GL_LINK_STATUS, linkStatus, 0);
+        if (linkStatus[0] != GLES30.GL_TRUE) {
+            Log.e(TAG, "Texture array program link error: " + GLES30.glGetProgramInfoLog(arrayProgram));
+            GLES30.glDeleteProgram(arrayProgram);
+            arrayProgram = 0;
+            return;
+        }
+        
+        GLES30.glDeleteShader(vertexShader);
+        GLES30.glDeleteShader(fragmentShader);
+        
+        arrayUniformLayerLocation = GLES30.glGetUniformLocation(arrayProgram, "uLayer");
+        Log.d(TAG, "Texture array shader initialized (uLayer location: " + arrayUniformLayerLocation + ")");
     }
     
     private int compileShader(int type, String source) {
@@ -950,9 +1029,14 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         String mode = metadata.optString("mode", "uastc");
         isNativeASTC = "astc".equals(mode);
         
+        // Check for texture array packing mode
+        String packingMode = metadata.optString("packingMode", "atlas");
+        useTextureArray = "array".equals(packingMode);
+        textureArrayLayerCount = metadata.optInt("layerCount", totalFrames);
+        
         Log.i(TAG, "Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
                 ", " + frameRate + " fps, " + partCount + " parts");
-        Log.i(TAG, "Mode: '" + mode + "', isNativeASTC=" + isNativeASTC);
+        Log.i(TAG, "Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode);
     }
     
     /**
@@ -1221,6 +1305,36 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                         loadedTextureHeights.add(result[2]);
                     }
                 }
+            } else if (useTextureArray) {
+                // Load texture array (packingMode: 'array')
+                Log.d(TAG, "Loading texture array from: " + ktx2Path);
+                
+                byte[] ktx2Data = readFileBytes(ktx2Path);
+                if (ktx2Data == null) {
+                    throw new Exception("Failed to read KTX2 file: " + ktx2Path);
+                }
+                
+                boolean useAstc = isNativeASTC && isASTCSupported();
+                Log.d(TAG, "Loading texture array with ASTC=" + useAstc);
+                
+                int[] result = KTX2PlayerModule.nativeLoadTextureArray(ktx2Data, useAstc);
+                if (result == null || result.length < 4) {
+                    throw new Exception("Failed to load texture array");
+                }
+                
+                textureArrayId = result[0];
+                int texWidth = result[1];
+                int texHeight = result[2];
+                textureArrayLayerCount = result[3];
+                
+                Log.d(TAG, "Loaded texture array ID " + textureArrayId + 
+                      " (" + texWidth + "x" + texHeight + ", " + textureArrayLayerCount + " layers)");
+                
+                // For texture arrays, we don't use the regular texture list
+                // Just set up minimal state for the render loop
+                loadedTextureIds.add(textureArrayId);
+                loadedTextureWidths.add(texWidth);
+                loadedTextureHeights.add(texHeight);
             } else {
                 Log.d(TAG, "Loading single KTX2 file: " + ktx2Path + (isNativeASTC ? " (native ASTC)" : ""));
                 
@@ -1319,7 +1433,17 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private float gpuElapsedTime = 0.0f;
     
     private void renderFrame() {
-        if (eglDisplay == null || eglSurface == null || textureIds == null || textureIds.length == 0) {
+        if (eglDisplay == null || eglSurface == null) {
+            return;
+        }
+        
+        // Check for texture array mode vs regular texture mode
+        if (useTextureArray && textureArrayId != 0) {
+            renderTextureArrayFrame();
+            return;
+        }
+        
+        if (textureIds == null || textureIds.length == 0) {
             return;
         }
         
@@ -1366,6 +1490,48 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         GLES30.glVertexAttribPointer(positionHandle, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer);
         
         int texCoordHandle = GLES30.glGetAttribLocation(program, "aTexCoord");
+        GLES30.glEnableVertexAttribArray(texCoordHandle);
+        GLES30.glVertexAttribPointer(texCoordHandle, 2, GLES30.GL_FLOAT, false, 0, texCoordBuffer);
+        
+        // Draw
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+        
+        GLES30.glDisableVertexAttribArray(positionHandle);
+        GLES30.glDisableVertexAttribArray(texCoordHandle);
+        
+        EGL14.eglSwapBuffers(eglDisplay, eglSurface);
+    }
+    
+    /**
+     * Render a frame using texture array (for packingMode: 'array').
+     * Uses GL_TEXTURE_2D_ARRAY and samples the layer corresponding to currentFrame.
+     */
+    private void renderTextureArrayFrame() {
+        if (arrayProgram == 0) {
+            Log.e(TAG, "Texture array shader not initialized");
+            return;
+        }
+        
+        GLES30.glClearColor(0, 0, 0, 0);
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT);
+        GLES30.glViewport(0, 0, getWidth(), getHeight());
+        GLES30.glUseProgram(arrayProgram);
+        
+        // Set layer uniform (current frame index)
+        GLES30.glUniform1f(arrayUniformLayerLocation, (float) currentFrame);
+        
+        // Bind texture array
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, textureArrayId);
+        int textureLocation = GLES30.glGetUniformLocation(arrayProgram, "uTextureArray");
+        GLES30.glUniform1i(textureLocation, 0);
+        
+        // Set vertex attributes
+        int positionHandle = GLES30.glGetAttribLocation(arrayProgram, "aPosition");
+        GLES30.glEnableVertexAttribArray(positionHandle);
+        GLES30.glVertexAttribPointer(positionHandle, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer);
+        
+        int texCoordHandle = GLES30.glGetAttribLocation(arrayProgram, "aTexCoord");
         GLES30.glEnableVertexAttribArray(texCoordHandle);
         GLES30.glVertexAttribPointer(texCoordHandle, 2, GLES30.GL_FLOAT, false, 0, texCoordBuffer);
         

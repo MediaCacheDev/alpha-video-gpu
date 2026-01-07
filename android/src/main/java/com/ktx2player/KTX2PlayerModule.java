@@ -49,4 +49,5 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     public static native void nativeDeleteTexture(int textureId);
     public static native byte[] nativeDecompressZstd(byte[] data, int offset, int compressedLength, int uncompressedLength);
     public static native int[] nativeDecodeASTCToRGBA(byte[] astcData, int width, int height);
+    public static native int[] nativeLoadTextureArray(byte[] ktx2Data, boolean useAstc);
 }
