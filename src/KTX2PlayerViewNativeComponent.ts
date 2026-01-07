@@ -13,6 +13,8 @@ export interface NativeProps extends ViewProps {
   autoPlay?: boolean;
   loop?: boolean;
   playbackSpeed?: number;
+  /** Pause playback and decompression (useful for screen focus/blur) */
+  paused?: boolean;
   cacheKey?: string;
   /**
    * Enable GPU-controlled playback timing (experimental).
@@ -21,6 +23,14 @@ export interface NativeProps extends ViewProps {
    * GPU mode may improve performance with many simultaneous animations.
    */
   gpuPlayback?: boolean;
+  
+  // Streaming parameters (for .ktx2.zst files)
+  /** GPU ring buffer slots (VRAM). Default: 16 */
+  streamingRingSize?: number;
+  /** CPU frame cache size (RAM). Default: 60 */
+  streamingCacheSize?: number;
+  /** Frames to decode ahead of playback. Default: 30 */
+  streamingPrefetchAhead?: number;
 }
 
 export default requireNativeComponent<NativeProps>(

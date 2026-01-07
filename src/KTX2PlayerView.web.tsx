@@ -32,12 +32,22 @@ export interface KTX2PlayerViewProps {
   autoPlay?: boolean;
   loop?: boolean;
   playbackSpeed?: number;
+  /** Pause playback and decompression (useful for screen focus/blur) */
+  paused?: boolean;
   cacheKey?: string;
   style?: any;
   onStateChange?: (state: string) => void;
   onFrameUpdate?: (frame: number, total: number) => void;
   onFinished?: () => void;
   onError?: (error: Error) => void;
+  
+  // Streaming parameters (for .ktx2.zst files)
+  /** GPU ring buffer slots (VRAM). Default: 16 */
+  streamingRingSize?: number;
+  /** CPU frame cache size (RAM). Default: 60 */
+  streamingCacheSize?: number;
+  /** Frames to decode ahead of playback. Default: 30 */
+  streamingPrefetchAhead?: number;
 }
 
 interface FrameUV {
@@ -249,11 +259,15 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   autoPlay = true,
   loop = true,
   playbackSpeed = 1.0,
+  paused = false,
   style,
   onStateChange,
   onFrameUpdate,
   onFinished,
   onError,
+  streamingRingSize = 16,
+  streamingCacheSize = 60,
+  streamingPrefetchAhead = 30,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const glRef = useRef<WebGLRenderingContext | WebGL2RenderingContext | null>(null);
@@ -273,6 +287,26 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   const textureArrayRef = useRef<WebGLTexture | null>(null);
   const useTextureArrayRef = useRef<boolean>(false);
   const zstdDecoderRef = useRef<any>(null);
+  
+  // Streaming state (sliding window)
+  const streamingModeRef = useRef<boolean>(false);
+  const streamingCancelledRef = useRef<boolean>(false); // Cancellation flag for cleanup
+  const streamingFrameCacheRef = useRef<Map<number, Uint8Array>>(new Map());
+  const streamingRingBufferRef = useRef<WebGLTexture | null>(null);
+  const streamingRingSlotsRef = useRef<number[]>([]);
+  const streamingRingActualSizeRef = useRef<number>(0);
+  const streamingDecodePosRef = useRef<number>(0);
+  const streamingFramesReadyRef = useRef<number>(0);
+  const streamingDecompressPausedRef = useRef<boolean>(false);
+  const streamingLoopCountRef = useRef<number>(0);
+  const streamingCompressedChunksRef = useRef<Uint8Array[] | null>(null);
+  const streamingDecompressStateRef = useRef<any>(null);
+  const streamingBytesPerLayerRef = useRef<number>(0);
+  const streamingWidthRef = useRef<number>(0);
+  const streamingHeightRef = useRef<number>(0);
+  const streamingLayerCountRef = useRef<number>(0);
+  const streamingLevel0OffsetRef = useRef<number>(0);
+  const streamingAstcFormatRef = useRef<number>(0);
   
   const [state, setState] = useState<string>('idle');
   const loadedSourceRef = useRef<string | null>(null);
@@ -718,6 +752,424 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     }
   }, []);
 
+  // Initialize streaming ring buffer
+  const initStreamingRingBuffer = useCallback((
+    gl: WebGL2RenderingContext,
+    width: number,
+    height: number,
+    astcFormat: number,
+    ringSize: number
+  ) => {
+    // Calculate bytes per layer (ASTC 4x4)
+    const blocksX = Math.ceil(width / 4);
+    const blocksY = Math.ceil(height / 4);
+    const bytesPerLayer = blocksX * blocksY * 16;
+    
+    // Create ring buffer texture array
+    const ringBuffer = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, ringBuffer);
+    
+    // Allocate empty texture array for ring buffer
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, astcFormat, width, height, ringSize);
+    
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    
+    streamingRingBufferRef.current = ringBuffer;
+    streamingRingActualSizeRef.current = ringSize;
+    streamingRingSlotsRef.current = new Array(ringSize).fill(-1);
+    streamingBytesPerLayerRef.current = bytesPerLayer;
+    streamingWidthRef.current = width;
+    streamingHeightRef.current = height;
+    streamingAstcFormatRef.current = astcFormat;
+    
+    console.log(`[KTX2PlayerView] Ring buffer initialized: ${ringSize} slots, ${bytesPerLayer} bytes/layer`);
+  }, []);
+
+  // Ensure frame is in ring buffer (upload from cache if needed)
+  const ensureFrameInRingBuffer = useCallback((frameIndex: number): number => {
+    const gl = glRef.current as WebGL2RenderingContext;
+    if (!gl || !streamingRingBufferRef.current) return -1;
+    
+    const ringSize = streamingRingActualSizeRef.current;
+    const ringSlots = streamingRingSlotsRef.current;
+    const frameCache = streamingFrameCacheRef.current;
+    
+    // Check if frame is already in ring buffer
+    const existingSlot = ringSlots.indexOf(frameIndex);
+    if (existingSlot !== -1) return existingSlot;
+    
+    // Get frame data from cache
+    const frameData = frameCache.get(frameIndex);
+    if (!frameData) {
+      // Frame not yet decoded - can't upload
+      return -1;
+    }
+    
+    // Find slot to use (simple round-robin based on frame index)
+    const slot = frameIndex % ringSize;
+    
+    // Upload frame to ring buffer slot
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, streamingRingBufferRef.current);
+    gl.compressedTexSubImage3D(
+      gl.TEXTURE_2D_ARRAY,
+      0, // level
+      0, 0, slot, // x, y, z offsets
+      streamingWidthRef.current,
+      streamingHeightRef.current,
+      1, // depth (1 layer)
+      streamingAstcFormatRef.current,
+      frameData
+    );
+    
+    ringSlots[slot] = frameIndex;
+    return slot;
+  }, []);
+
+  // Evict old frames from CPU cache
+  const evictOldFramesFromCache = useCallback((currentPlaybackFrame: number) => {
+    const frameCache = streamingFrameCacheRef.current;
+    const keepFrom = Math.max(0, currentPlaybackFrame - 2);
+    const keepTo = currentPlaybackFrame + streamingCacheSize;
+    
+    for (const frameIndex of frameCache.keys()) {
+      if (frameIndex < keepFrom || frameIndex > keepTo) {
+        frameCache.delete(frameIndex);
+      }
+    }
+  }, [streamingCacheSize]);
+
+  // Continue streaming decompression
+  const continueStreamingDecompression = useCallback(() => {
+    // Check if cancelled (component unmounted)
+    if (streamingCancelledRef.current) {
+      console.log('[KTX2PlayerView] Decompression cancelled (cleanup)');
+      return;
+    }
+    
+    const state = streamingDecompressStateRef.current;
+    if (!state || state.reachedEnd) return;
+    
+    const currentFrame = currentFrameRef.current;
+    const decodePos = streamingDecodePosRef.current;
+    const frameCache = streamingFrameCacheRef.current;
+    const bytesPerLayer = streamingBytesPerLayerRef.current;
+    
+    // Check if we should pause (too far ahead)
+    if (decodePos > currentFrame + streamingPrefetchAhead) {
+      if (!streamingDecompressPausedRef.current) {
+        streamingDecompressPausedRef.current = true;
+      }
+      // Schedule check later (but check cancellation first)
+      if (!streamingCancelledRef.current) {
+        requestAnimationFrame(() => continueStreamingDecompression());
+      }
+      return;
+    }
+    
+    streamingDecompressPausedRef.current = false;
+    
+    // Evict old frames
+    evictOldFramesFromCache(currentFrame);
+    
+    // Process some chunks
+    const startTime = performance.now();
+    const maxTimePerBatch = 8; // ms
+    let chunksProcessed = 0;
+    
+    while (performance.now() - startTime < maxTimePerBatch) {
+      const result = state.generator.next();
+      
+      if (result.done) {
+        state.reachedEnd = true;
+        console.log(`[KTX2PlayerView] ✓ Streaming decompression complete: ${decodePos} frames decoded`);
+        break;
+      }
+      
+      const chunk = result.value;
+      chunksProcessed++;
+      
+      // Skip header bytes on loop restart
+      if (state.bytesToSkipForHeader > 0) {
+        const toSkip = Math.min(chunk.length, state.bytesToSkipForHeader);
+        state.bytesToSkipForHeader -= toSkip;
+        if (toSkip < chunk.length) {
+          const remaining = chunk.subarray(toSkip);
+          if (state.frameAccumulator && state.frameAccumulatorLength + remaining.length <= state.frameAccumulator.length) {
+            state.frameAccumulator.set(remaining, state.frameAccumulatorLength);
+            state.frameAccumulatorLength += remaining.length;
+          }
+        }
+        continue;
+      }
+      
+      // Parse header first (only on first pass)
+      if (!state.headerParsed) {
+        const spaceLeft = state.headerBuffer.length - state.headerBufferLength;
+        const toCopy = Math.min(chunk.length, spaceLeft);
+        state.headerBuffer.set(chunk.subarray(0, toCopy), state.headerBufferLength);
+        state.headerBufferLength += toCopy;
+        
+        if (state.headerBufferLength >= 200) {
+          // Parse KTX2 header
+          const view = new DataView(state.headerBuffer.buffer);
+          if (state.headerBuffer[0] === 0xAB && state.headerBuffer[1] === 0x4B) {
+            state.headerParsed = true;
+            state.level0Offset = Number(view.getBigUint64(80, true));
+            streamingLevel0OffsetRef.current = state.level0Offset;
+            
+            // Initialize frame accumulator
+            state.frameAccumulator = new Uint8Array(bytesPerLayer * 2);
+            state.frameAccumulatorLength = 0;
+            
+            // Skip header bytes, keep remaining for frame data
+            const headerRemaining = state.headerBufferLength - state.level0Offset;
+            if (headerRemaining > 0) {
+              state.frameAccumulator.set(
+                state.headerBuffer.subarray(state.level0Offset, state.headerBufferLength),
+                0
+              );
+              state.frameAccumulatorLength = headerRemaining;
+            }
+            
+            // Also add rest of current chunk if any
+            if (toCopy < chunk.length) {
+              const remaining = chunk.subarray(toCopy);
+              state.frameAccumulator.set(remaining, state.frameAccumulatorLength);
+              state.frameAccumulatorLength += remaining.length;
+            }
+          }
+        }
+        continue;
+      }
+      
+      // Accumulate frame data
+      if (state.frameAccumulatorLength + chunk.length > state.frameAccumulator.length) {
+        // Grow accumulator
+        const newAccum = new Uint8Array(state.frameAccumulator.length * 2);
+        newAccum.set(state.frameAccumulator.subarray(0, state.frameAccumulatorLength));
+        state.frameAccumulator = newAccum;
+      }
+      state.frameAccumulator.set(chunk, state.frameAccumulatorLength);
+      state.frameAccumulatorLength += chunk.length;
+      
+      // Extract complete frames into cache
+      while (state.frameAccumulatorLength >= bytesPerLayer) {
+        const frameData = state.frameAccumulator.slice(0, bytesPerLayer);
+        frameCache.set(streamingDecodePosRef.current, frameData);
+        streamingDecodePosRef.current++;
+        streamingFramesReadyRef.current = streamingDecodePosRef.current;
+        
+        // Shift remaining data
+        const remaining = state.frameAccumulatorLength - bytesPerLayer;
+        if (remaining > 0) {
+          state.frameAccumulator.copyWithin(0, bytesPerLayer, state.frameAccumulatorLength);
+        }
+        state.frameAccumulatorLength = remaining;
+      }
+    }
+    
+    // Continue if not done and not cancelled
+    if (!state.reachedEnd && !streamingCancelledRef.current) {
+      requestAnimationFrame(() => continueStreamingDecompression());
+    }
+  }, [streamingPrefetchAhead, evictOldFramesFromCache]);
+
+  // Handle streaming loop restart
+  const handleStreamingLoop = useCallback(() => {
+    streamingLoopCountRef.current++;
+    console.log(`[KTX2PlayerView] 🔄 Loop #${streamingLoopCountRef.current} - restarting decompression`);
+    
+    // Clear frame cache
+    streamingFrameCacheRef.current.clear();
+    
+    // Reset decode position
+    streamingDecodePosRef.current = 0;
+    streamingFramesReadyRef.current = 0;
+    streamingDecompressPausedRef.current = false;
+    
+    // Re-create decompression generator
+    const compressedChunks = streamingCompressedChunksRef.current;
+    if (compressedChunks && zstdDecoderRef.current?.decodeStreaming) {
+      const generator = zstdDecoderRef.current.decodeStreaming(compressedChunks);
+      
+      const state = streamingDecompressStateRef.current;
+      if (state) {
+        state.generator = generator;
+        state.reachedEnd = false;
+        state.frameAccumulatorLength = 0;
+        state.bytesToSkipForHeader = streamingLevel0OffsetRef.current;
+      }
+      
+      // Restart decompression
+      continueStreamingDecompression();
+    }
+  }, [continueStreamingDecompression]);
+
+  // Load streaming texture array (.ktx2.zst) with progressive decompression
+  const loadStreamingTextureArray = useCallback(async (
+    gl: WebGL2RenderingContext,
+    uri: string,
+    onProgress?: (loaded: number, total: number, layersReady: number) => void
+  ): Promise<boolean> => {
+    try {
+      console.log('[KTX2PlayerView] Starting streaming load:', uri);
+      
+      // Initialize zstd decoder
+      if (typeof ZSTDDecoder === 'undefined') {
+        throw new Error('ZSTDDecoder not available for streaming mode');
+      }
+      
+      if (!zstdDecoderRef.current) {
+        zstdDecoderRef.current = new ZSTDDecoder();
+        await zstdDecoderRef.current.init();
+      }
+      
+      // Check for streaming support
+      if (typeof zstdDecoderRef.current.decodeStreaming !== 'function') {
+        throw new Error('decodeStreaming not available. Include zstddec-stream.js');
+      }
+      
+      // Fetch with streaming
+      const response = await fetch(uri);
+      if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
+      
+      const contentLength = parseInt(response.headers.get('content-length') || '0');
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('ReadableStream not supported');
+      
+      // Collect compressed chunks
+      const compressedChunks: Uint8Array[] = [];
+      let receivedLength = 0;
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        compressedChunks.push(value);
+        receivedLength += value.length;
+        onProgress?.(receivedLength, contentLength, 0);
+      }
+      
+      console.log(`[KTX2PlayerView] Downloaded ${receivedLength} bytes, parsing header...`);
+      streamingCompressedChunksRef.current = compressedChunks;
+      
+      // Parse header from first decompressed chunk to get dimensions
+      const generator = zstdDecoderRef.current.decodeStreaming(compressedChunks);
+      let headerBuffer = new Uint8Array(256);
+      let headerBufferLength = 0;
+      let headerParsed = false;
+      let width = 0, height = 0, layerCount = 0, vkFormat = 0, level0Offset = 0;
+      
+      // Read enough to parse header
+      for (const chunk of generator) {
+        // Grow buffer if needed - ensure it's large enough for existing + new data
+        if (headerBufferLength + chunk.length > headerBuffer.length) {
+          const newSize = Math.max(headerBuffer.length * 2, headerBufferLength + chunk.length);
+          const newBuf = new Uint8Array(newSize);
+          newBuf.set(headerBuffer.subarray(0, headerBufferLength));
+          headerBuffer = newBuf;
+        }
+        headerBuffer.set(chunk, headerBufferLength);
+        headerBufferLength += chunk.length;
+        
+        if (headerBufferLength >= 200 && !headerParsed) {
+          // Parse KTX2 header
+          const view = new DataView(headerBuffer.buffer);
+          if (headerBuffer[0] === 0xAB && headerBuffer[1] === 0x4B) {
+            vkFormat = view.getUint32(12, true);
+            width = view.getUint32(20, true);
+            height = view.getUint32(24, true);
+            layerCount = view.getUint32(32, true);
+            level0Offset = Number(view.getBigUint64(80, true));
+            headerParsed = true;
+            break; // We have what we need
+          }
+        }
+      }
+      
+      if (!headerParsed) {
+        throw new Error('Failed to parse KTX2 header from stream');
+      }
+      
+      console.log(`[KTX2PlayerView] Streaming texture: ${width}x${height}, ${layerCount} layers`);
+      
+      // Extract metadata from header
+      const metadata = extractKTX2Metadata(headerBuffer.subarray(0, Math.min(headerBufferLength, level0Offset + 100)));
+      if (!metadata) {
+        throw new Error('No metadata found in streaming KTX2');
+      }
+      metadataRef.current = metadata;
+      streamingLayerCountRef.current = layerCount;
+      streamingLevel0OffsetRef.current = level0Offset;
+      
+      // Check for ASTC support
+      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
+      if (!astcExt) {
+        throw new Error('ASTC texture compression not supported');
+      }
+      
+      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
+      if (vkFormat === 158) {
+        astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      }
+      
+      // Initialize ring buffer
+      const ringSize = Math.min(streamingRingSize, layerCount);
+      initStreamingRingBuffer(gl, width, height, astcFormat, ringSize);
+      
+      // Initialize streaming mode
+      streamingModeRef.current = true;
+      streamingFrameCacheRef.current = new Map();
+      streamingDecodePosRef.current = 0;
+      streamingFramesReadyRef.current = 0;
+      
+      // Setup frame UVs (layer index is determined at render time from ring buffer)
+      const uvs: FrameUV[] = [];
+      for (let i = 0; i < metadata.frameCount; i++) {
+        uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
+      }
+      frameUVsRef.current = uvs;
+      
+      // Use ring buffer as texture array
+      textureArrayRef.current = streamingRingBufferRef.current;
+      useTextureArrayRef.current = true;
+      
+      // Add dummy texture for textures.length check
+      texturesRef.current.push(gl.createTexture()!);
+      
+      // Calculate bytes per layer
+      const blocksX = Math.ceil(width / 4);
+      const blocksY = Math.ceil(height / 4);
+      const bytesPerLayer = blocksX * blocksY * 16;
+      
+      // Initialize decompression state
+      // We already parsed header above, so skip header bytes in the new generator
+      const newGenerator = zstdDecoderRef.current.decodeStreaming(compressedChunks);
+      streamingDecompressStateRef.current = {
+        generator: newGenerator,
+        reachedEnd: false,
+        headerBuffer: new Uint8Array(256),
+        headerBufferLength: 0,
+        headerParsed: true, // Already parsed above
+        level0Offset: level0Offset,
+        frameAccumulator: new Uint8Array(bytesPerLayer * 2),
+        frameAccumulatorLength: 0,
+        bytesToSkipForHeader: level0Offset, // Skip header bytes to get to frame data
+      };
+      
+      // Start decompression
+      continueStreamingDecompression();
+      
+      console.log(`[KTX2PlayerView] ✓ Streaming initialized: ${width}x${height}, ring=${ringSize}, cache=${streamingCacheSize}`);
+      return true;
+    } catch (error) {
+      console.error('[KTX2PlayerView] Streaming load failed:', error);
+      return false;
+    }
+  }, [streamingRingSize, streamingCacheSize, initStreamingRingBuffer, continueStreamingDecompression]);
+
   // Render frame
   const render = useCallback(() => {
     const gl = glRef.current;
@@ -740,14 +1192,41 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const arrayProgram = arrayProgramRef.current;
       const gl2 = gl as WebGL2RenderingContext;
       
+      // In streaming mode, ensure frame is in ring buffer first
+      let layerIndex: number;
+      if (streamingModeRef.current) {
+        // Check if frame is ready
+        if (currentFrame >= streamingFramesReadyRef.current) {
+          // Frame not yet decoded - skip render but don't advance frame
+          return;
+        }
+        
+        // Ensure current frame and next few frames are in ring buffer
+        const slot = ensureFrameInRingBuffer(currentFrame);
+        if (slot === -1) {
+          // Frame not available in cache
+          return;
+        }
+        layerIndex = slot;
+        
+        // Prefetch next frames
+        for (let i = 1; i <= 3; i++) {
+          const nextFrame = currentFrame + i;
+          if (nextFrame < metadata.frameCount) {
+            ensureFrameInRingBuffer(nextFrame);
+          }
+        }
+      } else {
+        // Non-streaming mode: layer index is frame index
+        layerIndex = frameUV.layer !== undefined ? frameUV.layer : currentFrame;
+      }
+      
       gl2.useProgram(arrayProgram);
       
       gl2.activeTexture(gl2.TEXTURE0);
       gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, textureArrayRef.current);
       gl2.uniform1i(gl2.getUniformLocation(arrayProgram, 'u_textureArray'), 0);
       
-      // Layer index for current frame
-      const layerIndex = frameUV.layer !== undefined ? frameUV.layer : currentFrame;
       gl2.uniform1f(gl2.getUniformLocation(arrayProgram, 'u_layer'), layerIndex);
       
       const positionLoc = gl2.getAttribLocation(arrayProgram, 'a_position');
@@ -790,7 +1269,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
     
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-  }, []);
+  }, [ensureFrameInRingBuffer]);
 
   // Animation loop
   const startAnimationLoop = useCallback(() => {
@@ -817,6 +1296,11 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         if (currentFrameRef.current >= metadata.frameCount) {
           if (loop) {
             currentFrameRef.current = 0;
+            
+            // In streaming mode, restart decompression for loop
+            if (streamingModeRef.current && streamingFrameCacheRef.current) {
+              handleStreamingLoop();
+            }
           } else {
             setPlayerState('stopped');
             onFinished?.();
@@ -829,7 +1313,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     };
     
     animationFrameRef.current = requestAnimationFrame(animate);
-  }, [loop, playbackSpeed, render, setPlayerState, onFrameUpdate, onFinished]);
+  }, [loop, playbackSpeed, render, setPlayerState, onFrameUpdate, onFinished, handleStreamingLoop]);
 
   const stopAnimationLoop = useCallback(() => {
     if (animationFrameRef.current) {
@@ -843,6 +1327,9 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     try {
       setPlayerState('loading');
       
+      // Reset cancellation flag for new load
+      streamingCancelledRef.current = false;
+      
       const gl = glRef.current || initGL();
       if (!gl) return;
       
@@ -853,12 +1340,6 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const uri = src.uri;
       if (!uri) throw new Error('No source URI provided');
       
-      const response = await fetch(uri);
-      if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
-      
-      const arrayBuffer = await response.arrayBuffer();
-      const data = new Uint8Array(arrayBuffer);
-      
       // Clean up old textures and texture array
       texturesRef.current.forEach(tex => gl.deleteTexture(tex));
       texturesRef.current = [];
@@ -867,6 +1348,48 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         textureArrayRef.current = null;
       }
       useTextureArrayRef.current = false;
+      
+      // Clean up old streaming state
+      if (streamingRingBufferRef.current && gl) {
+        gl.deleteTexture(streamingRingBufferRef.current);
+        streamingRingBufferRef.current = null;
+      }
+      streamingModeRef.current = false;
+      streamingFrameCacheRef.current.clear();
+      streamingCompressedChunksRef.current = null;
+      streamingDecompressStateRef.current = null;
+      
+      // Check for streaming mode (.ktx2.zst files)
+      // Metro bundler may insert hash: .ktx2.{hash}.zst
+      const isStreamingZst = uri.endsWith('.zst') || uri.includes('.zst?') || /\.ktx2\.[a-f0-9]+\.zst/.test(uri);
+      if (isStreamingZst) {
+        console.log('[KTX2PlayerView] Detected streaming mode (.zst):', uri);
+        
+        if (!(gl instanceof WebGL2RenderingContext) || !arrayProgramRef.current) {
+          throw new Error('Streaming mode requires WebGL2');
+        }
+        
+        const success = await loadStreamingTextureArray(gl, uri);
+        if (!success) {
+          throw new Error('Failed to load streaming texture array');
+        }
+        
+        setPlayerState('ready');
+        render();
+        
+        if (autoPlay) {
+          setPlayerState('playing');
+          lastFrameTimeRef.current = performance.now();
+          startAnimationLoop();
+        }
+        return;
+      }
+      
+      const response = await fetch(uri);
+      if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
+      
+      const arrayBuffer = await response.arrayBuffer();
+      const data = new Uint8Array(arrayBuffer);
       
       // Check if this is a GLB container
       if (isGLBContainer(data)) {
@@ -1000,7 +1523,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       setPlayerState('error');
       onError?.(error as Error);
     }
-  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
+  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, loadStreamingTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
 
   // Effect: Load source when it changes
   useEffect(() => {
@@ -1035,19 +1558,56 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     // Loop is handled in animation loop
   }, [loop]);
 
+  // Effect: Handle paused prop changes
+  useEffect(() => {
+    if (paused) {
+      console.log('[KTX2PlayerView] Paused: stopping animation and decompression');
+      streamingCancelledRef.current = true;
+      stopAnimationLoop();
+    } else {
+      // Resume if we were playing before
+      if (stateRef.current === 'playing' || (stateRef.current === 'ready' && autoPlay)) {
+        console.log('[KTX2PlayerView] Resumed: restarting animation and decompression');
+        streamingCancelledRef.current = false;
+        
+        // Resume decompression if in streaming mode
+        if (streamingModeRef.current && streamingDecompressStateRef.current && !streamingDecompressStateRef.current.reachedEnd) {
+          continueStreamingDecompression();
+        }
+        
+        // Resume animation
+        if (stateRef.current === 'playing') {
+          lastFrameTimeRef.current = performance.now();
+          startAnimationLoop();
+        }
+      }
+    }
+  }, [paused, autoPlay, stopAnimationLoop, startAnimationLoop, continueStreamingDecompression]);
+
   // Cleanup
   useEffect(() => {
     return () => {
+      console.log('[KTX2PlayerView] Cleanup: stopping animation and decompression');
+      
+      // Cancel streaming decompression first
+      streamingCancelledRef.current = true;
+      
       stopAnimationLoop();
       const gl = glRef.current;
       if (gl) {
         texturesRef.current.forEach(tex => gl.deleteTexture(tex));
         if (textureArrayRef.current) gl.deleteTexture(textureArrayRef.current);
+        if (streamingRingBufferRef.current) gl.deleteTexture(streamingRingBufferRef.current);
         if (programRef.current) gl.deleteProgram(programRef.current);
         if (arrayProgramRef.current) gl.deleteProgram(arrayProgramRef.current);
         if (positionBufferRef.current) gl.deleteBuffer(positionBufferRef.current);
         if (texCoordBufferRef.current) gl.deleteBuffer(texCoordBufferRef.current);
       }
+      // Clear streaming state
+      streamingModeRef.current = false;
+      streamingFrameCacheRef.current.clear();
+      streamingCompressedChunksRef.current = null;
+      streamingDecompressStateRef.current = null;
     };
   }, [stopAnimationLoop]);
 
