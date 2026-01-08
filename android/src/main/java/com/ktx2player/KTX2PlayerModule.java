@@ -48,6 +48,7 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     public static native byte[] nativeTranscodeKTX2NoUpload(byte[] ktx2Data, int textureFormat);
     public static native void nativeDeleteTexture(int textureId);
     public static native byte[] nativeDecompressZstd(byte[] data, int offset, int compressedLength, int uncompressedLength);
+    public static native boolean nativeDecompressZstdToBuffer(byte[] data, int offset, int compressedLength, java.nio.ByteBuffer outputBuffer, int uncompressedLength);  // Zero-copy to direct ByteBuffer
     public static native int[] nativeDecodeASTCToRGBA(byte[] astcData, int width, int height);
     public static native int[] nativeLoadTextureArray(byte[] ktx2Data, boolean useAstc);
     
@@ -61,4 +62,6 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     // Streaming texture array methods
     public static native int nativeCreateTextureArray(int width, int height, int layerCount, boolean useAstc);
     public static native boolean nativeUploadTextureArrayLayer(int textureId, int layer, int width, int height, byte[] astcData, boolean useAstc);
+    public static native boolean nativeUploadTextureArrayLayerFromBuffer(int textureId, int layer, int width, int height, java.nio.ByteBuffer buffer, int dataLength, boolean useAstc);  // Zero-copy from direct ByteBuffer
+    public static native boolean nativeUploadTextureArrayLayerFromBufferWithOffset(int textureId, int layer, int width, int height, java.nio.ByteBuffer buffer, int offset, int dataLength, boolean useAstc);  // Zero-copy with offset
 }

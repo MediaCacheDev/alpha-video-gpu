@@ -134,6 +134,17 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
     
     /**
+     * Memory strategy for frame storage.
+     * - "auto": Default behavior (VRAM for non-stream, RAM for stream)
+     * - "vram": Store all frames in GPU VRAM. Best for many simultaneous players.
+     * - "ram": Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
+     */
+    @ReactProp(name = "memoryStrategy")
+    public void setMemoryStrategy(KTX2TextureView view, @Nullable String strategy) {
+        view.setMemoryStrategy(strategy != null ? strategy : "auto");
+    }
+    
+    /**
      * Set explicit part URIs for multi-part animations.
      * This is needed for bundled assets where sibling files can't be auto-discovered.
      */

@@ -142,10 +142,24 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private boolean streamingRingBufferMode = false; // True when using ring buffer for streaming
     private int streamingRingSize = 0; // Size of ring buffer (for layer index calculation)
     
+    // RAM-heavy mode storage (for memoryStrategy: 'ram' in non-stream mode)
+    // Uses contiguous direct ByteBuffer for zero-copy GPU uploads
+    private ByteBuffer ramFrameBuffer = null;  // All decoded frames in single contiguous buffer
+    private int ramBytesPerFrame = 0;          // Size of each frame in bytes
+    private int ramFrameCount = 0;             // Total number of frames
+    private boolean ramHeavyMode = false;      // True when using RAM-heavy non-stream mode
+    private int ramUploadedFrame = -1;         // Currently uploaded frame in GPU ring buffer
+    
     // Configurable streaming parameters (set via props)
     private int configStreamingRingSize = 16;      // GPU ring buffer slots (VRAM)
     private int configStreamingCacheSize = 60;     // CPU frame cache size (RAM)
     private int configStreamingPrefetchAhead = 30; // Frames to decode ahead of playback
+    
+    // Memory strategy: "auto", "vram", "ram"
+    // - auto: VRAM for non-stream, RAM for stream (default behavior)
+    // - vram: All frames in GPU VRAM (best for many simultaneous players)
+    // - ram: Decoded frames in RAM, upload per-frame (lower VRAM usage)
+    private String memoryStrategy = "auto";
     
     // Threading
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -398,6 +412,21 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     public void setStreamingPrefetchAhead(int frames) {
         this.configStreamingPrefetchAhead = Math.max(5, Math.min(100, frames));
         Log.d(TAG, "setStreamingPrefetchAhead: " + this.configStreamingPrefetchAhead);
+    }
+    
+    /**
+     * Set memory strategy for frame storage.
+     * - "auto": Default behavior (VRAM for non-stream, RAM for stream)
+     * - "vram": All frames in GPU VRAM (best for many simultaneous players)
+     * - "ram": Decoded frames in RAM, upload per-frame (lower VRAM usage)
+     */
+    public void setMemoryStrategy(String strategy) {
+        if ("vram".equals(strategy) || "ram".equals(strategy)) {
+            this.memoryStrategy = strategy;
+        } else {
+            this.memoryStrategy = "auto";
+        }
+        Log.d(TAG, "setMemoryStrategy: " + this.memoryStrategy);
     }
     
     /**
@@ -851,28 +880,47 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // Check for ASTC support
         boolean useAstc = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
         
+        // Determine effective memory strategy for streaming
+        // - "auto" or "ram": Cache in CPU RAM, small ring buffer in GPU VRAM
+        // - "vram": Cache in GPU VRAM (larger texture array), minimal CPU RAM
+        final boolean useVramStrategy = "vram".equals(memoryStrategy);
+        
         // Streaming parameters (from props or defaults)
-        final int RING_BUFFER_SIZE = configStreamingRingSize;
-        final int CPU_CACHE_SIZE = configStreamingCacheSize;
-        final int PREFETCH_AHEAD = configStreamingPrefetchAhead;
+        // RAM mode: small GPU ring buffer, larger CPU cache
+        // VRAM mode: larger GPU cache (replaces CPU cache), minimal CPU buffer
+        final int GPU_CACHE_SIZE = useVramStrategy ? configStreamingCacheSize : configStreamingRingSize;
+        final int CPU_CACHE_SIZE = useVramStrategy ? 5 : configStreamingCacheSize;  // Minimal CPU cache for VRAM mode
+        final int PREFETCH_AHEAD = configStreamingPrefetchAhead;  // Same prefetch behavior for both modes
         
-        Log.i(TAG, "Streaming params: ring=" + RING_BUFFER_SIZE + ", cache=" + CPU_CACHE_SIZE + ", prefetch=" + PREFETCH_AHEAD);
+        Log.i(TAG, "Streaming params: strategy=" + memoryStrategy + 
+              ", gpuCache=" + GPU_CACHE_SIZE + ", cpuCache=" + CPU_CACHE_SIZE + 
+              ", prefetch=" + PREFETCH_AHEAD + ", vramMode=" + useVramStrategy);
         
-        // Create ring buffer texture array (smaller than total frames to save VRAM)
-        int ringSize = Math.min(RING_BUFFER_SIZE, layerCount);
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(width, height, ringSize, useAstc);
+        // Create texture array:
+        // - VRAM mode: Larger GPU cache (e.g., 60 slots) - this IS the sliding window
+        // - RAM mode: Small ring buffer (e.g., 16 slots) - CPU RAM is the sliding window
+        int textureLayerCount = Math.min(GPU_CACHE_SIZE, layerCount);
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(width, height, textureLayerCount, useAstc);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array"));
             KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
-        textureArrayLayerCount = ringSize;
+        textureArrayLayerCount = textureLayerCount;
         
-        Log.i(TAG, "Created streaming ring buffer: ID=" + textureArrayId + ", " + width + "x" + height + ", " + ringSize + " slots (total frames: " + layerCount + ")");
+        if (useVramStrategy) {
+            Log.i(TAG, "Created VRAM streaming cache: ID=" + textureArrayId + ", " + width + "x" + height + 
+                  ", " + textureLayerCount + " GPU slots (total frames: " + layerCount + ")");
+        } else {
+            Log.i(TAG, "Created RAM streaming ring buffer: ID=" + textureArrayId + ", " + width + "x" + height + 
+                  ", " + textureLayerCount + " GPU slots, " + CPU_CACHE_SIZE + " CPU cache (total frames: " + layerCount + ")");
+        }
         
-        // Set streaming ring buffer mode for proper rendering
-        streamingRingBufferMode = true;
-        streamingRingSize = ringSize;
+        // Both modes use ring buffer rotation - the difference is WHERE the cache lives
+        // RAM mode: CPU cache is primary, GPU ring buffer is secondary
+        // VRAM mode: GPU cache is primary (larger), CPU cache is minimal (just decode buffer)
+        streamingRingBufferMode = true;  // Both modes use ring buffer slot calculation
+        streamingRingSize = textureLayerCount;
         
         // Initialize shaders
         if (!initShaders()) {
@@ -881,40 +929,66 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return;
         }
         
-        // Calculate bytes per layer
+        // Calculate bytes per layer for streaming decode
+        // IMPORTANT: The KTX2 file always contains ASTC data (zstd compressed).
+        // Transcoding to RGBA32 happens at GPU upload time in nativeUploadTextureArrayLayer.
+        // So for streaming decode, we always use ASTC size regardless of useAstc flag.
         int blocksX = (width + 3) / 4;
         int blocksY = (height + 3) / 4;
-        int bytesPerLayer = blocksX * blocksY * 16;
+        int bytesPerLayer = blocksX * blocksY * 16;  // ASTC 4x4: 16 bytes per block
         
-        // Pre-allocated buffer pool for frame cache (reduces GC pressure)
-        // Pool size = cache size + some extra for concurrent access
-        final int POOL_SIZE = CPU_CACHE_SIZE + 5;
-        final java.util.Queue<byte[]> bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
-        for (int i = 0; i < POOL_SIZE; i++) {
-            bufferPool.offer(new byte[bytesPerLayer]);
-        }
-        Log.i(TAG, "Pre-allocated buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
-              (POOL_SIZE * bytesPerLayer / 1024) + " KB");
-        
-        // CPU frame cache (sliding window) - Map<virtualFrameIndex, pooledBuffer>
-        java.util.Map<Integer, byte[]> frameCache = new java.util.concurrent.ConcurrentHashMap<>();
-        int[] ringSlots = new int[ringSize]; // Track which frame is in each ring slot
+        // Track which virtual position is in each GPU slot (for both RAM and VRAM modes)
+        // ringSlots[slot] = virtualPos of frame currently in that GPU slot (-1 if empty)
+        int[] ringSlots = new int[textureLayerCount];
         java.util.Arrays.fill(ringSlots, -1);
         
-        // Decompression state - pre-allocate accumulator with expected size
-        ByteArrayOutputStream frameAccumulator = new ByteArrayOutputStream(bytesPerLayer + bufferSize);
+        // Decompression state
         final int[] decodePos = {0};  // Current sequential decode position
         final int[] bytesToSkip = {(int) level0Offset};
         final boolean[] decompressEnded = {false};
         
-        // Pre-allocated direct ByteBuffer for zero-copy decompression (Fix 3)
+        // Pre-allocated direct ByteBuffer for zero-copy decompression
         final ByteBuffer decompressBuffer = ByteBuffer.allocateDirect(bufferSize);
+        
+        // VRAM mode: Use direct ByteBuffer for frame accumulation (zero-copy to GPU)
+        // RAM mode: Use byte[] pool for CPU cache
+        final ByteBuffer frameAccumulatorBuffer;
+        final java.util.Queue<byte[]> bufferPool;
+        final java.util.Map<Integer, byte[]> frameCache;
+        
+        if (useVramStrategy) {
+            // VRAM mode: Single direct ByteBuffer for accumulation, upload directly to GPU
+            // No byte[] pool needed - frames go straight from ByteBuffer to GPU
+            frameAccumulatorBuffer = ByteBuffer.allocateDirect(bytesPerLayer + bufferSize);
+            bufferPool = null;
+            frameCache = new java.util.concurrent.ConcurrentHashMap<>();  // Only for blocked frames
+            Log.i(TAG, "VRAM mode: Pre-allocated direct frame buffer: " + (bytesPerLayer + bufferSize) + " bytes");
+        } else {
+            // RAM mode: byte[] pool for CPU cache (existing behavior)
+            frameAccumulatorBuffer = null;
+            final int POOL_SIZE = CPU_CACHE_SIZE + 5;
+            bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
+            for (int i = 0; i < POOL_SIZE; i++) {
+                bufferPool.offer(new byte[bytesPerLayer]);
+            }
+            frameCache = new java.util.concurrent.ConcurrentHashMap<>();
+            Log.i(TAG, "RAM mode: Pre-allocated buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
+                  (POOL_SIZE * bytesPerLayer / 1024) + " KB");
+        }
+        
+        // For RAM mode, keep ByteArrayOutputStream for accumulation
+        ByteArrayOutputStream frameAccumulator = useVramStrategy ? null : new ByteArrayOutputStream(bytesPerLayer + bufferSize);
         Log.i(TAG, "Pre-allocated direct decompression buffer: " + bufferSize + " bytes");
         
         // Skip header bytes from already-read data
         byte[] existingData = headerStream.toByteArray();
         if (existingData.length > bytesToSkip[0]) {
-            frameAccumulator.write(existingData, bytesToSkip[0], existingData.length - bytesToSkip[0]);
+            int dataToWrite = existingData.length - bytesToSkip[0];
+            if (useVramStrategy) {
+                frameAccumulatorBuffer.put(existingData, bytesToSkip[0], dataToWrite);
+            } else {
+                frameAccumulator.write(existingData, bytesToSkip[0], dataToWrite);
+            }
             bytesToSkip[0] = 0;
         } else {
             bytesToSkip[0] -= existingData.length;
@@ -924,7 +998,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         final int finalHeight = height;
         final int finalBytesPerLayer = bytesPerLayer;
         final boolean finalUseAstc = useAstc;
-        final int finalRingSize = ringSize;
+        final int finalGpuCacheSize = textureLayerCount;  // GPU cache size (ring buffer or VRAM cache)
         final long finalLevel0Offset = level0Offset;
         
         mSourceLoaded = true;
@@ -938,14 +1012,22 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // Track which "loop iteration" the decoder is on (for wrap-around prefetching)
         final int[] decoderLoopIteration = {0};
         
+        // Virtual positions are bounded to [0, 2*totalFrames) to prevent overflow
+        // This is sufficient to distinguish current loop from next loop frames
+        final int vPosModulus = 2 * totalFrames;
+        
         // Helper: Decode frames into CPU cache (up to prefetch ahead, with wrap-around)
-        // virtualPlaybackPos = loopIteration * totalFrames + currentFrame
+        // virtualPlaybackPos = bounded position that distinguishes current vs next loop
+        // VRAM mode: Uses direct ByteBuffer, uploads directly to GPU (zero-copy)
+        // RAM mode: Uses byte[] pool and ByteArrayOutputStream
         java.util.function.IntConsumer decodeFrames = (virtualPlaybackPos) -> {
-            int targetVirtualPos = virtualPlaybackPos + PREFETCH_AHEAD;
+            // Calculate how many frames ahead we need to decode
+            // Use relative distance to handle wraparound correctly
+            int currentVirtualDecodePos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+            int framesToDecode = (currentVirtualDecodePos - virtualPlaybackPos + vPosModulus) % vPosModulus;
+            int targetFramesAhead = PREFETCH_AHEAD;
             
-            while (true) {
-                int currentVirtualDecodePos = decoderLoopIteration[0] * totalFrames + decodePos[0];
-                if (currentVirtualDecodePos >= targetVirtualPos) break;
+            while (framesToDecode < targetFramesAhead) {
                 
                 // If decompression ended for current loop, restart for next loop (if looping)
                 if (decompressEnded[0]) {
@@ -954,7 +1036,11 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     decoderLoopIteration[0]++;
                     decodePos[0] = 0;
                     decompressEnded[0] = false;
-                    frameAccumulator.reset();
+                    if (useVramStrategy) {
+                        frameAccumulatorBuffer.clear();
+                    } else {
+                        frameAccumulator.reset();
+                    }
                     bytesToSkip[0] = (int) finalLevel0Offset;
                     KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
                     // Use mmap if available, otherwise fall back to byte array
@@ -967,6 +1053,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     continue;
                 }
                 
+                // Get current accumulator size
+                int accumulatorSize = useVramStrategy ? frameAccumulatorBuffer.position() : frameAccumulator.size();
+                
                 // Skip header bytes if needed (using zero-copy ByteBuffer)
                 while (bytesToSkip[0] > 0 && !decompressEnded[0]) {
                     decompressBuffer.clear();
@@ -977,9 +1066,17 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     if (bytesWritten >= bytesToSkip[0]) {
                         decompressBuffer.position(bytesToSkip[0]);
                         decompressBuffer.limit(bytesWritten);
-                        byte[] temp = new byte[bytesWritten - bytesToSkip[0]];
-                        decompressBuffer.get(temp);
-                        frameAccumulator.write(temp, 0, temp.length);
+                        int dataToWrite = bytesWritten - bytesToSkip[0];
+                        if (useVramStrategy) {
+                            // Zero-copy: transfer directly between ByteBuffers
+                            ByteBuffer slice = decompressBuffer.slice();
+                            slice.limit(dataToWrite);
+                            frameAccumulatorBuffer.put(slice);
+                        } else {
+                            byte[] temp = new byte[dataToWrite];
+                            decompressBuffer.get(temp);
+                            frameAccumulator.write(temp, 0, temp.length);
+                        }
                         bytesToSkip[0] = 0;
                     } else {
                         bytesToSkip[0] -= bytesWritten;
@@ -989,8 +1086,11 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 
                 if (decompressEnded[0]) continue; // Will restart on next iteration if looping
                 
-                // Decompress until we have a full frame (using zero-copy ByteBuffer)
-                while (frameAccumulator.size() < finalBytesPerLayer && !decompressEnded[0]) {
+                // Update accumulator size after header skip
+                accumulatorSize = useVramStrategy ? frameAccumulatorBuffer.position() : frameAccumulator.size();
+                
+                // Decompress until we have a full frame
+                while (accumulatorSize < finalBytesPerLayer && !decompressEnded[0]) {
                     decompressBuffer.clear();
                     long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
                     if (result == -1) { decompressEnded[0] = true; break; }
@@ -998,33 +1098,86 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
                     if (bytesWritten > 0) {
                         decompressBuffer.limit(bytesWritten);
-                        byte[] temp = new byte[bytesWritten];
-                        decompressBuffer.get(temp);
-                        frameAccumulator.write(temp, 0, temp.length);
+                        decompressBuffer.position(0);
+                        if (useVramStrategy) {
+                            // Zero-copy: transfer directly between ByteBuffers
+                            frameAccumulatorBuffer.put(decompressBuffer);
+                        } else {
+                            byte[] temp = new byte[bytesWritten];
+                            decompressBuffer.get(temp);
+                            frameAccumulator.write(temp, 0, temp.length);
+                        }
+                        accumulatorSize += bytesWritten;
                     }
                     if (status == 1) { decompressEnded[0] = true; break; }
                 }
                 
-                if (frameAccumulator.size() >= finalBytesPerLayer) {
-                    // Get buffer from pool (or allocate if pool empty - shouldn't happen normally)
-                    byte[] frameData = bufferPool.poll();
-                    if (frameData == null) {
-                        frameData = new byte[finalBytesPerLayer];
-                        Log.w(TAG, "Buffer pool exhausted, allocating new buffer");
-                    }
-                    
-                    // Extract frame data directly from accumulator's internal buffer
-                    byte[] accData = frameAccumulator.toByteArray();
-                    System.arraycopy(accData, 0, frameData, 0, finalBytesPerLayer);
-                    int virtualPos = decoderLoopIteration[0] * totalFrames + decodePos[0];
-                    frameCache.put(virtualPos, frameData);
+                if (accumulatorSize >= finalBytesPerLayer) {
+                    int virtualPos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+                    int actualFrame = decodePos[0];
                     decodePos[0]++;
                     
-                    // Keep remaining data
-                    frameAccumulator.reset();
-                    if (accData.length > finalBytesPerLayer) {
-                        frameAccumulator.write(accData, finalBytesPerLayer, accData.length - finalBytesPerLayer);
+                    if (useVramStrategy) {
+                        // VRAM mode: Upload directly from ByteBuffer to GPU (zero-copy)
+                        int gpuSlot = actualFrame % finalGpuCacheSize;
+                        int slotCurrentVPos = ringSlots[gpuSlot];
+                        int slotAge = (virtualPlaybackPos - slotCurrentVPos + vPosModulus) % vPosModulus;
+                        boolean slotIsOld = slotAge > 0 && slotAge < vPosModulus / 2;
+                        boolean canOverwrite = (slotCurrentVPos == -1) || 
+                                               (slotCurrentVPos == virtualPos) ||
+                                               slotIsOld;
+                        
+                        if (canOverwrite && ringSlots[gpuSlot] != virtualPos) {
+                            // Prepare buffer for reading
+                            frameAccumulatorBuffer.flip();
+                            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
+                                textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc);
+                            if (uploaded) {
+                                ringSlots[gpuSlot] = virtualPos;
+                            }
+                            // Keep remaining data (if any) for next frame
+                            if (frameAccumulatorBuffer.remaining() > finalBytesPerLayer) {
+                                frameAccumulatorBuffer.position(finalBytesPerLayer);
+                                frameAccumulatorBuffer.compact();
+                            } else {
+                                frameAccumulatorBuffer.clear();
+                            }
+                        } else {
+                            // Can't upload yet - slot blocked. Store in CPU cache temporarily
+                            byte[] tempData = new byte[finalBytesPerLayer];
+                            frameAccumulatorBuffer.flip();
+                            frameAccumulatorBuffer.get(tempData, 0, finalBytesPerLayer);
+                            frameCache.put(virtualPos, tempData);
+                            // Keep remaining data
+                            if (frameAccumulatorBuffer.remaining() > 0) {
+                                frameAccumulatorBuffer.compact();
+                            } else {
+                                frameAccumulatorBuffer.clear();
+                            }
+                        }
+                    } else {
+                        // RAM mode: Use byte[] pool (existing behavior)
+                        byte[] frameData = bufferPool.poll();
+                        if (frameData == null) {
+                            frameData = new byte[finalBytesPerLayer];
+                            Log.w(TAG, "Buffer pool exhausted, allocating new buffer");
+                        }
+                        
+                        byte[] accData = frameAccumulator.toByteArray();
+                        System.arraycopy(accData, 0, frameData, 0, finalBytesPerLayer);
+                        frameCache.put(virtualPos, frameData);
+                        
+                        // Keep remaining data
+                        frameAccumulator.reset();
+                        if (accData.length > finalBytesPerLayer) {
+                            frameAccumulator.write(accData, finalBytesPerLayer, accData.length - finalBytesPerLayer);
+                        }
                     }
+                    
+                    // Recalculate frames decoded for loop condition
+                    int newDecodePos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+                    framesToDecode = (newDecodePos - virtualPlaybackPos + vPosModulus) % vPosModulus;
                 } else if (!decompressEnded[0]) {
                     break; // No more data available right now
                 }
@@ -1032,42 +1185,73 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         };
         
         // Helper: Evict old frames from CPU cache and return buffers to pool
+        // In VRAM mode, only evict frames that have already been played
+        // In RAM mode, use sliding window based on CPU_CACHE_SIZE
+        // Uses relative distance to handle bounded virtual position wraparound
         java.util.function.IntConsumer evictOldFrames = (virtualPlaybackPos) -> {
-            int keepFrom = Math.max(0, virtualPlaybackPos - 2);
-            int keepTo = virtualPlaybackPos + CPU_CACHE_SIZE;
-            
             // Collect buffers to return to pool before removing from cache
             java.util.List<Integer> toRemove = new java.util.ArrayList<>();
-            for (Integer virtualPos : frameCache.keySet()) {
-                if (virtualPos < keepFrom || virtualPos > keepTo) {
-                    toRemove.add(virtualPos);
+            
+            if (useVramStrategy) {
+                // VRAM mode: Only evict frames that have been played
+                // Use relative distance to handle wraparound
+                for (Integer virtualPos : frameCache.keySet()) {
+                    int age = (virtualPlaybackPos - virtualPos + vPosModulus) % vPosModulus;
+                    // Frame is "old" if it's behind playback (age > 0) but not wrapped around (age < half modulus)
+                    if (age > 0 && age < vPosModulus / 2) {
+                        toRemove.add(virtualPos);
+                    }
+                }
+            } else {
+                // RAM mode: Use sliding window with relative distance
+                for (Integer virtualPos : frameCache.keySet()) {
+                    int distance = (virtualPos - virtualPlaybackPos + vPosModulus) % vPosModulus;
+                    // Keep frames within [-2, +CPU_CACHE_SIZE] window
+                    // distance > vPosModulus - 2 means frame is 1-2 behind (wrapped)
+                    // distance <= CPU_CACHE_SIZE means frame is ahead
+                    boolean isBehind = distance > vPosModulus - 2;
+                    boolean isAhead = distance <= CPU_CACHE_SIZE;
+                    if (!isBehind && !isAhead) {
+                        toRemove.add(virtualPos);
+                    }
                 }
             }
             
             // Return buffers to pool and remove from cache
             for (Integer virtualPos : toRemove) {
                 byte[] buffer = frameCache.remove(virtualPos);
-                if (buffer != null && buffer.length == finalBytesPerLayer) {
+                // Only return to pool in RAM mode (VRAM mode has no pool)
+                if (buffer != null && bufferPool != null && buffer.length == finalBytesPerLayer) {
                     bufferPool.offer(buffer);  // Return to pool for reuse
                 }
             }
         };
         
-        // Helper: Ensure frame is in GPU ring buffer - takes virtual position
-        java.util.function.IntConsumer ensureFrameInRingBuffer = (virtualPos) -> {
+        // Helper: Ensure frame is in GPU - takes virtual position
+        // Both modes use ring buffer slots, but:
+        // - VRAM mode: Larger GPU cache, upload happens during decode (or here if delayed)
+        // - RAM mode: Smaller GPU ring buffer, keep frames in CPU cache
+        java.util.function.IntConsumer ensureFrameInGpu = (virtualPos) -> {
             int actualFrame = virtualPos % totalFrames;
-            int ringSlot = actualFrame % finalRingSize;
-            // Check if this exact virtual position is already loaded
-            // (ringSlots stores virtual positions to handle wrap-around correctly)
-            if (ringSlots[ringSlot] == virtualPos) return; // Already loaded
+            int gpuSlot = actualFrame % finalGpuCacheSize;
+            
+            // Check if this exact virtual position is already loaded in this slot
+            if (ringSlots[gpuSlot] == virtualPos) return; // Already loaded
             
             byte[] frameData = frameCache.get(virtualPos);
-            if (frameData == null) return; // Not in cache yet
+            if (frameData == null) return; // Not decoded yet (or already in GPU for VRAM mode)
             
             boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
-                textureArrayId, ringSlot, finalWidth, finalHeight, frameData, finalUseAstc);
+                textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc);
             if (uploaded) {
-                ringSlots[ringSlot] = virtualPos;
+                ringSlots[gpuSlot] = virtualPos;
+                
+                // VRAM mode: Free CPU buffer now (was kept because slot was blocked during decode)
+                // No buffer pool in VRAM mode - just remove from cache
+                if (useVramStrategy) {
+                    frameCache.remove(virtualPos);
+                }
+                // RAM mode: Keep in CPU cache (CPU is the primary cache)
             }
         };
         
@@ -1078,13 +1262,14 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         int playbackLoopIteration = 0;
         
         // Main playback loop - uses virtual frame positions for seamless looping
+        // vPosModulus is defined above (2 * totalFrames) to prevent overflow
         while (!shouldStop.get() && !isDestroyed.get()) {
             currentFrame = 0;
             loopStartTime = System.nanoTime();
             
             while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
-                // Virtual position = which frame we're at across all loops
-                int virtualPlaybackPos = playbackLoopIteration * totalFrames + currentFrame;
+                // Virtual position = bounded position that distinguishes current vs next loop
+                int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
                 
                 // Check paused state
                 if (isPaused.get()) {
@@ -1104,14 +1289,27 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 // Evict old frames from CPU cache
                 evictOldFrames.accept(virtualPlaybackPos);
                 
-                // Check if current frame is ready (using virtual position)
-                if (frameCache.containsKey(virtualPlaybackPos)) {
-                    // Ensure current frame + next few are in GPU ring buffer
-                    ensureFrameInRingBuffer.accept(virtualPlaybackPos);
-                    for (int i = 1; i <= 2; i++) {
-                        int nextVirtualPos = virtualPlaybackPos + i;
-                        if (frameCache.containsKey(nextVirtualPos)) {
-                            ensureFrameInRingBuffer.accept(nextVirtualPos);
+                // Check if current frame is ready
+                // For both modes: check if frame is in CPU cache or already in GPU slot
+                int currentGpuSlot = currentFrame % finalGpuCacheSize;
+                boolean frameInGpu = ringSlots[currentGpuSlot] == virtualPlaybackPos;
+                boolean frameInCpuCache = frameCache.containsKey(virtualPlaybackPos);
+                    
+                if (frameInGpu || frameInCpuCache) {
+                    // Ensure current frame is in GPU (for RAM mode, or delayed VRAM uploads)
+                    ensureFrameInGpu.accept(virtualPlaybackPos);
+                    
+                    // RAM mode only: prefetch next few frames to GPU
+                    // VRAM mode: frames are uploaded during decode, don't prefetch here
+                    // (prefetching here can overwrite unplayed frames in the ring buffer)
+                    if (!useVramStrategy) {
+                        for (int i = 1; i <= 2; i++) {
+                            int nextVirtualPos = virtualPlaybackPos + i;
+                            int nextGpuSlot = ((currentFrame + i) % totalFrames) % finalGpuCacheSize;
+                            boolean nextInGpu = ringSlots[nextGpuSlot] == nextVirtualPos;
+                            if (frameCache.containsKey(nextVirtualPos) || nextInGpu) {
+                                ensureFrameInGpu.accept(nextVirtualPos);
+                            }
                         }
                     }
                     
@@ -1150,6 +1348,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     }
                 } else {
                     // Frame not ready yet - wait for decompression
+                    Log.w(TAG, "Frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos +
+                          ", gpuSlot=" + currentGpuSlot + ", ringSlots[" + currentGpuSlot + "]=" + ringSlots[currentGpuSlot] +
+                          ", inCache=" + frameInCpuCache + ", cacheSize=" + frameCache.size() +
+                          ", playbackLoop=" + playbackLoopIteration + ", decoderLoop=" + decoderLoopIteration[0]);
                     try {
                         Thread.sleep(8);
                     } catch (InterruptedException e) {
@@ -1163,6 +1365,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             // End of one loop iteration
             if (!loop) break;
             playbackLoopIteration++;
+            Log.i(TAG, "Loop transition: now on playbackLoop=" + playbackLoopIteration + 
+                  ", decoderLoop=" + decoderLoopIteration[0] + ", decodePos=" + decodePos[0] +
+                  ", cacheSize=" + frameCache.size() + ", ringSlots[0]=" + ringSlots[0]);
         }
         
         KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
@@ -1783,6 +1988,77 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
     }
     
+    /**
+     * Load texture array to RAM without GPU upload (for RAM-heavy mode).
+     * Returns Object[] = {width, height, layerCount, bytesPerLayer, ByteBuffer frameData}
+     * Uses a single contiguous direct ByteBuffer for zero-copy GPU uploads.
+     */
+    private Object[] loadTextureArrayToRam(byte[] ktx2Data, boolean useAstc) {
+        try {
+            // Parse KTX2 header to get dimensions and layer count
+            if (ktx2Data.length < 104) {
+                Log.e(TAG, "KTX2 data too small for header");
+                return null;
+            }
+            
+            ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
+            
+            // Check magic
+            if (ktx2Data[0] != (byte)0xAB || ktx2Data[1] != 0x4B) {
+                Log.e(TAG, "Invalid KTX2 magic");
+                return null;
+            }
+            
+            int pixelWidth = header.getInt(20);
+            int pixelHeight = header.getInt(24);
+            int layerCount = header.getInt(32);
+            if (layerCount == 0) layerCount = 1;
+            int supercompressionScheme = header.getInt(44);  // Offset 44, not 48
+            
+            // Get level 0 data offset and length
+            long level0ByteOffset = header.getLong(80);
+            long level0ByteLength = header.getLong(88);
+            
+            // Calculate ASTC frame size
+            int blocksX = (pixelWidth + 3) / 4;
+            int blocksY = (pixelHeight + 3) / 4;
+            int bytesPerLayer = blocksX * blocksY * 16;
+            int totalSize = bytesPerLayer * layerCount;
+            
+            Log.d(TAG, "KTX2 header: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + 
+                  " layers, supercompression=" + supercompressionScheme);
+            
+            // Allocate direct ByteBuffer for zero-copy GPU uploads
+            ByteBuffer frameBuffer = ByteBuffer.allocateDirect(totalSize);
+            frameBuffer.order(ByteOrder.nativeOrder());
+            
+            if (supercompressionScheme == 2) { // Zstd
+                // Decompress directly into the direct ByteBuffer
+                boolean success = KTX2PlayerModule.nativeDecompressZstdToBuffer(
+                    ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, frameBuffer, totalSize);
+                if (!success) {
+                    Log.e(TAG, "Zstd decompression to buffer failed");
+                    return null;
+                }
+            } else if (supercompressionScheme == 0) { // None
+                // Copy uncompressed data directly to buffer
+                frameBuffer.put(ktx2Data, (int)level0ByteOffset, (int)level0ByteLength);
+                frameBuffer.rewind();
+            } else {
+                Log.e(TAG, "Unsupported supercompression: " + supercompressionScheme);
+                return null;
+            }
+            
+            Log.d(TAG, "Decoded " + layerCount + " frames to direct ByteBuffer, " + 
+                  bytesPerLayer + " bytes each, total " + (totalSize / 1024) + " KB");
+            
+            return new Object[] { pixelWidth, pixelHeight, layerCount, bytesPerLayer, frameBuffer };
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to load texture array to RAM: " + e.getMessage());
+            return null;
+        }
+    }
+    
     private void loadPartTextures(String ktx2Path) throws Exception {
         String basePath = ktx2Path.replaceAll("_\\d+\\.ktx2$", "").replaceAll("\\.ktx2$", "");
         
@@ -1841,26 +2117,69 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 }
                 
                 boolean useAstc = isNativeASTC && isASTCSupported();
-                Log.d(TAG, "Loading texture array with ASTC=" + useAstc);
                 
-                int[] result = KTX2PlayerModule.nativeLoadTextureArray(ktx2Data, useAstc);
-                if (result == null || result.length < 4) {
-                    throw new Exception("Failed to load texture array");
+                // Check memory strategy for non-stream texture array mode
+                // "ram" mode: Decode to RAM, upload per-frame (lower VRAM usage)
+                // "auto" or "vram" mode: Upload all to GPU (current behavior)
+                boolean useRamMode = "ram".equals(memoryStrategy);
+                
+                if (useRamMode) {
+                    Log.d(TAG, "RAM-heavy mode: Decoding texture array to RAM, will upload per-frame");
+                    
+                    // Decode all frames to RAM using nativeLoadTextureArrayToRam
+                    // This returns frame data in a contiguous direct ByteBuffer (zero-copy)
+                    Object[] ramResult = loadTextureArrayToRam(ktx2Data, useAstc);
+                    if (ramResult == null) {
+                        throw new Exception("Failed to decode texture array to RAM");
+                    }
+                    
+                    int texWidth = (Integer) ramResult[0];
+                    int texHeight = (Integer) ramResult[1];
+                    int layerCount = (Integer) ramResult[2];
+                    ramBytesPerFrame = (Integer) ramResult[3];
+                    ramFrameBuffer = (ByteBuffer) ramResult[4];
+                    ramFrameCount = layerCount;
+                    
+                    // Create small ring buffer on GPU (2 frames for double buffering)
+                    int gpuRingSize = 2;
+                    textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(texWidth, texHeight, gpuRingSize, useAstc);
+                    if (textureArrayId == 0) {
+                        throw new Exception("Failed to create GPU ring buffer for RAM mode");
+                    }
+                    textureArrayLayerCount = gpuRingSize;
+                    ramHeavyMode = true;
+                    ramUploadedFrame = -1;
+                    
+                    Log.d(TAG, "RAM-heavy texture array: " + layerCount + " frames in direct ByteBuffer (" + 
+                          (ramFrameCount * ramBytesPerFrame / 1024) + " KB), " +
+                          gpuRingSize + " slots in GPU ring buffer");
+                    
+                    loadedTextureIds.add(textureArrayId);
+                    loadedTextureWidths.add(texWidth);
+                    loadedTextureHeights.add(texHeight);
+                } else {
+                    Log.d(TAG, "VRAM mode: Loading texture array with ASTC=" + useAstc);
+                    
+                    int[] result = KTX2PlayerModule.nativeLoadTextureArray(ktx2Data, useAstc);
+                    if (result == null || result.length < 4) {
+                        throw new Exception("Failed to load texture array");
+                    }
+                    
+                    textureArrayId = result[0];
+                    int texWidth = result[1];
+                    int texHeight = result[2];
+                    textureArrayLayerCount = result[3];
+                    ramHeavyMode = false;
+                    
+                    Log.d(TAG, "Loaded texture array ID " + textureArrayId + 
+                          " (" + texWidth + "x" + texHeight + ", " + textureArrayLayerCount + " layers)");
+                    
+                    // For texture arrays, we don't use the regular texture list
+                    // Just set up minimal state for the render loop
+                    loadedTextureIds.add(textureArrayId);
+                    loadedTextureWidths.add(texWidth);
+                    loadedTextureHeights.add(texHeight);
                 }
-                
-                textureArrayId = result[0];
-                int texWidth = result[1];
-                int texHeight = result[2];
-                textureArrayLayerCount = result[3];
-                
-                Log.d(TAG, "Loaded texture array ID " + textureArrayId + 
-                      " (" + texWidth + "x" + texHeight + ", " + textureArrayLayerCount + " layers)");
-                
-                // For texture arrays, we don't use the regular texture list
-                // Just set up minimal state for the render loop
-                loadedTextureIds.add(textureArrayId);
-                loadedTextureWidths.add(texWidth);
-                loadedTextureHeights.add(texHeight);
             } else {
                 Log.d(TAG, "Loading single KTX2 file: " + ktx2Path + (isNativeASTC ? " (native ASTC)" : ""));
                 
@@ -2038,13 +2357,39 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return;
         }
         
+        // RAM-heavy mode: Upload current frame to GPU ring buffer on-demand (zero-copy from direct ByteBuffer)
+        if (ramHeavyMode && ramFrameBuffer != null && currentFrame < ramFrameCount) {
+            if (ramUploadedFrame != currentFrame) {
+                // Upload to slot 0 (single-buffered for simplicity)
+                // Use zero-copy upload with offset into contiguous ByteBuffer
+                int slot = 0;
+                int offset = currentFrame * ramBytesPerFrame;
+                boolean useAstc = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
+                boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBufferWithOffset(
+                    textureArrayId, slot, frameWidth, frameHeight, ramFrameBuffer, offset, ramBytesPerFrame, useAstc);
+                if (uploaded) {
+                    ramUploadedFrame = currentFrame;
+                }
+            }
+        }
+        
         GLES30.glClearColor(0, 0, 0, 0);
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT);
         GLES30.glViewport(0, 0, getWidth(), getHeight());
         GLES30.glUseProgram(arrayProgram);
         
-        // Set layer uniform - use ring buffer slot in streaming mode, otherwise frame index
-        int layerIndex = streamingRingBufferMode ? (currentFrame % streamingRingSize) : currentFrame;
+        // Set layer uniform:
+        // - RAM-heavy mode: Always slot 0 (we upload current frame there)
+        // - Streaming ring buffer mode: currentFrame % ringSize
+        // - VRAM mode (non-stream or VRAM-heavy stream): currentFrame directly
+        int layerIndex;
+        if (ramHeavyMode) {
+            layerIndex = 0;  // Always render from slot 0 where we just uploaded
+        } else if (streamingRingBufferMode) {
+            layerIndex = currentFrame % streamingRingSize;
+        } else {
+            layerIndex = currentFrame;
+        }
         GLES30.glUniform1f(arrayUniformLayerLocation, (float) layerIndex);
         
         // Bind texture array
@@ -2141,6 +2486,13 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             // Reset streaming ring buffer mode
             streamingRingBufferMode = false;
             streamingRingSize = 0;
+            
+            // Clean up RAM-heavy mode resources
+            ramFrameBuffer = null;
+            ramBytesPerFrame = 0;
+            ramFrameCount = 0;
+            ramHeavyMode = false;
+            ramUploadedFrame = -1;
             
             if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglDestroySurface(eglDisplay, eglSurface);

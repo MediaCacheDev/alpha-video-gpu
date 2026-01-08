@@ -514,6 +514,53 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstd(JNIEnv *env, jclass cl
     return result;
 }
 
+// Zero-copy Zstd decompression directly to a direct ByteBuffer
+JNIEXPORT jboolean JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstdToBuffer(JNIEnv *env, jclass clazz,
+                                                                   jbyteArray data, jint offset,
+                                                                   jint compressed_length,
+                                                                   jobject output_buffer,
+                                                                   jint uncompressed_length) {
+    // Get input data
+    jbyte* input_bytes = env->GetByteArrayElements(data, nullptr);
+    if (!input_bytes) {
+        LOGE("Failed to get input byte array");
+        return JNI_FALSE;
+    }
+    
+    // Get direct buffer address
+    void* output_ptr = env->GetDirectBufferAddress(output_buffer);
+    if (!output_ptr) {
+        LOGE("Failed to get direct buffer address for Zstd output");
+        env->ReleaseByteArrayElements(data, input_bytes, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    
+    const uint8_t* compressed_data = reinterpret_cast<const uint8_t*>(input_bytes) + offset;
+    
+    // Decompress directly into the direct ByteBuffer (zero-copy)
+    size_t decompressed_size = ZSTD_decompress(
+        output_ptr, uncompressed_length,
+        compressed_data, compressed_length
+    );
+    
+    env->ReleaseByteArrayElements(data, input_bytes, JNI_ABORT);
+    
+    if (ZSTD_isError(decompressed_size)) {
+        LOGE("Zstd decompression to buffer failed: %s", ZSTD_getErrorName(decompressed_size));
+        return JNI_FALSE;
+    }
+    
+    if (decompressed_size != (size_t)uncompressed_length) {
+        LOGE("Zstd decompression size mismatch: expected %d, got %zu", uncompressed_length, decompressed_size);
+        return JNI_FALSE;
+    }
+    
+    LOGI("Zstd decompressed %d -> %zu bytes (zero-copy to direct buffer)", compressed_length, decompressed_size);
+    
+    return JNI_TRUE;
+}
+
 // Decode ASTC to RGBA and create texture (for emulator fallback)
 JNIEXPORT jintArray JNICALL
 Java_com_ktx2player_KTX2PlayerModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass clazz,
@@ -1187,6 +1234,122 @@ Java_com_ktx2player_KTX2PlayerModule_nativeCreateTextureArray(JNIEnv *env, jclas
          textureId, width, height, layer_count, use_astc);
     
     return (jint)textureId;
+}
+
+/**
+ * Upload a single layer to an existing texture array from a direct ByteBuffer.
+ * Zero-copy version for VRAM streaming mode - avoids Java byte[] allocation.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBuffer(JNIEnv *env, jclass clazz,
+                                                                               jint texture_id,
+                                                                               jint layer,
+                                                                               jint width, jint height,
+                                                                               jobject buffer,
+                                                                               jint data_length,
+                                                                               jboolean use_astc) {
+    void* data = env->GetDirectBufferAddress(buffer);
+    if (!data) {
+        LOGE("Failed to get direct buffer address for layer upload");
+        return JNI_FALSE;
+    }
+    
+    glBindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)texture_id);
+    
+    GLenum bindError = glGetError();
+    if (bindError != GL_NO_ERROR) {
+        LOGE("glBindTexture error: 0x%x", bindError);
+        return JNI_FALSE;
+    }
+    
+    if (use_astc) {
+        // Upload compressed ASTC data directly from buffer
+        glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                                   0, 0, layer,
+                                   width, height, 1,
+                                   GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                   data_length, data);
+    } else {
+        // Decode ASTC to RGBA and upload
+        std::vector<uint8_t> rgbaData;
+        if (!decode_astc_to_rgba((const uint8_t*)data, data_length, width, height, rgbaData)) {
+            LOGE("Failed to decode ASTC for layer %d", layer);
+            return JNI_FALSE;
+        }
+        
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                        0, 0, layer,
+                        width, height, 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, rgbaData.data());
+    }
+    
+    GLenum texError = glGetError();
+    if (texError != GL_NO_ERROR) {
+        LOGE("Texture layer upload from buffer error: 0x%x", texError);
+        return JNI_FALSE;
+    }
+    
+    return JNI_TRUE;
+}
+
+/**
+ * Upload a single layer to an existing texture array from a direct ByteBuffer with offset.
+ * Zero-copy version for non-stream RAM mode - reads from contiguous buffer at specified offset.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWithOffset(JNIEnv *env, jclass clazz,
+                                                                                        jint texture_id,
+                                                                                        jint layer,
+                                                                                        jint width, jint height,
+                                                                                        jobject buffer,
+                                                                                        jint offset,
+                                                                                        jint data_length,
+                                                                                        jboolean use_astc) {
+    void* buffer_base = env->GetDirectBufferAddress(buffer);
+    if (!buffer_base) {
+        LOGE("Failed to get direct buffer address for layer upload with offset");
+        return JNI_FALSE;
+    }
+    
+    // Calculate data pointer with offset
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer_base) + offset;
+    
+    glBindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)texture_id);
+    
+    GLenum bindError = glGetError();
+    if (bindError != GL_NO_ERROR) {
+        LOGE("glBindTexture error: 0x%x", bindError);
+        return JNI_FALSE;
+    }
+    
+    if (use_astc) {
+        // Upload compressed ASTC data directly from buffer at offset
+        glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                                   0, 0, layer,
+                                   width, height, 1,
+                                   GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                   data_length, data);
+    } else {
+        // Decode ASTC to RGBA and upload
+        std::vector<uint8_t> rgbaData;
+        if (!decode_astc_to_rgba(data, data_length, width, height, rgbaData)) {
+            LOGE("Failed to decode ASTC for layer %d (offset=%d)", layer, offset);
+            return JNI_FALSE;
+        }
+        
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                        0, 0, layer,
+                        width, height, 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, rgbaData.data());
+    }
+    
+    GLenum texError = glGetError();
+    if (texError != GL_NO_ERROR) {
+        LOGE("Texture layer upload from buffer with offset error: 0x%x", texError);
+        return JNI_FALSE;
+    }
+    
+    return JNI_TRUE;
 }
 
 } // extern "C"
