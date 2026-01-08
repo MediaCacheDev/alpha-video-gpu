@@ -31,6 +31,15 @@ export interface NativeProps extends ViewProps {
   streamingCacheSize?: number;
   /** Frames to decode ahead of playback. Default: 30 */
   streamingPrefetchAhead?: number;
+  
+  /**
+   * Memory strategy for frame storage.
+   * - 'auto': Default behavior (VRAM for non-stream, RAM for stream)
+   * - 'vram': Store all frames in GPU VRAM (texture array). Best for many simultaneous players.
+   * - 'ram': Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
+   * Default: 'auto'
+   */
+  memoryStrategy?: 'auto' | 'vram' | 'ram';
 }
 
 export default requireNativeComponent<NativeProps>(

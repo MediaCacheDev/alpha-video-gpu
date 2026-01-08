@@ -19,7 +19,8 @@ import androidx.annotation.Nullable;
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.uimanager.events.RCTEventEmitter;
+import com.facebook.react.uimanager.UIManagerHelper;
+import com.facebook.react.uimanager.events.EventDispatcher;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -27,6 +28,7 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.util.Arrays;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -134,6 +136,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     // Native ASTC mode flag
     private boolean isNativeASTC = false;
+    
+    // Stream mode flag from metadata (for internal KTX2 streaming)
+    private boolean metadataStreamMode = false;
     
     // Texture array mode (for packingMode: 'array')
     private boolean useTextureArray = false;
@@ -328,11 +333,36 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
     }
     
-    // React Native event sending
+    // React Native event sending (new architecture compatible)
     private void sendEvent(String eventName, WritableMap params) {
         if (mReactContext != null) {
-            mReactContext.getJSModule(RCTEventEmitter.class)
-                    .receiveEvent(getId(), eventName, params);
+            int surfaceId = UIManagerHelper.getSurfaceId(this);
+            EventDispatcher eventDispatcher = UIManagerHelper.getEventDispatcherForReactTag(mReactContext, getId());
+            if (eventDispatcher != null) {
+                eventDispatcher.dispatchEvent(new KTX2Event(surfaceId, getId(), eventName, params));
+            }
+        }
+    }
+    
+    // Custom event class for new architecture
+    private static class KTX2Event extends com.facebook.react.uimanager.events.Event<KTX2Event> {
+        private final String eventName;
+        private final WritableMap params;
+        
+        KTX2Event(int surfaceId, int viewId, String eventName, WritableMap params) {
+            super(surfaceId, viewId);
+            this.eventName = eventName;
+            this.params = params;
+        }
+        
+        @Override
+        public String getEventName() {
+            return eventName;
+        }
+        
+        @Override
+        protected WritableMap getEventData() {
+            return params;
         }
     }
     
@@ -561,7 +591,13 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return;
         }
         
-        // Read file data
+        // Check for uncompressed streaming mode BEFORE loading file into RAM
+        // This avoids allocating ~29MB per player instance for streaming files
+        if (checkAndPlayUncompressedStreaming(localPath)) {
+            return; // Handled by uncompressed streaming path
+        }
+        
+        // Read file data (only for non-streaming paths)
         byte[] fileData = null;
         try {
             fileData = readFileBytes(localPath);
@@ -602,7 +638,22 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return;
         }
         
-        // Load textures
+        // Check for internal streaming mode with Zstd compression (streamMode: true in metadata)
+        if (metadataStreamMode && useTextureArray) {
+            // Check supercompressionScheme from KTX2 header
+            int supercompressionScheme = getSupercompressionScheme(fileData);
+            Log.i(TAG, "Internal streaming mode detected, supercompression=" + supercompressionScheme);
+            
+            if (supercompressionScheme == 2) {
+                // Internal Zstd compression - use streaming decompression
+                playStreamingAnimation(localPath);
+                return;
+            } else {
+                Log.w(TAG, "Unsupported supercompression for streaming: " + supercompressionScheme + ", falling back to non-stream");
+            }
+        }
+        
+        // Load textures (non-streaming path)
         try {
             loadPartTextures(localPath);
         } catch (Exception e) {
@@ -1374,6 +1425,345 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         Log.i(TAG, "Streaming animation ended");
     }
     
+    /**
+     * Check if file is uncompressed streaming KTX2 and play it if so.
+     * Reads only the header (~1KB) to detect streaming mode - avoids loading entire file into RAM.
+     * @return true if handled as uncompressed streaming, false otherwise
+     */
+    private boolean checkAndPlayUncompressedStreaming(String localPath) {
+        Log.d(TAG, "checkAndPlayUncompressedStreaming: checking " + localPath);
+        try {
+            String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
+            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(filePath, "r");
+            
+            // Read just the header (first 256 bytes is enough for KTX2 header + basic metadata check)
+            byte[] headerBytes = new byte[256];
+            int bytesRead = raf.read(headerBytes);
+            if (bytesRead < 100) {
+                Log.d(TAG, "checkAndPlayUncompressedStreaming: file too small (" + bytesRead + " bytes)");
+                raf.close();
+                return false; // Too small to be valid KTX2
+            }
+            
+            ByteBuffer header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN);
+            
+            // Check KTX2 magic number (first 12 bytes)
+            byte[] magic = new byte[12];
+            header.get(magic);
+            byte[] ktx2Magic = {(byte)0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, (byte)0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+            boolean isKtx2 = java.util.Arrays.equals(magic, ktx2Magic);
+            if (!isKtx2) {
+                Log.d(TAG, "checkAndPlayUncompressedStreaming: not a KTX2 file (magic mismatch)");
+                raf.close();
+                return false; // Not a KTX2 file
+            }
+            
+            // Check supercompressionScheme at offset 44
+            int supercompressionScheme = header.getInt(44);
+            Log.d(TAG, "checkAndPlayUncompressedStreaming: supercompression=" + supercompressionScheme);
+            if (supercompressionScheme != 0) {
+                raf.close();
+                return false; // Not uncompressed - let other paths handle it
+            }
+            
+            // Read KVD offset and length from header (bytes 56-59 and 60-63, little-endian uint32)
+            int kvdByteOffset = header.getInt(56);
+            int kvdByteLength = header.getInt(60);
+            Log.d(TAG, "checkAndPlayUncompressedStreaming: kvdOffset=" + kvdByteOffset + ", kvdLength=" + kvdByteLength);
+            
+            if (kvdByteLength == 0 || kvdByteOffset == 0) {
+                Log.d(TAG, "checkAndPlayUncompressedStreaming: no metadata section");
+                raf.close();
+                return false; // No metadata
+            }
+            
+            // Read metadata section
+            raf.seek(kvdByteOffset);
+            byte[] metadataBytes = new byte[Math.min(kvdByteLength, 4096)]; // Cap at 4KB for safety
+            raf.read(metadataBytes);
+            raf.close();
+            
+            // Extract metadata JSON using the same logic as extractKTX2Metadata
+            String metadataJson = extractMetadataJsonFromKvdBytes(metadataBytes);
+            if (metadataJson == null) {
+                Log.d(TAG, "checkAndPlayUncompressedStreaming: failed to extract metadata JSON from KVD");
+                return false;
+            }
+            
+            // Check for streamMode in metadata
+            boolean hasStreamMode = metadataJson.contains("\"streamMode\":true") || metadataJson.contains("\"streamMode\": true");
+            Log.d(TAG, "checkAndPlayUncompressedStreaming: hasStreamMode=" + hasStreamMode);
+            if (!hasStreamMode) {
+                return false; // Not streaming mode
+            }
+            
+            // Parse metadata to set up isNativeASTC, frameRate, etc.
+            try {
+                parseMetadata(metadataJson);
+                Log.i(TAG, "Uncompressed streaming detected: isNativeASTC=" + isNativeASTC);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to parse metadata for uncompressed streaming: " + e.getMessage());
+                return false;
+            }
+            
+            // All checks passed - this is uncompressed streaming mode
+            Log.i(TAG, "Detected uncompressed streaming KTX2 (supercompression=0, streamMode=true) - using mmap streaming");
+            playUncompressedStreamingAnimation(localPath);
+            return true;
+            
+        } catch (Exception e) {
+            Log.w(TAG, "Error checking for uncompressed streaming: " + e.getMessage());
+            e.printStackTrace();
+            return false; // Fall back to normal path
+        }
+    }
+    
+    /**
+     * Extract JSON metadata from KTX2 metadata bytes (simple JSON extraction).
+     */
+    private String extractMetadataJsonFromBytes(byte[] metadataBytes) {
+        try {
+            String str = new String(metadataBytes, java.nio.charset.StandardCharsets.UTF_8);
+            int jsonStart = str.indexOf('{');
+            int jsonEnd = str.lastIndexOf('}');
+            if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                return str.substring(jsonStart, jsonEnd + 1);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to extract metadata JSON: " + e.getMessage());
+        }
+        return null;
+    }
+    
+    /**
+     * Extract BasisPlayerMetadata JSON from KVD (Key-Value Data) section bytes.
+     * Parses the KTX2 KVD format to find the BasisPlayerMetadata entry.
+     */
+    private String extractMetadataJsonFromKvdBytes(byte[] kvdBytes) {
+        try {
+            if (kvdBytes == null || kvdBytes.length < 4) return null;
+            
+            int pos = 0;
+            int kvdEnd = kvdBytes.length;
+            
+            while (pos < kvdEnd) {
+                if (pos + 4 > kvdBytes.length) break;
+                
+                ByteBuffer entryBuf = ByteBuffer.wrap(kvdBytes, pos, 4).order(ByteOrder.LITTLE_ENDIAN);
+                int entryLength = entryBuf.getInt();
+                pos += 4;
+                
+                if (entryLength == 0 || pos + entryLength > kvdBytes.length) break;
+                
+                // Find key (NUL-terminated string)
+                int keyEnd = pos;
+                while (keyEnd < pos + entryLength && kvdBytes[keyEnd] != 0) {
+                    keyEnd++;
+                }
+                
+                String key = new String(kvdBytes, pos, keyEnd - pos, "UTF-8");
+                
+                if ("BasisPlayerMetadata".equals(key)) {
+                    // Value starts after key's NUL terminator
+                    int valueStart = keyEnd + 1;
+                    int valueEnd = pos + entryLength;
+                    
+                    // Find actual value end (may have NUL terminator)
+                    while (valueEnd > valueStart && kvdBytes[valueEnd - 1] == 0) {
+                        valueEnd--;
+                    }
+                    
+                    String metadataJson = new String(kvdBytes, valueStart, valueEnd - valueStart, "UTF-8");
+                    Log.d(TAG, "extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
+                    return metadataJson;
+                }
+                
+                // Move to next entry (with padding to 4-byte alignment)
+                pos += entryLength;
+                pos += (4 - (entryLength % 4)) % 4;
+            }
+            
+            return null;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to extract KVD metadata: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Play uncompressed streaming animation from .ktx2 file.
+     * Uses memory-mapped file for true zero-copy frame uploads.
+     * This is the fastest streaming mode - no decompression overhead.
+     * Does not require pre-loading the file into memory - reads header from mmap.
+     */
+    private void playUncompressedStreamingAnimation(String localPath) {
+        Log.i(TAG, "Starting uncompressed streaming animation: " + localPath);
+        
+        // Memory-map the file for zero-copy reads - do this FIRST to avoid loading file into RAM
+        final ByteBuffer mmapBuffer;
+        try {
+            String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
+            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(filePath, "r");
+            java.nio.channels.FileChannel channel = raf.getChannel();
+            mmapBuffer = channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, channel.size());
+            mmapBuffer.order(ByteOrder.LITTLE_ENDIAN);
+            Log.i(TAG, "Memory-mapped file: " + channel.size() + " bytes");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to memory-map file: " + e.getMessage());
+            mainHandler.post(() -> notifyError("Failed to memory-map file: " + e.getMessage()));
+            return;
+        }
+        
+        // Parse KTX2 header directly from mmap buffer (no RAM copy needed)
+        int pixelWidth = mmapBuffer.getInt(20);
+        int pixelHeight = mmapBuffer.getInt(24);
+        int layerCount = mmapBuffer.getInt(32);
+        if (layerCount == 0) layerCount = 1;
+        long level0ByteOffset = mmapBuffer.getLong(80);
+        
+        // Calculate bytes per frame
+        int blocksX = (pixelWidth + 3) / 4;
+        int blocksY = (pixelHeight + 3) / 4;
+        int bytesPerLayer = blocksX * blocksY * 16;
+        
+        Log.i(TAG, "Uncompressed streaming: " + pixelWidth + "x" + pixelHeight + ", " + 
+              layerCount + " layers, " + bytesPerLayer + " bytes/layer, data offset=" + level0ByteOffset);
+        
+        // Determine GPU cache size based on memory strategy
+        boolean useVramStrategy = "vram".equals(memoryStrategy);
+        boolean useAstc = isNativeASTC && isASTCSupported();
+        int gpuCacheSize = useVramStrategy ? 
+            Math.min(configStreamingCacheSize, layerCount) : 
+            Math.min(configStreamingRingSize, layerCount);
+        
+        Log.i(TAG, "Uncompressed streaming params: strategy=" + memoryStrategy + 
+              ", gpuCache=" + gpuCacheSize + ", vramMode=" + useVramStrategy);
+        
+        // Create GPU texture array
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, gpuCacheSize, useAstc);
+        if (textureArrayId == 0) {
+            mainHandler.post(() -> notifyError("Failed to create texture array for uncompressed streaming"));
+            return;
+        }
+        
+        Log.i(TAG, "Created uncompressed streaming texture array: ID=" + textureArrayId + 
+              ", " + pixelWidth + "x" + pixelHeight + ", " + gpuCacheSize + " GPU slots");
+        
+        // Initialize ring buffer tracking
+        streamingRingBufferMode = true;
+        streamingRingSize = gpuCacheSize;
+        int[] ringSlots = new int[gpuCacheSize];
+        Arrays.fill(ringSlots, -1);
+        
+        // Initialize shaders
+        if (!initShaders()) {
+            mainHandler.post(() -> notifyError("Failed to initialize shaders"));
+            return;
+        }
+        
+        mSourceLoaded = true;
+        mainHandler.post(() -> notifyStateChange("ready"));
+        
+        if (autoPlay) {
+            isPlaying.set(true);
+            mainHandler.post(() -> notifyStateChange("playing"));
+        }
+        
+        // Frame timing - use metadata frameRate (already parsed)
+        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
+        Log.i(TAG, "Uncompressed streaming timing: frameRate=" + frameRate + ", playbackSpeed=" + playbackSpeed + 
+              ", frameIntervalNs=" + frameIntervalNs + " (" + (frameIntervalNs / 1_000_000.0) + "ms)");
+        
+        // Capture finals for lambda
+        final int finalWidth = pixelWidth;
+        final int finalHeight = pixelHeight;
+        final int finalBytesPerLayer = bytesPerLayer;
+        final int finalLayerCount = layerCount;
+        final int finalGpuCacheSize = gpuCacheSize;
+        final long finalDataOffset = level0ByteOffset;
+        final boolean finalUseAstc = useAstc;
+        
+        // Main playback loop - simple and fast for uncompressed data
+        int debugFrameCounter = 0;
+        while (!shouldStop.get() && !isDestroyed.get()) {
+            long loopStartTime = System.nanoTime();
+            currentFrame = 0;
+            
+            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < finalLayerCount) {
+                // Check paused state
+                if (isPaused.get()) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    continue;
+                }
+                
+                // Calculate GPU slot for this frame
+                int gpuSlot = currentFrame % finalGpuCacheSize;
+                
+                // Check if frame needs to be uploaded
+                if (ringSlots[gpuSlot] != currentFrame) {
+                    // Calculate offset in mmap buffer for this frame
+                    long frameOffset = finalDataOffset + (long)currentFrame * finalBytesPerLayer;
+                    
+                    // Upload directly from mmap buffer (true zero-copy!)
+                    mmapBuffer.position((int)frameOffset);
+                    mmapBuffer.limit((int)frameOffset + finalBytesPerLayer);
+                    ByteBuffer frameSlice = mmapBuffer.slice();
+                    frameSlice.order(ByteOrder.nativeOrder());
+                    
+                    boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
+                        textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                        frameSlice, finalBytesPerLayer, finalUseAstc);
+                    
+                    if (uploaded) {
+                        ringSlots[gpuSlot] = currentFrame;
+                    }
+                }
+                
+                // Render (includes eglSwapBuffers)
+                renderTextureArrayFrame();
+                
+                // Debug logging every 30 frames
+                if (debugFrameCounter % 30 == 0) {
+                    Log.d(TAG, "Uncompressed frame " + currentFrame + "/" + finalLayerCount + 
+                          ", gpuSlot=" + (currentFrame % finalGpuCacheSize) + 
+                          ", ringSize=" + streamingRingSize);
+                }
+                debugFrameCounter++;
+                
+                // Frame timing - wait until next frame time
+                long frameEndTime = loopStartTime + (long)(currentFrame + 1) * frameIntervalNs;
+                long now = System.nanoTime();
+                long sleepNs = frameEndTime - now;
+                if (sleepNs > 0) {
+                    try {
+                        Thread.sleep(sleepNs / 1_000_000, (int)(sleepNs % 1_000_000));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                
+                if (isPlaying.get()) {
+                    currentFrame++;
+                }
+            }
+            
+            // End of one loop iteration
+            if (!loop) break;
+            
+            // Reset for next loop
+            Arrays.fill(ringSlots, -1);
+            Log.i(TAG, "Uncompressed streaming loop restart");
+        }
+        
+        Log.i(TAG, "Uncompressed streaming animation ended");
+    }
+    
     private boolean initGL(SurfaceTexture surfaceTexture) {
         eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
         if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
@@ -1765,9 +2155,23 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         useTextureArray = "array".equals(packingMode);
         textureArrayLayerCount = metadata.optInt("layerCount", totalFrames);
         
+        // Check for stream mode (internal streaming flag in metadata)
+        metadataStreamMode = metadata.optBoolean("streamMode", false);
+        
         Log.i(TAG, "Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
                 ", " + frameRate + " fps, " + partCount + " parts");
-        Log.i(TAG, "Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode);
+        Log.i(TAG, "Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode + 
+                ", streamMode=" + metadataStreamMode);
+    }
+    
+    /**
+     * Get supercompression scheme from KTX2 header.
+     * Returns 0 for uncompressed, 2 for Zstd, or -1 on error.
+     */
+    private int getSupercompressionScheme(byte[] ktx2Data) {
+        if (ktx2Data == null || ktx2Data.length < 48) return -1;
+        ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
+        return header.getInt(44);
     }
     
     /**
