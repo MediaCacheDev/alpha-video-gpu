@@ -23,6 +23,13 @@
 @property (nonatomic, assign) BOOL autoPlay;
 @property (nonatomic, assign) BOOL enableFrameEvents;
 @property (nonatomic, assign) BOOL gpuPlayback;  // GPU-controlled frame timing (experimental)
+@property (nonatomic, assign) BOOL reactPaused;  // Pause from React prop (for screen focus/blur)
+
+// Streaming configuration
+@property (nonatomic, assign) NSInteger streamingRingSize;      // GPU ring buffer slots (VRAM)
+@property (nonatomic, assign) NSInteger streamingCacheSize;     // CPU frame cache size (RAM)
+@property (nonatomic, assign) NSInteger streamingPrefetchAhead; // Frames to decode ahead of playback
+@property (nonatomic, copy) NSString *memoryStrategy;           // "auto", "vram", "ram"
 
 // Animation properties
 @property (nonatomic, assign) NSInteger currentFrame;

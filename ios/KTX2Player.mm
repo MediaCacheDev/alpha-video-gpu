@@ -1,6 +1,10 @@
 #import "KTX2Player.h"
 #import <React/RCTEventDispatcher.h>
 #import <TargetConditionals.h>
+#import <sys/mman.h>
+#import <sys/stat.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 // Basis Universal transcoder - must define this before including
 #define BASISU_NO_ITERATOR_DEBUG_LEVEL
@@ -51,7 +55,42 @@
   NSInteger _textureArrayLayerCount;
   id<MTLRenderPipelineState> _arrayPipelineState;
   id<MTLBuffer> _arrayUniformBuffer;
+  
+  // Streaming ring buffer support (for efficient memory usage)
+  BOOL _streamingRingBufferMode;
+  NSInteger _streamingRingBufferSize;
+  NSMutableArray<NSNumber *> *_ringSlots;  // Tracks which virtual frame is in each GPU slot
+  NSMutableDictionary<NSNumber *, NSData *> *_frameCache;  // CPU frame cache
+  NSInteger _decoderPosition;              // Current decoder frame position
+  NSInteger _decoderLoopIteration;         // Which loop iteration the decoder is on
+  NSInteger _playbackLoopIteration;        // Which loop iteration playback is on
+  BOOL _useVramStrategy;                   // True for VRAM-heavy mode
+  
+  // Streaming decompression state
+  ZSTD_DStream *_dstream;
+  NSData *_compressedData;
+  size_t _compressedDataPos;
+  NSMutableData *_frameAccumulator;
+  uint32_t _streamBytesPerLayer;
+  uint64_t _streamLevel0Offset;
+  BOOL _streamHeaderSkipped;
+  
+  // Uncompressed streaming (mmap)
+  int _mmapFd;
+  void *_mmapData;
+  size_t _mmapSize;
+  BOOL _isUncompressedStreaming;
+  
+  // Decoded RGBA cache for simulator ASTC decompression (background thread)
+  NSMutableDictionary<NSNumber *, NSData *> *_decodedRgbaCache;
+  NSInteger _uncompressedDecoderPosition;
+  dispatch_queue_t _astcDecodeQueue;
+  
+  // React paused state (backing ivar for property)
+  BOOL _reactPaused;
 }
+
+@synthesize reactPaused = _reactPaused;
 
 - (instancetype)initWithFrame:(CGRect)frame
 {
@@ -86,6 +125,36 @@
     _isSourceLoaded = NO;
     _isSourceLoading = NO;
     _isDestroyed = NO;
+    
+    // Streaming configuration defaults (match Android)
+    self.streamingRingSize = 16;       // GPU ring buffer slots
+    self.streamingCacheSize = 60;      // CPU frame cache size
+    self.streamingPrefetchAhead = 30;  // Frames to decode ahead
+    self.memoryStrategy = @"auto";     // auto, vram, ram
+    
+    // Initialize streaming state
+    _streamingRingBufferMode = NO;
+    _streamingRingBufferSize = 0;
+    _ringSlots = nil;
+    _frameCache = nil;
+    _decoderPosition = 0;
+    _decoderLoopIteration = 0;
+    _playbackLoopIteration = 0;
+    _useVramStrategy = NO;
+    _dstream = NULL;
+    _compressedData = nil;
+    _compressedDataPos = 0;
+    _frameAccumulator = nil;
+    _streamBytesPerLayer = 0;
+    _streamLevel0Offset = 0;
+    _streamHeaderSkipped = NO;
+    _mmapFd = -1;
+    _mmapData = NULL;
+    _mmapSize = 0;
+    _isUncompressedStreaming = NO;
+    _decodedRgbaCache = nil;
+    _uncompressedDecoderPosition = 0;
+    _astcDecodeQueue = dispatch_queue_create("com.ktx2player.astcdecode", DISPATCH_QUEUE_SERIAL);
     
     // Initialize Basis transcoder (only once)
     if (!_basisInitialized) {
@@ -625,8 +694,36 @@
   _isGLBContainer = NO;
   _glbKtx2Parts = nil;
   
-  // Download the file and extract metadata
+  // Check for streaming mode (.ktx2.zst files)
+  // Metro bundler may insert hash: .ktx2.{hash}.zst
+  NSRegularExpression *zstRegex = [NSRegularExpression regularExpressionWithPattern:@"\\.ktx2\\.[a-f0-9]+\\.zst" options:0 error:nil];
+  BOOL isStreamingZst = [uri hasSuffix:@".zst"] || 
+                        [uri containsString:@".zst?"] ||
+                        ([zstRegex numberOfMatchesInString:uri options:0 range:NSMakeRange(0, uri.length)] > 0);
+  
+  if (isStreamingZst) {
+    NSLog(@"KTX2PlayerView: Detected streaming mode (.zst): %@", uri);
+    [self loadStreamingKTX2WithSource:source];
+    return;
+  }
+  
+  // Check for uncompressed streaming mode (.ktx2 files with streamMode:true)
+  // This avoids loading the entire file into memory
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    NSString *filePath = nil;
+    if ([uri hasPrefix:@"file://"]) {
+      filePath = [[NSURL URLWithString:uri] path];
+    } else if (![uri hasPrefix:@"http://"] && ![uri hasPrefix:@"https://"]) {
+      filePath = uri;
+    }
+    
+    // Try uncompressed streaming first (for local files only)
+    if (filePath && [self checkAndPlayUncompressedStreaming:filePath]) {
+      NSLog(@"KTX2PlayerView: Using uncompressed streaming mode");
+      return;
+    }
+    
+    // Fall back to loading entire file
     NSData *fileData = nil;
     if ([uri hasPrefix:@"http://"] || [uri hasPrefix:@"https://"]) {
       fileData = [self loadDataFromURLWithCaching:uri partIndex:0];
@@ -673,6 +770,1040 @@
       [self applyMetadataAndLoadTextures:metadata basePath:self->_basePath sourceUri:uri];
     });
   });
+}
+
+#pragma mark - Streaming Decompression
+
+- (void)loadStreamingKTX2WithSource:(NSDictionary *)source
+{
+  NSString *uri = source[@"uri"];
+  
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    // Load compressed data
+    NSData *compressedData = nil;
+    if ([uri hasPrefix:@"http://"] || [uri hasPrefix:@"https://"]) {
+      compressedData = [self loadDataFromURLWithCaching:uri partIndex:0];
+    } else if ([uri hasPrefix:@"file://"]) {
+      NSURL *fileURL = [NSURL URLWithString:uri];
+      compressedData = [NSData dataWithContentsOfURL:fileURL];
+    } else {
+      compressedData = [NSData dataWithContentsOfFile:uri];
+    }
+    
+    if (!compressedData) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"Failed to load streaming file"];
+      });
+      return;
+    }
+    
+    NSLog(@"KTX2PlayerView: Streaming compressed data: %lu bytes", (unsigned long)compressedData.length);
+    
+    // Initialize streaming decompression with ZSTD_DStream
+    ZSTD_DStream *dstream = ZSTD_createDStream();
+    if (!dstream) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"Failed to create ZSTD_DStream"];
+      });
+      return;
+    }
+    
+    size_t initResult = ZSTD_initDStream(dstream);
+    if (ZSTD_isError(initResult)) {
+      NSLog(@"KTX2PlayerView: ZSTD_initDStream failed: %s", ZSTD_getErrorName(initResult));
+      ZSTD_freeDStream(dstream);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"Failed to init ZSTD_DStream"];
+      });
+      return;
+    }
+    
+    // Setup input buffer
+    ZSTD_inBuffer input = { compressedData.bytes, compressedData.length, 0 };
+    
+    // Decompress header first (need at least 104 bytes for KTX2 header)
+    size_t outputBufferSize = ZSTD_DStreamOutSize();
+    NSMutableData *headerBuffer = [NSMutableData dataWithLength:outputBufferSize];
+    NSMutableData *decompressedHeader = [NSMutableData data];
+    
+    uint32_t width = 0, height = 0, layerCount = 0;
+    uint64_t level0Offset = 0;
+    BOOL headerParsed = NO;
+    
+    while (!headerParsed && input.pos < input.size) {
+      ZSTD_outBuffer output = { headerBuffer.mutableBytes, outputBufferSize, 0 };
+      size_t result = ZSTD_decompressStream(dstream, &output, &input);
+      
+      if (ZSTD_isError(result)) {
+        NSLog(@"KTX2PlayerView: Streaming decompression error: %s", ZSTD_getErrorName(result));
+        ZSTD_freeDStream(dstream);
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self notifyError:@"Streaming decompression error"];
+        });
+        return;
+      }
+      
+      if (output.pos > 0) {
+        [decompressedHeader appendBytes:headerBuffer.bytes length:output.pos];
+      }
+      
+      // Try to parse header once we have enough data
+      if (decompressedHeader.length >= 104 && !headerParsed) {
+        const uint8_t *bytes = (const uint8_t *)decompressedHeader.bytes;
+        if (bytes[0] == 0xAB && bytes[1] == 0x4B) {
+          width = *(uint32_t *)(bytes + 20);
+          height = *(uint32_t *)(bytes + 24);
+          layerCount = *(uint32_t *)(bytes + 32);
+          level0Offset = *(uint64_t *)(bytes + 80);
+          headerParsed = YES;
+          NSLog(@"KTX2PlayerView: Streaming texture: %ux%u, %u layers, offset=%llu", width, height, layerCount, level0Offset);
+        }
+      }
+    }
+    
+    if (!headerParsed || layerCount == 0) {
+      ZSTD_freeDStream(dstream);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"Failed to parse KTX2 header from stream"];
+      });
+      return;
+    }
+    
+    // Continue decompressing until we have enough for metadata
+    while (decompressedHeader.length < level0Offset && input.pos < input.size) {
+      ZSTD_outBuffer output = { headerBuffer.mutableBytes, outputBufferSize, 0 };
+      size_t result = ZSTD_decompressStream(dstream, &output, &input);
+      
+      if (ZSTD_isError(result)) {
+        NSLog(@"KTX2PlayerView: Streaming decompression error: %s", ZSTD_getErrorName(result));
+        ZSTD_freeDStream(dstream);
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self notifyError:@"Streaming decompression error"];
+        });
+        return;
+      }
+      
+      if (output.pos > 0) {
+        [decompressedHeader appendBytes:headerBuffer.bytes length:output.pos];
+      }
+    }
+    
+    // Extract metadata from header
+    NSDictionary *metadata = [self extractKTX2Metadata:decompressedHeader];
+    if (!metadata) {
+      ZSTD_freeDStream(dstream);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"No metadata found in streaming KTX2"];
+      });
+      return;
+    }
+    
+    // Calculate bytes per layer
+    uint32_t blocksX = (width + 3) / 4;
+    uint32_t blocksY = (height + 3) / 4;
+    uint32_t bytesPerLayer = blocksX * blocksY * 16;
+    
+    NSLog(@"KTX2PlayerView: Bytes per layer: %u, level0Offset: %llu", bytesPerLayer, level0Offset);
+    
+    // Determine memory strategy
+    BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
+                           ([self.memoryStrategy isEqualToString:@"auto"]);
+    NSInteger gpuCacheSize = useVramStrategy ? 
+        MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
+        MIN(self.streamingRingSize, (NSInteger)layerCount);
+    
+    NSLog(@"KTX2PlayerView: Streaming params: strategy=%@, gpuCache=%ld, vramMode=%d", 
+          self.memoryStrategy, (long)gpuCacheSize, useVramStrategy);
+    
+    // Setup on main thread
+    __block id<MTLTexture> textureArray = nil;
+    __block BOOL setupComplete = NO;
+    
+    dispatch_sync(dispatch_get_main_queue(), ^{
+      // Apply metadata
+      self.totalFrames = layerCount;
+      self.framesPerRow = 1;
+      self.framesPerPart = layerCount;
+      self.partCount = 1;
+      self.frameWidth = width;
+      self.frameHeight = height;
+      self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+      self.frameInterval = 1.0 / self.frameRate;
+      
+      self->_useTextureArray = YES;
+      self->_textureArrayLayerCount = layerCount;
+      self->_streamingRingBufferMode = YES;
+      self->_streamingRingBufferSize = gpuCacheSize;
+      self->_useVramStrategy = useVramStrategy;
+      
+      // Initialize ring buffer tracking
+      self->_ringSlots = [NSMutableArray arrayWithCapacity:gpuCacheSize];
+      for (NSInteger i = 0; i < gpuCacheSize; i++) {
+        [self->_ringSlots addObject:@(-1)];
+      }
+      self->_frameCache = [NSMutableDictionary dictionary];
+      self->_decoderPosition = 0;
+      self->_decoderLoopIteration = 0;
+      self->_playbackLoopIteration = 0;
+      
+      // Store streaming state for on-demand decoding
+      self->_compressedData = compressedData;
+      self->_compressedDataPos = input.pos;
+      self->_dstream = dstream;
+      self->_frameAccumulator = [NSMutableData data];
+      self->_streamBytesPerLayer = bytesPerLayer;
+      self->_streamLevel0Offset = level0Offset;
+      self->_streamHeaderSkipped = NO;
+      
+      // Copy any data we already have past the header
+      if (decompressedHeader.length > level0Offset) {
+        [self->_frameAccumulator appendBytes:((const uint8_t *)decompressedHeader.bytes + level0Offset) 
+                                      length:decompressedHeader.length - level0Offset];
+        self->_streamHeaderSkipped = YES;
+      }
+      
+      // Create texture array with ring buffer size (not full layer count!)
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
+                                                                                           width:width
+                                                                                          height:height
+                                                                                       mipmapped:NO];
+      descriptor.textureType = MTLTextureType2DArray;
+      descriptor.arrayLength = gpuCacheSize;  // Ring buffer size, not total frames!
+      descriptor.usage = MTLTextureUsageShaderRead;
+      
+      self->_textureArray = [self.device newTextureWithDescriptor:descriptor];
+      textureArray = self->_textureArray;
+      
+      if (!textureArray) {
+        [self notifyError:@"Failed to create texture array"];
+        return;
+      }
+      
+      NSLog(@"KTX2PlayerView: Created streaming texture array: %ux%u, %ld GPU slots (ring buffer)", 
+            width, height, (long)gpuCacheSize);
+      
+      // Pre-decode initial frames so we have something to display
+      // This is needed because decodeFramesAhead is only called during playback
+      NSInteger initialVPos = 0;
+      [self decodeFramesAhead:initialVPos];
+      
+      self->_isSourceLoaded = YES;
+      self->_isSourceLoading = NO;
+      [self notifyStateChange:@"ready"];
+      
+      if (self.autoPlay && !self.reactPaused) {
+        [self play];
+      }
+      
+      setupComplete = YES;
+    });
+    
+    if (!setupComplete || !textureArray) {
+      // Don't free dstream here - it's now owned by the instance for on-demand decoding
+      return;
+    }
+    
+    // Note: We no longer decode all frames upfront!
+    // Frames are decoded on-demand during playback via decodeFramesAhead:
+    NSLog(@"KTX2PlayerView: Streaming setup complete - frames will be decoded on-demand during playback");
+  });
+}
+
+#pragma mark - On-Demand Frame Decoding
+
+- (void)decodeFramesAhead:(NSInteger)currentVirtualPos
+{
+  if (!_dstream || !_compressedData || !_streamingRingBufferMode) {
+    static int skipCount = 0;
+    if (skipCount++ < 5) {
+      NSLog(@"KTX2PlayerView: decodeFramesAhead skipping - dstream=%p, compressedData=%p, ringMode=%d",
+            _dstream, _compressedData, _streamingRingBufferMode);
+    }
+    return;
+  }
+  
+  // Calculate how many frames to decode ahead
+  // Use relative distance to handle wraparound correctly (matching Android approach)
+  NSInteger vPosModulus = self.totalFrames * 2;  // Bounded virtual position space
+  NSInteger currentDecodeVPos = (_decoderLoopIteration * self.totalFrames + _decoderPosition) % vPosModulus;
+  
+  // Calculate frames ahead using relative distance
+  NSInteger framesAhead = (currentDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
+  NSInteger framesToDecode = self.streamingPrefetchAhead - framesAhead;
+  
+  if (framesToDecode <= 0) {
+    static int skipLogCount = 0;
+    if (skipLogCount++ < 10 || skipLogCount % 60 == 0) {
+      NSLog(@"KTX2PlayerView: decodeFramesAhead skipping - vPos=%ld, decodeVPos=%ld, framesAhead=%ld (already ahead enough)",
+            (long)currentVirtualPos, (long)currentDecodeVPos, (long)framesAhead);
+    }
+    return;  // Already ahead enough
+  }
+  
+  static int decodeLogCount = 0;
+  if (decodeLogCount++ < 20 || framesToDecode > 0) {
+    static int logThrottle = 0;
+    if (logThrottle++ % 30 == 0 || framesToDecode > 0) {
+      NSLog(@"KTX2PlayerView: decodeFramesAhead vPos=%ld, decodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, decoderPos=%ld, decoderLoop=%ld",
+            (long)currentVirtualPos, (long)currentDecodeVPos, (long)framesAhead, (long)framesToDecode,
+            (long)_decoderPosition, (long)_decoderLoopIteration);
+    }
+  }
+  
+  size_t outputBufferSize = ZSTD_DStreamOutSize();
+  NSMutableData *decompressBuffer = [NSMutableData dataWithLength:outputBufferSize];
+  
+  ZSTD_inBuffer input = { _compressedData.bytes, _compressedData.length, _compressedDataPos };
+  
+  while (framesToDecode > 0) {
+    // Check if we need to restart decompression for looping
+    if (_decoderPosition >= self.totalFrames) {
+      _decoderPosition = 0;
+      _decoderLoopIteration++;
+      
+      // Reinitialize decompression stream
+      ZSTD_initDStream(_dstream);
+      input.pos = 0;
+      _compressedDataPos = 0;
+      [_frameAccumulator setLength:0];
+      _streamHeaderSkipped = NO;
+      
+      NSLog(@"KTX2PlayerView: Decoder wrap-around: loop %ld, resetting input.pos from %zu to 0", 
+            (long)_decoderLoopIteration, input.pos);
+      
+      // After wrap-around, recalculate how many frames we need to decode
+      // Use the same formula as at the start of the method
+      NSInteger newDecodeVPos = (_decoderLoopIteration * self.totalFrames + _decoderPosition) % vPosModulus;
+      NSInteger newFramesAhead = (newDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
+      framesToDecode = self.streamingPrefetchAhead - newFramesAhead;
+      if (framesToDecode <= 0) {
+        NSLog(@"KTX2PlayerView: After wrap-around: already ahead enough, stopping decode");
+        break;
+      }
+      NSLog(@"KTX2PlayerView: After wrap-around: newDecodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, inputSize=%zu",
+            (long)newDecodeVPos, (long)newFramesAhead, (long)framesToDecode, input.size);
+      // Don't continue - fall through to decompress the header and first frames
+      // The continue was causing us to skip decompression after wrap-around
+    }
+    
+    // Skip header bytes if needed
+    if (!_streamHeaderSkipped) {
+      while (_frameAccumulator.length < _streamLevel0Offset && input.pos < input.size) {
+        ZSTD_outBuffer output = { decompressBuffer.mutableBytes, outputBufferSize, 0 };
+        size_t result = ZSTD_decompressStream(_dstream, &output, &input);
+        if (ZSTD_isError(result)) break;
+        if (output.pos > 0) {
+          [_frameAccumulator appendBytes:decompressBuffer.bytes length:output.pos];
+        }
+      }
+      
+      if (_frameAccumulator.length >= _streamLevel0Offset) {
+        // Remove header data, keep frame data
+        NSData *frameData = [NSData dataWithBytes:((const uint8_t *)_frameAccumulator.bytes + _streamLevel0Offset)
+                                           length:_frameAccumulator.length - _streamLevel0Offset];
+        [_frameAccumulator setData:frameData];
+        _streamHeaderSkipped = YES;
+      } else {
+        break;  // Not enough data yet
+      }
+    }
+    
+    // Decompress until we have a full frame
+    int decompressLoopCount = 0;
+    while (_frameAccumulator.length < _streamBytesPerLayer && input.pos < input.size) {
+      ZSTD_outBuffer output = { decompressBuffer.mutableBytes, outputBufferSize, 0 };
+      size_t result = ZSTD_decompressStream(_dstream, &output, &input);
+      if (ZSTD_isError(result)) {
+        NSLog(@"KTX2PlayerView: Decompression error: %s", ZSTD_getErrorName(result));
+        break;
+      }
+      if (output.pos > 0) {
+        [_frameAccumulator appendBytes:decompressBuffer.bytes length:output.pos];
+      }
+      decompressLoopCount++;
+      if (result == 0) {
+        NSLog(@"KTX2PlayerView: ZSTD stream ended at decoderPos=%ld, inputPos=%zu/%zu, accumLen=%lu",
+              (long)_decoderPosition, input.pos, input.size, (unsigned long)_frameAccumulator.length);
+        break;  // Stream ended
+      }
+    }
+    
+    // Log if we exited without a full frame
+    if (_frameAccumulator.length < _streamBytesPerLayer && decompressLoopCount == 0) {
+      static int noProgressCount = 0;
+      if (noProgressCount++ < 10) {
+        NSLog(@"KTX2PlayerView: No decompression progress - accumLen=%lu, bytesPerLayer=%u, inputPos=%zu/%zu, decoderPos=%ld",
+              (unsigned long)_frameAccumulator.length, _streamBytesPerLayer, input.pos, input.size, (long)_decoderPosition);
+      }
+    }
+    
+    // Process complete frame
+    if (_frameAccumulator.length >= _streamBytesPerLayer) {
+      NSInteger virtualPos = (_decoderLoopIteration * self.totalFrames + _decoderPosition) % vPosModulus;
+      NSInteger gpuSlot = _decoderPosition % _streamingRingBufferSize;
+      
+      // Check if we can upload to this GPU slot
+      NSInteger slotCurrentVPos = [_ringSlots[gpuSlot] integerValue];
+      
+      // Calculate if slot is "old" (behind playback) using relative distance
+      // A slot is old if it's behind the current playback position
+      // We also allow overwriting if the slot is from a different loop iteration
+      // (i.e., slot has vPos from loop 0 but we're decoding for loop 1)
+      NSInteger slotAge = (currentVirtualPos - slotCurrentVPos + vPosModulus) % vPosModulus;
+      BOOL slotIsOld = slotAge > 0 && slotAge < vPosModulus / 2;
+      
+      // Also allow overwriting if the slot's frame is from a previous loop
+      // This handles the wrap-around case where decoder is ahead of playback
+      NSInteger slotActualFrame = slotCurrentVPos % self.totalFrames;
+      NSInteger decoderActualFrame = _decoderPosition;
+      BOOL slotFromPreviousLoop = (slotCurrentVPos != -1) && 
+                                   (slotActualFrame == decoderActualFrame) && 
+                                   (slotCurrentVPos != virtualPos);
+      
+      BOOL canOverwrite = (slotCurrentVPos == -1) || (slotCurrentVPos == virtualPos) || slotIsOld || slotFromPreviousLoop;
+      
+      // In RAM mode, ALWAYS cache the frame first (CPU cache is primary storage)
+      // In VRAM mode, only cache if we can't upload to GPU
+      if (!_useVramStrategy) {
+        // RAM mode: Always cache to CPU
+        NSData *frameData = [NSData dataWithBytes:_frameAccumulator.bytes length:_streamBytesPerLayer];
+        _frameCache[@(virtualPos)] = frameData;
+      }
+      
+      if (canOverwrite && slotCurrentVPos != virtualPos) {
+        // Upload frame to GPU
+        static int uploadLogCount = 0;
+        if (uploadLogCount++ < 30) {
+          NSLog(@"KTX2PlayerView: Uploading frame %ld to GPU slot %ld (vPos=%ld, loop=%ld)", 
+                (long)_decoderPosition, (long)gpuSlot, (long)virtualPos, (long)_decoderLoopIteration);
+        }
+        [self uploadFrameToGPU:_frameAccumulator.bytes slot:gpuSlot];
+        _ringSlots[gpuSlot] = @(virtualPos);
+      } else if (!canOverwrite && _useVramStrategy) {
+        // VRAM mode: Can't upload, cache temporarily
+        static int blockLogCount = 0;
+        if (blockLogCount++ < 10) {
+          NSLog(@"KTX2PlayerView: Can't upload frame %ld to slot %ld - caching (slotVPos=%ld, virtualPos=%ld, slotAge=%ld)",
+                (long)_decoderPosition, (long)gpuSlot, (long)slotCurrentVPos, (long)virtualPos, (long)slotAge);
+        }
+        NSData *frameData = [NSData dataWithBytes:_frameAccumulator.bytes length:_streamBytesPerLayer];
+        _frameCache[@(virtualPos)] = frameData;
+      }
+      
+      _decoderPosition++;
+      framesToDecode--;
+      
+      // Remove processed frame data
+      if (_frameAccumulator.length > _streamBytesPerLayer) {
+        NSData *remaining = [NSData dataWithBytes:((const uint8_t *)_frameAccumulator.bytes + _streamBytesPerLayer)
+                                           length:_frameAccumulator.length - _streamBytesPerLayer];
+        [_frameAccumulator setData:remaining];
+      } else {
+        [_frameAccumulator setLength:0];
+      }
+    } else {
+      break;  // No more data available
+    }
+  }
+  
+  _compressedDataPos = input.pos;
+}
+
+- (void)uploadFrameToGPU:(const void *)frameData slot:(NSInteger)slot
+{
+  if (!_textureArray) return;
+  
+  MTLRegion region = MTLRegionMake2D(0, 0, self.frameWidth, self.frameHeight);
+  
+  if (_useCompressedFormat) {
+    // Upload compressed ASTC data directly
+    [_textureArray replaceRegion:region
+                     mipmapLevel:0
+                           slice:slot
+                       withBytes:frameData
+                     bytesPerRow:0
+                   bytesPerImage:_streamBytesPerLayer];
+  } else {
+    // Decode ASTC to RGBA for simulator
+    uint32_t blocksX = (self.frameWidth + 3) / 4;
+    uint32_t blocksY = (self.frameHeight + 3) / 4;
+    std::vector<uint8_t> rgbaData(self.frameWidth * self.frameHeight * 4);
+    
+    const uint8_t *astcData = (const uint8_t *)frameData;
+    for (uint32_t by = 0; by < blocksY; by++) {
+      for (uint32_t bx = 0; bx < blocksX; bx++) {
+        const uint8_t *block = astcData + (by * blocksX + bx) * 16;
+        uint8_t blockPixels[4 * 4 * 4];
+        basisu::astc::decompress(blockPixels, block, false, 4, 4);
+        
+        for (int y = 0; y < 4 && (by * 4 + y) < self.frameHeight; y++) {
+          for (int x = 0; x < 4 && (bx * 4 + x) < self.frameWidth; x++) {
+            uint32_t dstX = bx * 4 + x;
+            uint32_t dstY = by * 4 + y;
+            uint8_t *dst = rgbaData.data() + (dstY * self.frameWidth + dstX) * 4;
+            uint8_t *src = blockPixels + (y * 4 + x) * 4;
+            memcpy(dst, src, 4);
+          }
+        }
+      }
+    }
+    
+    [_textureArray replaceRegion:region
+                     mipmapLevel:0
+                           slice:slot
+                       withBytes:rgbaData.data()
+                     bytesPerRow:self.frameWidth * 4
+                   bytesPerImage:self.frameWidth * self.frameHeight * 4];
+  }
+}
+
+- (void)ensureFrameInGPU:(NSInteger)virtualPos
+{
+  if (!_streamingRingBufferMode) return;
+  
+  NSInteger actualFrame = virtualPos % self.totalFrames;
+  NSInteger gpuSlot = actualFrame % _streamingRingBufferSize;
+  
+  // Check if already loaded
+  NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+  if (slotVPos == virtualPos) return;
+  
+  // Check CPU cache
+  NSData *frameData = _frameCache[@(virtualPos)];
+  if (!frameData) {
+    static int missCount = 0;
+    if (missCount++ < 30) {
+      NSLog(@"KTX2PlayerView: ensureFrameInGPU - cache miss for vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu",
+            (long)virtualPos, (long)gpuSlot, (long)slotVPos, (unsigned long)_frameCache.count);
+    }
+    return;
+  }
+  
+  // Upload to GPU
+  static int ensureUploadCount = 0;
+  if (ensureUploadCount++ < 30) {
+    NSLog(@"KTX2PlayerView: ensureFrameInGPU - uploading vPos=%ld to slot=%ld from cache",
+          (long)virtualPos, (long)gpuSlot);
+  }
+  [self uploadFrameToGPU:frameData.bytes slot:gpuSlot];
+  _ringSlots[gpuSlot] = @(virtualPos);
+  
+  // In VRAM mode, remove from CPU cache after upload
+  if (_useVramStrategy) {
+    [_frameCache removeObjectForKey:@(virtualPos)];
+  }
+}
+
+- (void)evictOldFrames:(NSInteger)currentVirtualPos
+{
+  if (!_frameCache) return;
+  
+  NSInteger vPosModulus = self.totalFrames * 2;
+  NSMutableArray *toRemove = [NSMutableArray array];
+  
+  if (_useVramStrategy) {
+    // VRAM mode: Only evict frames that have been played
+    for (NSNumber *virtualPos in _frameCache.allKeys) {
+      NSInteger vPos = [virtualPos integerValue];
+      NSInteger age = (currentVirtualPos - vPos + vPosModulus) % vPosModulus;
+      // Frame is "old" if it's behind playback (age > 0) but not wrapped around (age < half modulus)
+      if (age > 0 && age < vPosModulus / 2) {
+        [toRemove addObject:virtualPos];
+      }
+    }
+  } else {
+    // RAM mode: Use sliding window with relative distance
+    // Keep frames within [-2, +streamingCacheSize] window
+    for (NSNumber *virtualPos in _frameCache.allKeys) {
+      NSInteger vPos = [virtualPos integerValue];
+      NSInteger distance = (vPos - currentVirtualPos + vPosModulus) % vPosModulus;
+      // distance > vPosModulus - 2 means frame is 1-2 behind (wrapped)
+      // distance <= streamingCacheSize means frame is ahead
+      BOOL isBehind = distance > (NSInteger)(vPosModulus - 2);
+      BOOL isAhead = distance <= self.streamingCacheSize;
+      if (!isBehind && !isAhead) {
+        [toRemove addObject:virtualPos];
+      }
+    }
+  }
+  
+  for (NSNumber *virtualPos in toRemove) {
+    [_frameCache removeObjectForKey:virtualPos];
+  }
+}
+
+#pragma mark - Uncompressed Streaming (mmap)
+
+- (BOOL)checkAndPlayUncompressedStreaming:(NSString *)filePath
+{
+  NSLog(@"KTX2PlayerView: checkAndPlayUncompressedStreaming: %@", filePath);
+  
+  // Open file
+  int fd = open([filePath UTF8String], O_RDONLY);
+  if (fd < 0) {
+    NSLog(@"KTX2PlayerView: Failed to open file for mmap");
+    return NO;
+  }
+  
+  // Get file size
+  struct stat st;
+  if (fstat(fd, &st) < 0) {
+    close(fd);
+    return NO;
+  }
+  size_t fileSize = st.st_size;
+  
+  // Read header (first 256 bytes)
+  uint8_t headerBytes[256];
+  if (read(fd, headerBytes, 256) < 100) {
+    close(fd);
+    return NO;
+  }
+  
+  // Check KTX2 magic
+  uint8_t ktx2Magic[] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+  if (memcmp(headerBytes, ktx2Magic, 12) != 0) {
+    close(fd);
+    return NO;
+  }
+  
+  // Check supercompressionScheme at offset 44
+  uint32_t supercompression = *(uint32_t *)(headerBytes + 44);
+  if (supercompression != 0) {
+    close(fd);
+    return NO;  // Not uncompressed
+  }
+  
+  // Read KVD offset and length (bytes 56-63)
+  uint32_t kvdOffset = *(uint32_t *)(headerBytes + 56);
+  uint32_t kvdLength = *(uint32_t *)(headerBytes + 60);
+  
+  NSLog(@"KTX2PlayerView: checkAndPlayUncompressedStreaming: kvdOffset=%u, kvdLength=%u", kvdOffset, kvdLength);
+  
+  if (kvdLength == 0 || kvdOffset == 0) {
+    close(fd);
+    return NO;
+  }
+  
+  // Read metadata section
+  lseek(fd, kvdOffset, SEEK_SET);
+  NSMutableData *metadataBytes = [NSMutableData dataWithLength:MIN(kvdLength, 4096u)];
+  read(fd, metadataBytes.mutableBytes, metadataBytes.length);
+  
+  // Extract metadata JSON from KVD
+  NSString *metadataJson = [self extractMetadataJsonFromKvdBytes:metadataBytes];
+  if (!metadataJson) {
+    close(fd);
+    return NO;
+  }
+  
+  // Check for streamMode
+  if (![metadataJson containsString:@"\"streamMode\":true"] && 
+      ![metadataJson containsString:@"\"streamMode\": true"]) {
+    close(fd);
+    return NO;
+  }
+  
+  // Parse metadata
+  NSError *jsonError = nil;
+  NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:[metadataJson dataUsingEncoding:NSUTF8StringEncoding]
+                                                           options:0 error:&jsonError];
+  if (jsonError || !metadata) {
+    close(fd);
+    return NO;
+  }
+  
+  NSLog(@"KTX2PlayerView: Detected uncompressed streaming KTX2 - using mmap");
+  
+  // Memory map the file
+  void *mmapData = mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (mmapData == MAP_FAILED) {
+    NSLog(@"KTX2PlayerView: mmap failed");
+    close(fd);
+    return NO;
+  }
+  
+  // Store mmap state
+  _mmapFd = fd;
+  _mmapData = mmapData;
+  _mmapSize = fileSize;
+  _isUncompressedStreaming = YES;
+  
+  // Parse KTX2 header from mmap
+  const uint8_t *data = (const uint8_t *)mmapData;
+  uint32_t width = *(uint32_t *)(data + 20);
+  uint32_t height = *(uint32_t *)(data + 24);
+  uint32_t layerCount = *(uint32_t *)(data + 32);
+  if (layerCount == 0) layerCount = 1;
+  uint64_t level0Offset = *(uint64_t *)(data + 80);
+  
+  uint32_t blocksX = (width + 3) / 4;
+  uint32_t blocksY = (height + 3) / 4;
+  uint32_t bytesPerLayer = blocksX * blocksY * 16;
+  
+  NSLog(@"KTX2PlayerView: Uncompressed streaming: %ux%u, %u layers, %u bytes/layer, offset=%llu",
+        width, height, layerCount, bytesPerLayer, level0Offset);
+  
+  // Determine GPU cache size
+  BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
+                         [self.memoryStrategy isEqualToString:@"auto"];
+  NSInteger gpuCacheSize = useVramStrategy ? 
+      MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
+      MIN(self.streamingRingSize, (NSInteger)layerCount);
+  
+  // Setup on main thread
+  dispatch_sync(dispatch_get_main_queue(), ^{
+    self.totalFrames = layerCount;
+    self.framesPerRow = 1;
+    self.framesPerPart = layerCount;
+    self.partCount = 1;
+    self.frameWidth = width;
+    self.frameHeight = height;
+    self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+    self.frameInterval = 1.0 / self.frameRate;
+    
+    self->_useTextureArray = YES;
+    self->_textureArrayLayerCount = layerCount;
+    self->_streamingRingBufferMode = YES;
+    self->_streamingRingBufferSize = gpuCacheSize;
+    self->_useVramStrategy = useVramStrategy;
+    self->_streamBytesPerLayer = bytesPerLayer;
+    self->_streamLevel0Offset = level0Offset;
+    
+    // Initialize ring buffer tracking
+    self->_ringSlots = [NSMutableArray arrayWithCapacity:gpuCacheSize];
+    for (NSInteger i = 0; i < gpuCacheSize; i++) {
+      [self->_ringSlots addObject:@(-1)];
+    }
+    self->_playbackLoopIteration = 0;
+    
+    // Initialize decoded RGBA cache for simulator ASTC decompression
+    if (!self->_useCompressedFormat) {
+      self->_decodedRgbaCache = [NSMutableDictionary dictionary];
+      self->_uncompressedDecoderPosition = 0;
+      self->_decoderLoopIteration = 0;
+    }
+    
+    // Create texture array with ring buffer size
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
+                                                                                         width:width
+                                                                                        height:height
+                                                                                     mipmapped:NO];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = gpuCacheSize;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    
+    self->_textureArray = [self.device newTextureWithDescriptor:descriptor];
+    
+    if (!self->_textureArray) {
+      [self notifyError:@"Failed to create texture array for uncompressed streaming"];
+      return;
+    }
+    
+    NSLog(@"KTX2PlayerView: Created uncompressed streaming texture array: %ux%u, %ld GPU slots",
+          width, height, (long)gpuCacheSize);
+    
+    self->_isSourceLoaded = YES;
+    self->_isSourceLoading = NO;
+    [self notifyStateChange:@"ready"];
+    
+    // Pre-decode initial frames on background thread to avoid freeze
+    if (!self->_useCompressedFormat) {
+      // Simulator: decode ASTC to RGBA on background, then upload to GPU
+      dispatch_async(self->_astcDecodeQueue, ^{
+        NSInteger framesToPreload = MIN(gpuCacheSize, (NSInteger)layerCount);
+        NSLog(@"KTX2PlayerView: Pre-decoding %ld initial frames for uncompressed streaming (simulator)", (long)framesToPreload);
+        
+        for (NSInteger i = 0; i < framesToPreload && self->_mmapData; i++) {
+          // Decode ASTC to RGBA
+          const uint8_t *data = (const uint8_t *)self->_mmapData;
+          uint64_t frameOffset = self->_streamLevel0Offset + (uint64_t)i * self->_streamBytesPerLayer;
+          const uint8_t *frameData = data + frameOffset;
+          
+          uint32_t blocksX = (width + 3) / 4;
+          uint32_t blocksY = (height + 3) / 4;
+          NSMutableData *rgbaData = [NSMutableData dataWithLength:width * height * 4];
+          uint8_t *rgba = (uint8_t *)rgbaData.mutableBytes;
+          
+          for (uint32_t by = 0; by < blocksY; by++) {
+            for (uint32_t bx = 0; bx < blocksX; bx++) {
+              const uint8_t *block = frameData + (by * blocksX + bx) * 16;
+              uint8_t blockPixels[4 * 4 * 4];
+              basisu::astc::decompress(blockPixels, block, false, 4, 4);
+              
+              for (int y = 0; y < 4 && (by * 4 + y) < height; y++) {
+                for (int x = 0; x < 4 && (bx * 4 + x) < width; x++) {
+                  uint32_t dstX = bx * 4 + x;
+                  uint32_t dstY = by * 4 + y;
+                  uint8_t *dst = rgba + (dstY * width + dstX) * 4;
+                  uint8_t *src = blockPixels + (y * 4 + x) * 4;
+                  memcpy(dst, src, 4);
+                }
+              }
+            }
+          }
+          
+          // Cache decoded frame
+          @synchronized(self->_decodedRgbaCache) {
+            self->_decodedRgbaCache[@(i)] = rgbaData;
+          }
+          self->_uncompressedDecoderPosition = i + 1;
+        }
+        
+        // Upload to GPU on main thread (fast - just memcpy)
+        dispatch_async(dispatch_get_main_queue(), ^{
+          for (NSInteger i = 0; i < framesToPreload; i++) {
+            NSInteger slot = i % gpuCacheSize;
+            [self uploadDecodedFrameToGPU:i slot:slot];
+            self->_ringSlots[slot] = @(i);
+          }
+          
+          NSLog(@"KTX2PlayerView: Pre-decode complete, starting playback");
+          
+          if (self.autoPlay && !self.reactPaused) {
+            [self play];
+          }
+        });
+      });
+    } else {
+      // Real device: direct upload (fast, no ASTC decode needed)
+      dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        NSInteger framesToPreload = MIN(gpuCacheSize, (NSInteger)layerCount);
+        NSLog(@"KTX2PlayerView: Pre-uploading %ld initial frames for uncompressed streaming (device)", (long)framesToPreload);
+        
+        for (NSInteger i = 0; i < framesToPreload; i++) {
+          NSInteger slot = i % gpuCacheSize;
+          [self uploadUncompressedFrame:i toSlot:slot];
+          self->_ringSlots[slot] = @(i);
+        }
+        
+        NSLog(@"KTX2PlayerView: Pre-upload complete, starting playback");
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (self.autoPlay && !self.reactPaused) {
+            [self play];
+          }
+        });
+      });
+    }
+  });
+  
+  return YES;
+}
+
+- (NSString *)extractMetadataJsonFromKvdBytes:(NSData *)kvdBytes
+{
+  if (!kvdBytes || kvdBytes.length < 4) return nil;
+  
+  const uint8_t *bytes = (const uint8_t *)kvdBytes.bytes;
+  NSUInteger pos = 0;
+  NSUInteger kvdEnd = kvdBytes.length;
+  
+  while (pos < kvdEnd) {
+    if (pos + 4 > kvdBytes.length) break;
+    
+    uint32_t entryLength = *(uint32_t *)(bytes + pos);
+    pos += 4;
+    
+    if (entryLength == 0 || pos + entryLength > kvdBytes.length) break;
+    
+    // Find key (NUL-terminated string)
+    NSUInteger keyEnd = pos;
+    while (keyEnd < pos + entryLength && bytes[keyEnd] != 0) {
+      keyEnd++;
+    }
+    
+    NSString *key = [[NSString alloc] initWithBytes:(bytes + pos) length:(keyEnd - pos) encoding:NSUTF8StringEncoding];
+    
+    if ([key isEqualToString:@"BasisPlayerMetadata"]) {
+      NSUInteger valueStart = keyEnd + 1;
+      NSUInteger valueEnd = pos + entryLength;
+      
+      // Find actual value end (may have NUL terminator)
+      while (valueEnd > valueStart && bytes[valueEnd - 1] == 0) {
+        valueEnd--;
+      }
+      
+      NSString *metadataJson = [[NSString alloc] initWithBytes:(bytes + valueStart) 
+                                                        length:(valueEnd - valueStart) 
+                                                      encoding:NSUTF8StringEncoding];
+      NSLog(@"KTX2PlayerView: extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
+      return metadataJson;
+    }
+    
+    // Move to next entry (with padding to 4-byte alignment)
+    pos += entryLength;
+    pos += (4 - (entryLength % 4)) % 4;
+  }
+  
+  return nil;
+}
+
+- (void)uploadUncompressedFrame:(NSInteger)frameIndex toSlot:(NSInteger)slot
+{
+  if (!_mmapData || !_textureArray) return;
+  
+  const uint8_t *data = (const uint8_t *)_mmapData;
+  uint64_t frameOffset = _streamLevel0Offset + (uint64_t)frameIndex * _streamBytesPerLayer;
+  const uint8_t *frameData = data + frameOffset;
+  
+  MTLRegion region = MTLRegionMake2D(0, 0, self.frameWidth, self.frameHeight);
+  
+  if (_useCompressedFormat) {
+    [_textureArray replaceRegion:region
+                     mipmapLevel:0
+                           slice:slot
+                       withBytes:frameData
+                     bytesPerRow:0
+                   bytesPerImage:_streamBytesPerLayer];
+  } else {
+    // Decode ASTC to RGBA for simulator
+    uint32_t blocksX = (self.frameWidth + 3) / 4;
+    uint32_t blocksY = (self.frameHeight + 3) / 4;
+    std::vector<uint8_t> rgbaData(self.frameWidth * self.frameHeight * 4);
+    
+    for (uint32_t by = 0; by < blocksY; by++) {
+      for (uint32_t bx = 0; bx < blocksX; bx++) {
+        const uint8_t *block = frameData + (by * blocksX + bx) * 16;
+        uint8_t blockPixels[4 * 4 * 4];
+        basisu::astc::decompress(blockPixels, block, false, 4, 4);
+        
+        for (int y = 0; y < 4 && (by * 4 + y) < self.frameHeight; y++) {
+          for (int x = 0; x < 4 && (bx * 4 + x) < self.frameWidth; x++) {
+            uint32_t dstX = bx * 4 + x;
+            uint32_t dstY = by * 4 + y;
+            uint8_t *dst = rgbaData.data() + (dstY * self.frameWidth + dstX) * 4;
+            uint8_t *src = blockPixels + (y * 4 + x) * 4;
+            memcpy(dst, src, 4);
+          }
+        }
+      }
+    }
+    
+    [_textureArray replaceRegion:region
+                     mipmapLevel:0
+                           slice:slot
+                       withBytes:rgbaData.data()
+                     bytesPerRow:self.frameWidth * 4
+                   bytesPerImage:self.frameWidth * self.frameHeight * 4];
+  }
+}
+
+// Decode ASTC frames ahead on background thread for uncompressed streaming (simulator only)
+- (void)decodeUncompressedFramesAhead:(NSInteger)currentVirtualPos
+{
+  if (!_mmapData || !_isUncompressedStreaming || _useCompressedFormat) return;
+  
+  // Only needed on simulator where we decode ASTC to RGBA
+  NSInteger vPosModulus = self.totalFrames * 2;
+  NSInteger currentDecodeVPos = (_decoderLoopIteration * self.totalFrames + _uncompressedDecoderPosition) % vPosModulus;
+  
+  // Calculate frames ahead
+  NSInteger framesAhead = (currentDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
+  NSInteger framesToDecode = self.streamingPrefetchAhead - framesAhead;
+  
+  if (framesToDecode <= 0) return;
+  
+  // Dispatch decode work to background queue
+  dispatch_async(_astcDecodeQueue, ^{
+    for (NSInteger i = 0; i < framesToDecode && self->_mmapData; i++) {
+      NSInteger frameIndex = self->_uncompressedDecoderPosition;
+      NSInteger virtualPos = (self->_decoderLoopIteration * self.totalFrames + frameIndex) % vPosModulus;
+      
+      // Skip if already decoded
+      if (self->_decodedRgbaCache[@(virtualPos)]) {
+        self->_uncompressedDecoderPosition++;
+        if (self->_uncompressedDecoderPosition >= self.totalFrames) {
+          self->_uncompressedDecoderPosition = 0;
+          self->_decoderLoopIteration++;
+        }
+        continue;
+      }
+      
+      // Decode ASTC to RGBA
+      const uint8_t *data = (const uint8_t *)self->_mmapData;
+      uint64_t frameOffset = self->_streamLevel0Offset + (uint64_t)frameIndex * self->_streamBytesPerLayer;
+      const uint8_t *frameData = data + frameOffset;
+      
+      uint32_t blocksX = (self.frameWidth + 3) / 4;
+      uint32_t blocksY = (self.frameHeight + 3) / 4;
+      NSMutableData *rgbaData = [NSMutableData dataWithLength:self.frameWidth * self.frameHeight * 4];
+      uint8_t *rgba = (uint8_t *)rgbaData.mutableBytes;
+      
+      for (uint32_t by = 0; by < blocksY; by++) {
+        for (uint32_t bx = 0; bx < blocksX; bx++) {
+          const uint8_t *block = frameData + (by * blocksX + bx) * 16;
+          uint8_t blockPixels[4 * 4 * 4];
+          basisu::astc::decompress(blockPixels, block, false, 4, 4);
+          
+          for (int y = 0; y < 4 && (by * 4 + y) < self.frameHeight; y++) {
+            for (int x = 0; x < 4 && (bx * 4 + x) < self.frameWidth; x++) {
+              uint32_t dstX = bx * 4 + x;
+              uint32_t dstY = by * 4 + y;
+              uint8_t *dst = rgba + (dstY * self.frameWidth + dstX) * 4;
+              uint8_t *src = blockPixels + (y * 4 + x) * 4;
+              memcpy(dst, src, 4);
+            }
+          }
+        }
+      }
+      
+      // Cache the decoded frame
+      @synchronized(self->_decodedRgbaCache) {
+        self->_decodedRgbaCache[@(virtualPos)] = rgbaData;
+      }
+      
+      self->_uncompressedDecoderPosition++;
+      if (self->_uncompressedDecoderPosition >= self.totalFrames) {
+        self->_uncompressedDecoderPosition = 0;
+        self->_decoderLoopIteration++;
+      }
+    }
+  });
+}
+
+// Upload pre-decoded RGBA frame to GPU (fast, main thread safe)
+- (void)uploadDecodedFrameToGPU:(NSInteger)virtualPos slot:(NSInteger)slot
+{
+  NSData *rgbaData;
+  @synchronized(_decodedRgbaCache) {
+    rgbaData = _decodedRgbaCache[@(virtualPos)];
+  }
+  
+  if (!rgbaData || !_textureArray) return;
+  
+  MTLRegion region = MTLRegionMake2D(0, 0, self.frameWidth, self.frameHeight);
+  [_textureArray replaceRegion:region
+                   mipmapLevel:0
+                         slice:slot
+                     withBytes:rgbaData.bytes
+                   bytesPerRow:self.frameWidth * 4
+                 bytesPerImage:self.frameWidth * self.frameHeight * 4];
+}
+
+// Evict old decoded frames from cache
+- (void)evictOldDecodedFrames:(NSInteger)currentVirtualPos
+{
+  if (!_decodedRgbaCache) return;
+  
+  NSInteger vPosModulus = self.totalFrames * 2;
+  NSMutableArray *toRemove = [NSMutableArray array];
+  
+  @synchronized(_decodedRgbaCache) {
+    for (NSNumber *virtualPos in _decodedRgbaCache.allKeys) {
+      NSInteger vPos = [virtualPos integerValue];
+      NSInteger distance = (vPos - currentVirtualPos + vPosModulus) % vPosModulus;
+      BOOL isBehind = distance > (NSInteger)(vPosModulus - 2);
+      BOOL isAhead = distance <= self.streamingCacheSize;
+      if (!isBehind && !isAhead) {
+        [toRemove addObject:virtualPos];
+      }
+    }
+    
+    for (NSNumber *virtualPos in toRemove) {
+      [_decodedRgbaCache removeObjectForKey:virtualPos];
+    }
+  }
 }
 
 - (void)applyMetadataAndLoadTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri
@@ -986,7 +2117,28 @@
     NSLog(@"KTX2PlayerView: ASTC data: %lu bytes, %u bytes/layer, %u layers",
           (unsigned long)astcData.length, bytesPerLayer, layerCount);
     
-    // Create texture array on main thread
+    // Pre-decode ASTC to RGBA on background thread for simulator (avoid main thread freeze)
+    NSMutableArray<NSData *> *decodedLayers = nil;
+    if (!self->_useCompressedFormat) {
+      NSLog(@"KTX2PlayerView: Pre-decoding %u ASTC layers to RGBA on background thread (simulator)", layerCount);
+      decodedLayers = [NSMutableArray arrayWithCapacity:layerCount];
+      const uint8_t *astcBytes = (const uint8_t *)[astcData bytes];
+      
+      for (uint32_t layer = 0; layer < layerCount; layer++) {
+        const uint8_t *layerData = astcBytes + (layer * bytesPerLayer);
+        NSData *layerASTCData = [NSData dataWithBytesNoCopy:(void *)layerData length:bytesPerLayer freeWhenDone:NO];
+        NSData *rgbaData = [self decodeASTCToRGBA:layerASTCData width:width height:height];
+        if (rgbaData) {
+          [decodedLayers addObject:rgbaData];
+        } else {
+          // Create empty placeholder to maintain layer indices
+          [decodedLayers addObject:[NSData data]];
+        }
+      }
+      NSLog(@"KTX2PlayerView: Pre-decode complete, uploading to GPU");
+    }
+    
+    // Create texture array and upload on main thread (fast - just memcpy)
     dispatch_async(dispatch_get_main_queue(), ^{
       if (self->_isDestroyed) return;
       
@@ -1012,11 +2164,11 @@
       const uint8_t *astcBytes = (const uint8_t *)[astcData bytes];
       
       for (uint32_t layer = 0; layer < layerCount; layer++) {
-        const uint8_t *layerData = astcBytes + (layer * bytesPerLayer);
+        MTLRegion region = MTLRegionMake2D(0, 0, width, height);
         
         if (self->_useCompressedFormat) {
-          // Upload compressed ASTC directly
-          MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+          // Upload compressed ASTC directly (real device)
+          const uint8_t *layerData = astcBytes + (layer * bytesPerLayer);
           [self->_textureArray replaceRegion:region
                                  mipmapLevel:0
                                        slice:layer
@@ -1024,16 +2176,12 @@
                                  bytesPerRow:blocksX * 16
                                bytesPerImage:bytesPerLayer];
         } else {
-          // Decode ASTC to RGBA for simulator
-          NSData *layerASTCData = [NSData dataWithBytesNoCopy:(void *)layerData length:bytesPerLayer freeWhenDone:NO];
-          NSData *rgbaData = [self decodeASTCToRGBA:layerASTCData width:width height:height];
-          
-          if (rgbaData) {
-            MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+          // Upload pre-decoded RGBA (simulator)
+          if (layer < decodedLayers.count && decodedLayers[layer].length > 0) {
             [self->_textureArray replaceRegion:region
                                    mipmapLevel:0
                                          slice:layer
-                                     withBytes:[rgbaData bytes]
+                                     withBytes:[decodedLayers[layer] bytes]
                                    bytesPerRow:width * 4
                                  bytesPerImage:width * height * 4];
           }
@@ -1382,6 +2530,24 @@
   _frameInterval = 1.0 / (_frameRate * speed);
 }
 
+- (void)setReactPaused:(BOOL)newPaused
+{
+  if (_reactPaused != newPaused) {
+    _reactPaused = newPaused;
+    NSLog(@"KTX2PlayerView: setReactPaused: %d", newPaused);
+    
+    if (newPaused) {
+      // Stop playback
+      [self pause];
+    } else {
+      // Resume playback if we were playing before and source is loaded
+      if (_isSourceLoaded && self.autoPlay && !self.isPlaying) {
+        [self play];
+      }
+    }
+  }
+}
+
 - (void)updateFrame
 {
   if (!self.isPlaying) return;
@@ -1413,11 +2579,88 @@
     if (elapsed >= self.frameInterval / self.playbackSpeed) {
       self.lastFrameTime = currentTime - fmod(elapsed, self.frameInterval / self.playbackSpeed);
       
+      // For streaming ring buffer mode, handle on-demand decoding/upload
+      if (_streamingRingBufferMode) {
+        NSInteger vPosModulus = self.totalFrames * 2;
+        NSInteger virtualPos = (_playbackLoopIteration * self.totalFrames + self.currentFrame) % vPosModulus;
+        NSInteger gpuSlot = self.currentFrame % _streamingRingBufferSize;
+        
+        if (_isUncompressedStreaming) {
+          // Uncompressed streaming
+          if (!_useCompressedFormat && _decodedRgbaCache) {
+            // Simulator: use background-decoded RGBA cache
+            [self decodeUncompressedFramesAhead:virtualPos];
+            [self evictOldDecodedFrames:virtualPos];
+            
+            NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+            if (slotVPos != virtualPos) {
+              NSData *rgbaData;
+              @synchronized(_decodedRgbaCache) {
+                rgbaData = _decodedRgbaCache[@(virtualPos)];
+              }
+              if (rgbaData) {
+                [self uploadDecodedFrameToGPU:virtualPos slot:gpuSlot];
+                _ringSlots[gpuSlot] = @(virtualPos);
+              } else {
+                // Frame not decoded yet - skip this update
+                return;
+              }
+            }
+          } else {
+            // Real device: upload directly from mmap (fast, native ASTC)
+            NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+            if (slotVPos != virtualPos) {
+              [self uploadUncompressedFrame:self.currentFrame toSlot:gpuSlot];
+              _ringSlots[gpuSlot] = @(virtualPos);
+            }
+          }
+        } else {
+          // Zstd streaming: decode frames ahead
+          [self decodeFramesAhead:virtualPos];
+          
+          // Evict old frames from CPU cache
+          [self evictOldFrames:virtualPos];
+          
+          // Ensure current frame is in GPU
+          [self ensureFrameInGPU:virtualPos];
+          
+          // Check if frame is ready
+          NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+          
+          if (slotVPos != virtualPos && !_frameCache[@(virtualPos)]) {
+            // Frame not ready yet - skip this update
+            static int notReadyCount = 0;
+            if (notReadyCount++ < 20) {
+              NSLog(@"KTX2PlayerView: Frame not ready - frame=%ld, vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu, decoderPos=%ld",
+                    (long)self.currentFrame, (long)virtualPos, (long)gpuSlot, (long)slotVPos, 
+                    (unsigned long)_frameCache.count, (long)_decoderPosition);
+            }
+            return;
+          }
+        }
+      }
+      
       self.currentFrame++;
       
       if (self.currentFrame >= self.totalFrames) {
         if (self.loop) {
           self.currentFrame = 0;
+          if (_streamingRingBufferMode) {
+            _playbackLoopIteration++;
+            NSInteger nextVPos = (_playbackLoopIteration * self.totalFrames) % (self.totalFrames * 2);
+            NSLog(@"KTX2PlayerView: Playback loop wrap-around: iteration %ld, nextVPos=%ld, decoderLoop=%ld, decoderPos=%ld, cacheSize=%lu",
+                  (long)_playbackLoopIteration, (long)nextVPos, (long)_decoderLoopIteration, (long)_decoderPosition, (unsigned long)_frameCache.count);
+            // Log first few slot states
+            for (int i = 0; i < MIN(4, _streamingRingBufferSize); i++) {
+              NSLog(@"  slot[%d] = vPos %ld", i, (long)[_ringSlots[i] integerValue]);
+            }
+            // Log if next frame is in cache
+            NSLog(@"  cache has nextVPos=%ld: %@", (long)nextVPos, _frameCache[@(nextVPos)] ? @"YES" : @"NO");
+            
+            // CRITICAL: Immediately upload frame 0 of new loop to GPU before next render
+            // This prevents showing stale frame from previous loop
+            [self ensureFrameInGPU:nextVPos];
+          }
         } else {
           self.isPlaying = NO;
           if (self.displayLink) {
@@ -1528,8 +2771,49 @@
       drawCount++;
     }
     
-    // Update layer uniform
-    float layer = (float)self.currentFrame;
+    // Update layer uniform - use ring buffer slot for streaming mode
+    float layer;
+    if (_streamingRingBufferMode) {
+      NSInteger gpuSlot = self.currentFrame % _streamingRingBufferSize;
+      
+      // CRITICAL: Ensure the GPU slot has the correct frame before rendering
+      // This handles the loop boundary case where the slot has stale data
+      NSInteger vPosModulus = self.totalFrames * 2;
+      NSInteger virtualPos = (_playbackLoopIteration * self.totalFrames + self.currentFrame) % vPosModulus;
+      NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+      
+      if (slotVPos != virtualPos) {
+        // Slot has wrong frame - upload correct frame
+        if (_isUncompressedStreaming) {
+          if (!_useCompressedFormat && _decodedRgbaCache) {
+            // Simulator: upload from decoded RGBA cache
+            NSData *rgbaData;
+            @synchronized(_decodedRgbaCache) {
+              rgbaData = _decodedRgbaCache[@(virtualPos)];
+            }
+            if (rgbaData) {
+              [self uploadDecodedFrameToGPU:virtualPos slot:gpuSlot];
+              _ringSlots[gpuSlot] = @(virtualPos);
+            }
+          } else {
+            // Real device: upload directly from mmap
+            [self uploadUncompressedFrame:self.currentFrame toSlot:gpuSlot];
+            _ringSlots[gpuSlot] = @(virtualPos);
+          }
+        } else {
+          // Zstd: upload from cache
+          NSData *frameData = _frameCache[@(virtualPos)];
+          if (frameData) {
+            [self uploadFrameToGPU:frameData.bytes slot:gpuSlot];
+            _ringSlots[gpuSlot] = @(virtualPos);
+          }
+        }
+      }
+      
+      layer = (float)gpuSlot;
+    } else {
+      layer = (float)self.currentFrame;
+    }
     memcpy([_arrayUniformBuffer contents], &layer, sizeof(float));
     
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
@@ -1612,6 +2896,29 @@
   self.partTextures = nil;
   self.currentTexture = nil;
   _transcodedData.clear();
+  
+  // Cleanup streaming state
+  if (_dstream) {
+    ZSTD_freeDStream(_dstream);
+    _dstream = NULL;
+  }
+  _compressedData = nil;
+  _frameAccumulator = nil;
+  _ringSlots = nil;
+  _frameCache = nil;
+  _streamingRingBufferMode = NO;
+  
+  // Cleanup mmap
+  if (_mmapData && _mmapData != MAP_FAILED) {
+    munmap(_mmapData, _mmapSize);
+    _mmapData = NULL;
+  }
+  if (_mmapFd >= 0) {
+    close(_mmapFd);
+    _mmapFd = -1;
+  }
+  _mmapSize = 0;
+  _isUncompressedStreaming = NO;
 }
 
 - (void)willMoveToSuperview:(UIView *)newSuperview

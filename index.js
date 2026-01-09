@@ -85,19 +85,22 @@ export const KTX2PlayerView = React.memo(({
   }
 
   // Native implementation (iOS/Android)
+  // Map 'paused' prop to 'reactPaused' on iOS (to avoid conflict with MTKView's paused property)
+  const { paused, ...restOtherProps } = otherProps;
   const nativeProps = {
     source: normalizedSource,
     autoPlay,
     loop,
     playbackSpeed,
     cacheKey,
+    ...(Platform.OS === 'ios' && paused !== undefined ? { reactPaused: paused } : { paused }),
   };
 
   return (
     <NativeKTX2PlayerView
       {...nativeProps}
       style={[styles.container, style]}
-      {...otherProps}
+      {...restOtherProps}
     />
   );
 });

@@ -15,6 +15,8 @@ export interface NativeProps extends ViewProps {
   playbackSpeed?: number;
   /** Pause playback and decompression (useful for screen focus/blur) */
   paused?: boolean;
+  /** iOS-specific: mapped from paused to avoid MTKView property conflict */
+  reactPaused?: boolean;
   cacheKey?: string;
   /**
    * Enable GPU-controlled playback timing (experimental).
