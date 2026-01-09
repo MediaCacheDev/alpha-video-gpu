@@ -11,6 +11,8 @@ This library renders animations from KTX2 texture files containing sprite sheets
 - Hardware texture compression (ASTC on iOS/Android, transcoded formats on web)
 - Software RGBA fallback for emulators and unsupported devices
 - Metadata embedded in KTX2 files or provided separately
+- **Streaming playback** for long animations with minimal memory footprint
+- **Uncompressed ASTC streaming** for many concurrent players
 
 ---
 
@@ -221,7 +223,7 @@ const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 
 const config = {
   resolver: {
-    assetExts: [...getDefaultConfig(__dirname).resolver.assetExts, 'ktx2', 'glb'],
+    assetExts: [...getDefaultConfig(__dirname).resolver.assetExts, 'ktx2', 'glb', 'zst'],
   },
 };
 
@@ -398,6 +400,215 @@ const scripts = `
 
 ---
 
+## Playback Modes
+
+The player supports multiple playback strategies optimized for different use cases.
+
+### Memory Strategy: VRAM vs RAM
+
+The `streamingStrategy` prop controls where the main frame buffer is located. The goal is to **maximize** usage of one memory type while **minimizing** the other:
+
+| Strategy | Main Buffer | Behavior | Performance |
+|----------|-------------|----------|-------------|
+| `vram` (default) | GPU VRAM | Maximizes VRAM, minimizes RAM | **Generally preferred** - VRAM is separate from app memory, can use 2GB+ without affecting app performance |
+| `ram` | CPU RAM | Maximizes RAM, minimizes VRAM | Use when VRAM is constrained - but note that high RAM usage (1GB+) can cause app slowdowns |
+
+**Recommendation:** Use `vram` mode unless you have a specific reason to minimize GPU memory usage. VRAM is allocated separately from your app's heap and doesn't contribute to memory pressure warnings.
+
+### Non-Streaming (Default)
+
+All frames are loaded into memory before playback begins. Best for short-to-medium animations. Works with both **texture arrays** and **atlas** packing modes, and supports both **Native ASTC** and **UASTC** encoding.
+
+```jsx
+<KTX2PlayerView
+  source={{ uri: 'https://example.com/animation.ktx2' }}
+  autoPlay
+  loop
+/>
+```
+
+**Non-streaming memory behavior:**
+
+| Strategy | Description |
+|----------|-------------|
+| `vram` | All frames loaded directly to GPU VRAM, skipping RAM entirely. Fastest playback, instant frame switching. |
+| `ram` | All frames held in CPU RAM, streamed to a small VRAM buffer on demand. Minimizes VRAM while RAM holds all data. |
+
+```jsx
+<KTX2PlayerView
+  source={{ uri: 'https://example.com/animation.ktx2' }}
+  streamingStrategy="ram"
+  autoPlay
+  loop
+/>
+```
+
+### Streaming Mode
+
+For very long animations or memory-constrained scenarios, streaming mode decodes frames on-demand during playback using a ring buffer. Only a small window of frames is kept in memory at any time, providing **constant and predictable memory usage** regardless of animation length.
+
+**Streaming requirements:**
+- File must use `.ktx2.zst` extension (externally Zstd-compressed KTX2)
+- Must use **texture array** packing (not atlas)
+- Must use **Native ASTC** encoding (not UASTC)
+- The KTX2 inside is uncompressed; Zstd compression is applied to the whole container externally
+
+**Enable streaming by using `.ktx2.zst` file extension:**
+
+```jsx
+<KTX2PlayerView
+  source={{ uri: 'https://example.com/animation.ktx2.zst' }}
+  streamingStrategy="vram"
+  streamingRingBufferSize={20}
+  streamingCacheSize={60}
+  streamingPrefetchAhead={15}
+  autoPlay
+  loop
+/>
+```
+
+#### Streaming Props
+
+| Prop | Default | Description |
+|------|---------|-------------|
+| `streamingStrategy` | `"vram"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM) |
+| `streamingRingBufferSize` | `20` | Number of GPU texture slots in ring buffer |
+| `streamingCacheSize` | `60` | (RAM mode only) Number of decoded frames to keep in CPU memory |
+| `streamingPrefetchAhead` | `15` | How many frames to decode ahead of playback position |
+
+#### VRAM Streaming
+
+Frames are decoded directly into a GPU texture ring buffer. Minimal CPU RAM usage - only the ring buffer exists in VRAM.
+
+```
+[GPU Ring Buffer: 20 slots]
+Slot 0: Frame 100  ← Currently displaying
+Slot 1: Frame 101
+Slot 2: Frame 102
+...
+Slot 19: Frame 119 ← Prefetched ahead
+```
+
+#### RAM Streaming
+
+Frames are first decoded to a CPU RAM cache, then uploaded to a smaller GPU ring buffer on demand. Minimizes VRAM usage while providing a larger decode-ahead buffer.
+
+```
+[CPU Cache: 60 frames] → [GPU Ring Buffer: 20 slots]
+Frames 80-139 cached    Frames 100-119 in GPU
+```
+
+#### Why Streaming?
+
+Streaming enables playback of arbitrarily long animations with **fixed memory footprint**:
+- A 10,000 frame animation uses the same memory as a 100 frame animation
+- Memory usage is fully configurable via ring buffer and cache size props
+- Ideal for long-form content, digital signage, or memory-constrained devices
+
+### Encoding for Streaming
+
+```bash
+node encode-basis.js \
+  --input ./frames \
+  --output ./animation.ktx2 \
+  --width 400 \
+  --height 400 \
+  --fps 30 \
+  --no-mipmap \
+  --astc \
+  --astc-quality exhaustive \
+  --astc-block 4x4 \
+  --astc-perceptual \
+  --zstd 22 \
+  --max-texture-size 8192 \
+  --mode array \
+  --stream
+```
+
+The `--stream` flag produces an uncompressed ASTC texture array inside the KTX2 container. When combined with `--zstd N` (where N > 0), the encoder internally applies Zstd compression to the entire container and outputs a `.ktx2.zst` file suitable for streaming. This all happens in a single encoding command.
+
+---
+
+## Uncompressed ASTC Streaming
+
+For maximum playback performance and massive concurrency, uncompressed ASTC streaming eliminates all runtime Zstd decompression overhead. The KTX2 file contains raw ASTC texture data that can be uploaded directly to the GPU.
+
+### When to Use
+
+- **50-100+ simultaneous players** on a single device
+- **Battery-critical applications** (kiosks, digital signage)
+- **Guaranteed smooth playback** regardless of device CPU
+- **Storage is not a constraint** (local assets, fast network)
+
+### Performance Characteristics
+
+| Metric | Zstd Compressed (.ktx2.zst) | Uncompressed (.ktx2) |
+|--------|-----------------|---------------|
+| File size | ~5 MB | ~29 MB (6x larger) |
+| CPU during playback | Zstd decode + upload | Upload only |
+| Concurrent players | 10-20 typical | 50-100+ tested |
+| Battery impact | Moderate | Minimal |
+| Memory bandwidth | Lower | Higher |
+
+### Encoding Uncompressed ASTC
+
+```bash
+node encode-basis.js \
+  --input ./frames \
+  --output ./animation_uncompressed.ktx2 \
+  --width 400 \
+  --height 400 \
+  --fps 30 \
+  --no-mipmap \
+  --astc \
+  --astc-quality exhaustive \
+  --astc-block 4x4 \
+  --astc-perceptual \
+  --zstd 0 \
+  --max-texture-size 8192 \
+  --mode array \
+  --stream
+```
+
+The only difference from compressed streaming is `--zstd 0` instead of `--zstd 22`. This produces an uncompressed `.ktx2` file (not `.ktx2.zst`) that uses memory-mapped I/O for zero-copy frame access.
+
+### Usage
+
+```jsx
+// Uncompressed streaming uses .ktx2 extension (not .ktx2.zst)
+// The player auto-detects uncompressed format from file header
+<KTX2PlayerView
+  source={{ uri: 'https://example.com/animation_uncompressed.ktx2' }}
+  streamingStrategy="vram"
+  streamingRingBufferSize={20}
+  autoPlay
+  loop
+/>
+```
+
+### How It Works
+
+1. **Memory-mapped file access** - The KTX2 file is mmap'd, allowing the OS to page frames in/out efficiently
+2. **Direct GPU upload** - ASTC blocks are copied directly to GPU texture memory (no Zstd decompression needed)
+3. **Ring buffer playback** - Only `streamingRingBufferSize` frames are in GPU memory at once
+4. **Zero CPU decode** - On real devices with ASTC hardware, CPU usage approaches zero during playback
+
+### Trade-offs
+
+| Pros | Cons |
+|------|------|
+| Near-zero CPU usage | 5-6x larger file size |
+| Scales to 50-100+ concurrent players | Higher storage/bandwidth requirements |
+| Consistent frame timing | Not suitable for slow networks |
+| Lower battery consumption | Larger app bundle if bundled |
+| No decode latency on startup | — |
+
+### Simulator Behavior
+
+On iOS/Android simulators (no hardware ASTC), uncompressed streaming still requires software ASTC→RGBA decode. The player performs this decode on a background thread to keep the UI responsive, but performance will be significantly lower than on real devices.
+
+---
+
 ## Performance Characteristics
 
 - **CPU:** Near-zero during playback (UV updates only)
@@ -405,16 +616,73 @@ const scripts = `
 - **Battery:** Significantly lower than video playback
 - **Load time:** One-time transcode (UASTC) or direct upload (ASTC)
 
+### Playback Mode Comparison
+
+| Mode | Encoding | Packing | Load Time | Memory | CPU (Playback) | Best For |
+|------|----------|---------|-----------|--------|----------------|----------|
+| Non-streaming VRAM | ASTC or UASTC | Array or Atlas | Slow (all frames) | High VRAM, minimal RAM | Near-zero | Short animations, best performance |
+| Non-streaming RAM | ASTC or UASTC | Array or Atlas | Slow (all frames) | High RAM, minimal VRAM | Low (uploads) | VRAM-constrained devices |
+| Streaming VRAM (Zstd) | ASTC only | Array only | Fast (prefetch) | Low VRAM ring buffer | Medium (decode) | Long animations, fixed memory |
+| Streaming RAM (Zstd) | ASTC only | Array only | Fast (prefetch) | Medium RAM cache, minimal VRAM | Medium (decode) | Long animations, VRAM-constrained |
+| Streaming Uncompressed | ASTC only | Array only | Fast (mmap) | Low VRAM ring buffer | Near-zero | Massive concurrency, battery-critical |
+
 Best suited for:
 - Looping UI effects (glows, shimmers, highlights)
 - Transparent overlays
 - Kiosk/always-on displays
 - Any animation where consistent frame timing matters
+- **High-concurrency scenarios** (50-100+ simultaneous animations)
 
 Not ideal for:
 - Long-form video content
-- Streaming media
 - Audio-synced playback
+- Bandwidth-constrained streaming (use Zstd compression)
+
+---
+
+## Props Reference
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `source` | `{ uri: string }` | Required | Animation source URL or file path |
+| `style` | `ViewStyle` | — | Container style |
+| `autoPlay` | `boolean` | `false` | Start playback automatically when loaded |
+| `loop` | `boolean` | `false` | Loop playback continuously |
+| `paused` | `boolean` | `false` | Pause/resume playback |
+| `cacheKey` | `string` | — | Custom cache key for remote files |
+| `parts` | `Array<{ uri: string }>` | — | Explicit part URIs for multi-part animations |
+| `streamingStrategy` | `"vram"` \| `"ram"` | `"vram"` | Memory strategy for playback |
+| `streamingRingBufferSize` | `number` | `20` | GPU texture slots for streaming |
+| `streamingCacheSize` | `number` | `60` | CPU cache size for RAM streaming |
+| `streamingPrefetchAhead` | `number` | `15` | Frames to decode ahead |
+| `onStateChange` | `(event) => void` | — | Called when player state changes |
+| `onError` | `(event) => void` | — | Called on playback errors |
+| `onLoop` | `(event) => void` | — | Called when animation loops |
+
+### State Change Events
+
+```jsx
+<KTX2PlayerView
+  onStateChange={({ nativeEvent }) => {
+    // nativeEvent.state: "loading" | "ready" | "playing" | "paused" | "stopped"
+    console.log('State:', nativeEvent.state);
+  }}
+/>
+```
+
+### Imperative Methods
+
+```jsx
+const playerRef = useRef(null);
+
+<KTX2PlayerView ref={playerRef} ... />
+
+// Control playback
+playerRef.current?.play();
+playerRef.current?.pause();
+playerRef.current?.stop();
+playerRef.current?.seekToFrame(30);
+```
 
 ---
 
