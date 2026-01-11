@@ -6,7 +6,8 @@
   "types": "src/index.d.ts",
   "scripts": {
     "setup": "bash scripts/setup.sh",
-    "prepublishOnly": "npm run setup",
+    "bundle-basis": "node scripts/bundle-basis.js",
+    "prepublishOnly": "npm run setup && npm run bundle-basis",
     "clean": "rm -rf vendor ios/vendor android/src/main/cpp/basis_universal",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -41,7 +42,6 @@
     "ios/",
     "src/",
     "scripts/",
-    "web/",
     "index.js",
     "react-native.config.js",
     "react-native-ktx2player.podspec",

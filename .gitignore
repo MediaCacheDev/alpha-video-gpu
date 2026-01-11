@@ -11,6 +11,9 @@ android/src/main/cpp/basis_universal/
 build/
 dist/
 
+# Generated files (created by npm run bundle-basis)
+src/basis-transcoder.ts
+
 # iOS
 ios/Pods/
 ios/*.xcworkspace

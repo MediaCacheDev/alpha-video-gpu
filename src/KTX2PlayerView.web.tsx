@@ -3,12 +3,20 @@
  * 
  * Uses WebGL and Basis Universal transcoder to play KTX2 animations
  * Same API as native iOS/Android implementations
+ * 
+ * All dependencies are bundled - no external scripts needed:
+ * - Basis Universal: JS + WASM inlined in basis-transcoder.ts
+ * - ZSTD decoder: JS + WASM inlined in zstddec-stream-bundled.js
  */
 
 import React, { useRef, useEffect, useCallback, useState, useMemo } from 'react';
 import { View, StyleSheet, Platform } from 'react-native';
 
-// Basis Universal transcoder types
+// Import bundled dependencies
+import { initBasisTranscoder as initBundledBasis } from './basis-transcoder';
+import { ZSTDDecoder as ZSTDDecoderClass } from './zstddec-stream-bundled.js';
+
+// Global types for compatibility
 declare global {
   interface Window {
     BASIS: any;
@@ -16,9 +24,11 @@ declare global {
     fzstd: any;
   }
   var BASIS: any;
-  var ZSTDDecoder: any;
   var fzstd: any;
 }
+
+// Alias for internal use
+const ZSTDDecoder = ZSTDDecoderClass;
 
 export interface SourceType {
   uri?: string;
@@ -239,19 +249,8 @@ async function initBasisTranscoder(): Promise<any> {
   if (basisModulePromise) return basisModulePromise;
   
   basisModulePromise = (async () => {
-    // Wait for BASIS to be available
-    let attempts = 0;
-    while (typeof BASIS === 'undefined' && attempts < 100) {
-      await new Promise(resolve => setTimeout(resolve, 50));
-      attempts++;
-    }
-    
-    if (typeof BASIS === 'undefined') {
-      throw new Error('Basis Universal not loaded. Include basis_transcoder.js script.');
-    }
-    
-    const module = await BASIS();
-    module.initializeBasis();
+    // Use bundled Basis transcoder (JS + WASM inlined)
+    const module = await initBundledBasis();
     basisModule = module;
     return module;
   })();
