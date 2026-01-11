@@ -48,6 +48,12 @@ export interface KTX2PlayerViewProps {
   streamingCacheSize?: number;
   /** Frames to decode ahead of playback. Default: 30 */
   streamingPrefetchAhead?: number;
+  /** Memory strategy: 'auto' | 'vram' | 'ram'. Default: 'auto'
+   * - auto: defaults to 'ram' for streaming
+   * - vram: larger GPU texture array, minimal CPU cache (best for many simultaneous players)
+   * - ram: small GPU ring buffer, larger CPU cache (lower VRAM usage)
+   */
+  memoryStrategy?: 'auto' | 'vram' | 'ram';
 }
 
 interface FrameUV {
@@ -268,6 +274,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   streamingRingSize = 16,
   streamingCacheSize = 60,
   streamingPrefetchAhead = 30,
+  memoryStrategy = 'auto',
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const glRef = useRef<WebGLRenderingContext | WebGL2RenderingContext | null>(null);
@@ -292,6 +299,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   const streamingModeRef = useRef<boolean>(false);
   const streamingCancelledRef = useRef<boolean>(false); // Cancellation flag for cleanup
   const streamingFrameCacheRef = useRef<Map<number, Uint8Array>>(new Map());
+  const useVramStrategyRef = useRef<boolean>(memoryStrategy === 'vram');
   const streamingRingBufferRef = useRef<WebGLTexture | null>(null);
   const streamingRingSlotsRef = useRef<number[]>([]);
   const streamingRingActualSizeRef = useRef<number>(0);
@@ -307,6 +315,16 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   const streamingLayerCountRef = useRef<number>(0);
   const streamingLevel0OffsetRef = useRef<number>(0);
   const streamingAstcFormatRef = useRef<number>(0);
+  
+  // RAM mode state (non-streaming texture arrays with memoryStrategy='ram')
+  const ramHeavyModeRef = useRef<boolean>(false);
+  const ramFrameDataRef = useRef<Uint8Array | null>(null);
+  const ramBytesPerFrameRef = useRef<number>(0);
+  const ramFrameCountRef = useRef<number>(0);
+  const ramUploadedFrameRef = useRef<number>(-1);
+  const ramAstcFormatRef = useRef<number>(0);
+  const ramWidthRef = useRef<number>(0);
+  const ramHeightRef = useRef<number>(0);
   
   const [state, setState] = useState<string>('idle');
   const loadedSourceRef = useRef<string | null>(null);
@@ -650,12 +668,18 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   }, []);
 
   // Load texture array (packingMode: 'array')
+  // Memory strategy for non-streaming:
+  // - 'auto' or 'vram': Upload all frames to GPU at load time (default)
+  // - 'ram': Keep frames in CPU memory, upload per-frame on demand (lower VRAM)
   const loadTextureArray = useCallback(async (
     gl: WebGL2RenderingContext,
     ktx2Data: Uint8Array,
     metadata: Metadata
   ): Promise<boolean> => {
     try {
+      // Determine memory strategy for non-streaming
+      const useRamMode = memoryStrategy === 'ram';
+      
       const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
       
       // Parse KTX2 header
@@ -665,7 +689,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const layerCount = view.getUint32(32, true);
       const supercompressionScheme = view.getUint32(44, true);
       
-      console.log(`[KTX2PlayerView] Texture array: ${width}x${height}, ${layerCount} layers, vkFormat=${vkFormat}`);
+      console.log(`[KTX2PlayerView] Texture array: ${width}x${height}, ${layerCount} layers (${useRamMode ? 'RAM' : 'VRAM'} mode)`);
       
       // Level 0 index (at byte 80)
       const level0Offset = Number(view.getBigUint64(80, true));
@@ -711,22 +735,63 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       const textureArray = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, textureArray);
       
-      // Upload all layers at once
-      gl.compressedTexImage3D(
-        gl.TEXTURE_2D_ARRAY,
-        0,
-        astcFormat,
-        width,
-        height,
-        layerCount,
-        0,
-        compressedData
-      );
-      
-      const glError = gl.getError();
-      if (glError !== gl.NO_ERROR) {
-        console.error('[KTX2PlayerView] WebGL error after texture array upload:', glError);
-        return false;
+      if (useRamMode) {
+        // RAM mode: Keep all frames in CPU memory, create small GPU ring buffer
+        const gpuRingSize = 2; // Double buffering
+        
+        // Calculate bytes per layer
+        const blocksX = Math.ceil(width / 4);
+        const blocksY = Math.ceil(height / 4);
+        const bytesPerLayer = blocksX * blocksY * 16;
+        const emptyData = new Uint8Array(bytesPerLayer * gpuRingSize);
+        
+        gl.compressedTexImage3D(
+          gl.TEXTURE_2D_ARRAY,
+          0,
+          astcFormat,
+          width,
+          height,
+          gpuRingSize,
+          0,
+          emptyData
+        );
+        
+        // Store frame data in CPU memory for on-demand upload
+        ramFrameDataRef.current = compressedData;
+        ramBytesPerFrameRef.current = bytesPerLayer;
+        ramFrameCountRef.current = layerCount;
+        ramUploadedFrameRef.current = -1;
+        ramAstcFormatRef.current = astcFormat;
+        ramWidthRef.current = width;
+        ramHeightRef.current = height;
+        ramHeavyModeRef.current = true;
+        
+        const cpuMB = (compressedData.length / (1024 * 1024)).toFixed(1);
+        const gpuMB = (bytesPerLayer * gpuRingSize / (1024 * 1024)).toFixed(2);
+        console.log(`[KTX2PlayerView] RAM mode: ${layerCount} frames in CPU (${cpuMB}MB), ${gpuRingSize} slots in GPU (${gpuMB}MB)`);
+      } else {
+        // VRAM mode: Upload all frames to GPU at load time
+        ramHeavyModeRef.current = false;
+        
+        gl.compressedTexImage3D(
+          gl.TEXTURE_2D_ARRAY,
+          0,
+          astcFormat,
+          width,
+          height,
+          layerCount,
+          0,
+          compressedData
+        );
+        
+        const glError = gl.getError();
+        if (glError !== gl.NO_ERROR) {
+          console.error('[KTX2PlayerView] WebGL error after texture array upload:', glError);
+          return false;
+        }
+        
+        const dataMB = (compressedData.length / (1024 * 1024)).toFixed(1);
+        console.log(`[KTX2PlayerView] VRAM mode: ${dataMB}MB uploaded to GPU`);
       }
       
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -750,7 +815,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       console.error('[KTX2PlayerView] Failed to load texture array:', error);
       return false;
     }
-  }, []);
+  }, [memoryStrategy]);
 
   // Initialize streaming ring buffer
   const initStreamingRingBuffer = useCallback((
@@ -758,8 +823,23 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     width: number,
     height: number,
     astcFormat: number,
-    ringSize: number
+    layerCount: number
   ) => {
+    // Determine memory strategy
+    // - auto: defaults to 'ram' for streaming
+    // - vram: larger GPU texture array (streamingCacheSize), minimal CPU cache
+    // - ram: small GPU ring buffer (streamingRingSize), larger CPU cache
+    const useVram = memoryStrategy === 'vram';
+    useVramStrategyRef.current = useVram;
+    
+    // GPU cache size depends on memory strategy:
+    // - VRAM mode: use streamingCacheSize (larger, e.g., 60 slots)
+    // - RAM mode: use streamingRingSize (smaller, e.g., 16 slots)
+    const gpuCacheSize = useVram ? streamingCacheSize : streamingRingSize;
+    const ringSize = Math.min(gpuCacheSize, layerCount);
+    
+    console.log(`[KTX2PlayerView] Memory strategy: ${memoryStrategy} (useVram=${useVram}), GPU cache: ${ringSize} slots`);
+    
     // Calculate bytes per layer (ASTC 4x4)
     const blocksX = Math.ceil(width / 4);
     const blocksY = Math.ceil(height / 4);
@@ -786,7 +866,146 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     streamingAstcFormatRef.current = astcFormat;
     
     console.log(`[KTX2PlayerView] Ring buffer initialized: ${ringSize} slots, ${bytesPerLayer} bytes/layer`);
-  }, []);
+  }, [memoryStrategy, streamingRingSize, streamingCacheSize]);
+
+  // Load uncompressed streaming texture array (.ktx2 with streamMode: true)
+  const loadUncompressedStreamingTextureArray = useCallback(async (
+    gl: WebGL2RenderingContext,
+    ktx2Data: Uint8Array,
+    metadata: Metadata
+  ): Promise<boolean> => {
+    try {
+      console.log('[KTX2PlayerView] Starting uncompressed streaming playback...');
+      
+      const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
+      
+      const vkFormat = view.getUint32(12, true);
+      const width = view.getUint32(20, true);
+      const height = view.getUint32(24, true);
+      const layerCount = view.getUint32(32, true);
+      const supercompressionScheme = view.getUint32(44, true);
+      
+      if (supercompressionScheme !== 0) {
+        throw new Error('Uncompressed streaming requires supercompressionScheme=0');
+      }
+      
+      // Level 0 index
+      const level0Offset = Number(view.getBigUint64(80, true));
+      
+      // Calculate bytes per layer (ASTC 4x4)
+      const blocksX = Math.ceil(width / 4);
+      const blocksY = Math.ceil(height / 4);
+      const bytesPerLayer = blocksX * blocksY * 16;
+      
+      console.log(`[KTX2PlayerView] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
+      
+      // Check for ASTC support
+      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
+      if (!astcExt) {
+        throw new Error('ASTC texture compression not supported');
+      }
+      
+      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
+      if (vkFormat === 158) {
+        astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      }
+      
+      // Initialize ring buffer (memory strategy determines actual GPU cache size)
+      initStreamingRingBuffer(gl, width, height, astcFormat, layerCount);
+      
+      // Store references for on-demand frame access
+      streamingModeRef.current = true;
+      streamingLayerCountRef.current = layerCount;
+      streamingLevel0OffsetRef.current = level0Offset;
+      streamingFrameCacheRef.current = new Map();
+      streamingDecodePosRef.current = layerCount; // All frames available
+      streamingFramesReadyRef.current = layerCount;
+      
+      // Store the full data for on-demand frame access
+      const fullDataRef = ktx2Data;
+      
+      // Pre-load initial frames into ring buffer
+      const actualRingSize = streamingRingActualSizeRef.current;
+      for (let i = 0; i < actualRingSize; i++) {
+        const frameOffset = level0Offset + (i * bytesPerLayer);
+        const frameData = new Uint8Array(fullDataRef.buffer, fullDataRef.byteOffset + frameOffset, bytesPerLayer);
+        
+        // Upload to ring buffer
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, streamingRingBufferRef.current);
+        gl.compressedTexSubImage3D(
+          gl.TEXTURE_2D_ARRAY,
+          0, 0, 0, i % actualRingSize,
+          width, height, 1,
+          astcFormat,
+          frameData
+        );
+        streamingRingSlotsRef.current[i % actualRingSize] = i;
+        
+        // Also cache for seeking
+        streamingFrameCacheRef.current.set(i, frameData.slice());
+      }
+      
+      // Store full data reference for on-demand frame loading
+      // Use a closure to access frames on demand
+      const loadFrameOnDemand = (frameIndex: number): Uint8Array | null => {
+        const frameOffset = level0Offset + (frameIndex * bytesPerLayer);
+        if (frameOffset + bytesPerLayer > fullDataRef.length) return null;
+        return new Uint8Array(fullDataRef.buffer, fullDataRef.byteOffset + frameOffset, bytesPerLayer);
+      };
+      
+      // Override ensureFrameInRingBuffer to use on-demand loading
+      const originalCache = streamingFrameCacheRef.current;
+      streamingFrameCacheRef.current = new Map();
+      // Create a proxy-like cache that loads on demand
+      const proxyCache = {
+        get: (frameIndex: number): Uint8Array | undefined => {
+          if (originalCache.has(frameIndex)) {
+            return originalCache.get(frameIndex);
+          }
+          const frameData = loadFrameOnDemand(frameIndex);
+          if (frameData) {
+            originalCache.set(frameIndex, frameData.slice());
+            return originalCache.get(frameIndex);
+          }
+          return undefined;
+        },
+        has: (frameIndex: number): boolean => {
+          return frameIndex >= 0 && frameIndex < layerCount;
+        },
+        set: (frameIndex: number, data: Uint8Array) => {
+          originalCache.set(frameIndex, data);
+        },
+        delete: (frameIndex: number) => {
+          originalCache.delete(frameIndex);
+        },
+        clear: () => {
+          originalCache.clear();
+        },
+        get size() {
+          return originalCache.size;
+        },
+        keys: () => originalCache.keys(),
+      };
+      streamingFrameCacheRef.current = proxyCache as any;
+      
+      // Setup frame UVs
+      const uvs: FrameUV[] = [];
+      for (let i = 0; i < metadata.frameCount; i++) {
+        uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
+      }
+      frameUVsRef.current = uvs;
+      
+      // Use ring buffer as texture array
+      textureArrayRef.current = streamingRingBufferRef.current;
+      useTextureArrayRef.current = true;
+      
+      console.log(`[KTX2PlayerView] ✓ Uncompressed streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
+      return true;
+    } catch (error) {
+      console.error('[KTX2PlayerView] Uncompressed streaming load failed:', error);
+      return false;
+    }
+  }, [streamingRingSize, initStreamingRingBuffer]);
 
   // Ensure frame is in ring buffer (upload from cache if needed)
   const ensureFrameInRingBuffer = useCallback((frameIndex: number): number => {
@@ -828,16 +1047,46 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     return slot;
   }, []);
 
-  // Evict old frames from CPU cache
+  // Evict old frames from CPU cache based on memory strategy
+  // - VRAM mode: Evict frames immediately after they've been played (minimal CPU cache)
+  // - RAM mode: Use sliding window based on streamingCacheSize
   const evictOldFramesFromCache = useCallback((currentPlaybackFrame: number) => {
     const frameCache = streamingFrameCacheRef.current;
-    const keepFrom = Math.max(0, currentPlaybackFrame - 2);
-    const keepTo = currentPlaybackFrame + streamingCacheSize;
+    const metadata = metadataRef.current;
+    if (!metadata) return;
     
-    for (const frameIndex of frameCache.keys()) {
-      if (frameIndex < keepFrom || frameIndex > keepTo) {
-        frameCache.delete(frameIndex);
+    const totalFrames = metadata.frameCount;
+    const vPosModulus = totalFrames * 2;
+    const toRemove: number[] = [];
+    
+    if (useVramStrategyRef.current) {
+      // VRAM mode: Only evict frames that have been played
+      // Use relative distance to handle wraparound
+      for (const virtualPos of frameCache.keys()) {
+        const age = (currentPlaybackFrame - virtualPos + vPosModulus) % vPosModulus;
+        // Frame is "old" if it's behind playback (age > 0) but not wrapped around (age < half modulus)
+        if (age > 0 && age < vPosModulus / 2) {
+          toRemove.push(virtualPos);
+        }
       }
+    } else {
+      // RAM mode: Use sliding window with relative distance
+      // Keep frames within [-2, +streamingCacheSize] window
+      for (const virtualPos of frameCache.keys()) {
+        const distance = (virtualPos - currentPlaybackFrame + vPosModulus) % vPosModulus;
+        // distance > vPosModulus - 2 means frame is 1-2 behind (wrapped)
+        // distance <= streamingCacheSize means frame is ahead
+        const isBehind = distance > vPosModulus - 2;
+        const isAhead = distance <= streamingCacheSize;
+        if (!isBehind && !isAhead) {
+          toRemove.push(virtualPos);
+        }
+      }
+    }
+    
+    // Remove evicted frames
+    for (const virtualPos of toRemove) {
+      frameCache.delete(virtualPos);
     }
   }, [streamingCacheSize]);
 
@@ -961,6 +1210,15 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         frameCache.set(streamingDecodePosRef.current, frameData);
         streamingDecodePosRef.current++;
         streamingFramesReadyRef.current = streamingDecodePosRef.current;
+        
+        // In VRAM mode, limit CPU cache to minimal size (5 frames like Android)
+        // This ensures frames are uploaded to GPU and evicted from CPU quickly
+        if (useVramStrategyRef.current) {
+          const maxCpuCache = 5;
+          if (frameCache.size > maxCpuCache) {
+            evictOldFramesFromCache(currentFrameRef.current);
+          }
+        }
         
         // Shift remaining data
         const remaining = state.frameAccumulatorLength - bytesPerLayer;
@@ -1115,9 +1373,8 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
       }
       
-      // Initialize ring buffer
-      const ringSize = Math.min(streamingRingSize, layerCount);
-      initStreamingRingBuffer(gl, width, height, astcFormat, ringSize);
+      // Initialize ring buffer (memory strategy determines actual GPU cache size)
+      initStreamingRingBuffer(gl, width, height, astcFormat, layerCount);
       
       // Initialize streaming mode
       streamingModeRef.current = true;
@@ -1162,7 +1419,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       // Start decompression
       continueStreamingDecompression();
       
-      console.log(`[KTX2PlayerView] ✓ Streaming initialized: ${width}x${height}, ring=${ringSize}, cache=${streamingCacheSize}`);
+      console.log(`[KTX2PlayerView] ✓ Streaming initialized: ${width}x${height}, ring=${streamingRingActualSizeRef.current}, cache=${streamingCacheSize}`);
       return true;
     } catch (error) {
       console.error('[KTX2PlayerView] Streaming load failed:', error);
@@ -1216,8 +1473,33 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
             ensureFrameInRingBuffer(nextFrame);
           }
         }
+      } else if (ramHeavyModeRef.current && ramFrameDataRef.current) {
+        // Non-streaming RAM mode: upload current frame on demand
+        if (currentFrame !== ramUploadedFrameRef.current) {
+          const slot = 0; // Single-buffered
+          const offset = currentFrame * ramBytesPerFrameRef.current;
+          const frameData = new Uint8Array(
+            ramFrameDataRef.current.buffer,
+            ramFrameDataRef.current.byteOffset + offset,
+            ramBytesPerFrameRef.current
+          );
+          
+          gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, textureArrayRef.current);
+          gl2.compressedTexSubImage3D(
+            gl2.TEXTURE_2D_ARRAY,
+            0,
+            0, 0, slot,
+            ramWidthRef.current,
+            ramHeightRef.current,
+            1,
+            ramAstcFormatRef.current,
+            frameData
+          );
+          ramUploadedFrameRef.current = currentFrame;
+        }
+        layerIndex = 0; // Single slot in RAM mode
       } else {
-        // Non-streaming mode: layer index is frame index
+        // Non-streaming VRAM mode: layer index is frame index
         layerIndex = frameUV.layer !== undefined ? frameUV.layer : currentFrame;
       }
       
@@ -1450,9 +1732,19 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         // Check for texture array mode (WebGL2 required)
         if (isTextureArray && gl instanceof WebGL2RenderingContext && arrayProgramRef.current) {
           console.log('[KTX2PlayerView] Using texture array mode');
-          const success = await loadTextureArray(gl, data, metadata);
-          if (!success) {
-            throw new Error('Failed to load texture array');
+          
+          // Check for uncompressed streaming mode (streamMode: true in metadata)
+          if ((metadata as any).streamMode === true) {
+            console.log('[KTX2PlayerView] Detected uncompressed streaming mode');
+            const success = await loadUncompressedStreamingTextureArray(gl, data, metadata);
+            if (!success) {
+              throw new Error('Failed to load uncompressed streaming texture array');
+            }
+          } else {
+            const success = await loadTextureArray(gl, data, metadata);
+            if (!success) {
+              throw new Error('Failed to load texture array');
+            }
           }
           // Add a dummy texture to satisfy the textures.length check
           texturesRef.current.push(gl.createTexture()!);
@@ -1523,7 +1815,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       setPlayerState('error');
       onError?.(error as Error);
     }
-  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, loadStreamingTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
+  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, loadUncompressedStreamingTextureArray, loadStreamingTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
 
   // Effect: Load source when it changes
   useEffect(() => {
