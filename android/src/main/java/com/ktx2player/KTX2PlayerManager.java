@@ -145,6 +145,16 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
     
     /**
+     * Enable streaming mode for texture array playback.
+     * When true: Use streaming decompression with ring buffer (constant memory usage).
+     * When false (default): Load all frames at once.
+     */
+    @ReactProp(name = "stream", defaultBoolean = false)
+    public void setStream(KTX2TextureView view, boolean stream) {
+        view.setStream(stream);
+    }
+    
+    /**
      * Set explicit part URIs for multi-part animations.
      * This is needed for bundled assets where sibling files can't be auto-discovered.
      */

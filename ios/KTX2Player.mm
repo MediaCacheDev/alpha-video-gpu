@@ -2047,15 +2047,42 @@
   _cachedMetadata = metadata;
   _isNativeASTC = isNativeASTC;
   
+  // Check for streaming mode from stream prop (not metadata)
+  BOOL streamMode = self.stream;
+  
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
     // Load the KTX2 file
     NSData *ktx2Data = nil;
+    NSString *filePath = nil;
+    
     if ([sourceUri hasPrefix:@"http://"] || [sourceUri hasPrefix:@"https://"]) {
       ktx2Data = [self loadDataFromURLWithCaching:sourceUri partIndex:0];
+      // For streaming mode, we need the cached file path
+      // Compute it the same way as loadDataFromURLWithCaching
+      if (streamMode) {
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSURL *cachesDir = [[fileManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
+        if (self.cacheKey && self.cacheKey.length > 0) {
+          filePath = [[cachesDir URLByAppendingPathComponent:self.cacheKey] path];
+        } else {
+          NSURL *ktx2CacheDir = [cachesDir URLByAppendingPathComponent:@"ktx2-cache"];
+          const char *urlCString = [sourceUri UTF8String];
+          unsigned long hash = 5381;
+          int c;
+          while ((c = *urlCString++)) {
+            hash = ((hash << 5) + hash) + c;
+          }
+          NSString *cacheFileName = [NSString stringWithFormat:@"%016lx.ktx2", hash];
+          filePath = [[ktx2CacheDir URLByAppendingPathComponent:cacheFileName] path];
+        }
+        NSLog(@"KTX2PlayerView: Streaming mode - using cached file path: %@", filePath);
+      }
     } else if ([sourceUri hasPrefix:@"file://"]) {
       NSURL *fileURL = [NSURL URLWithString:sourceUri];
+      filePath = [fileURL path];
       ktx2Data = [NSData dataWithContentsOfURL:fileURL];
     } else {
+      filePath = sourceUri;
       ktx2Data = [NSData dataWithContentsOfFile:sourceUri];
     }
     
@@ -2078,14 +2105,27 @@
     uint64_t level0Length = *(uint64_t *)(bytes + 88);
     uint64_t level0UncompressedLength = *(uint64_t *)(bytes + 96);
     
-    NSLog(@"KTX2PlayerView: Texture array: %ux%u, %u layers, supercompression=%u",
-          width, height, layerCount, supercompressionScheme);
+    NSLog(@"KTX2PlayerView: Texture array: %ux%u, %u layers, supercompression=%u, streamMode=%d",
+          width, height, layerCount, supercompressionScheme, streamMode);
     
-    // Extract ASTC data
+    // Check for internal zstd streaming mode
+    if (streamMode && supercompressionScheme == 2 && filePath) {
+      NSLog(@"KTX2PlayerView: Using internal zstd streaming mode");
+      [self loadInternalZstdStreamingTextureArray:filePath
+                                            width:width
+                                           height:height
+                                       layerCount:layerCount
+                                     level0Offset:level0Offset
+                                     level0Length:level0Length
+                                         metadata:metadata];
+      return;
+    }
+    
+    // Extract ASTC data (non-streaming path)
     NSData *astcData = nil;
     
     if (supercompressionScheme == 2) {
-      // Zstd compressed - decompress using zstd
+      // Zstd compressed - decompress using zstd (all at once)
       const void *compressedData = bytes + level0Offset;
       size_t compressedSize = (size_t)level0Length;
       size_t decompressedSize = (size_t)level0UncompressedLength;
@@ -2201,6 +2241,180 @@
       }
     });
   });
+}
+
+#pragma mark - Internal Zstd Streaming
+
+/**
+ * Load a KTX2 texture array with internal zstd compression using streaming decompression.
+ * This is similar to loadStreamingKTX2WithSource but for internal zstd (supercompressionScheme=2)
+ * where the KTX2 header is uncompressed and only level0 data is zstd compressed.
+ */
+- (void)loadInternalZstdStreamingTextureArray:(NSString *)filePath
+                                        width:(uint32_t)width
+                                       height:(uint32_t)height
+                                   layerCount:(uint32_t)layerCount
+                                 level0Offset:(uint64_t)level0Offset
+                                 level0Length:(uint64_t)level0Length
+                                     metadata:(NSDictionary *)metadata
+{
+  NSLog(@"KTX2PlayerView: Starting internal zstd streaming: %@", filePath);
+  NSLog(@"KTX2PlayerView: Internal zstd: %ux%u, %u layers, offset=%llu, compressedSize=%llu",
+        width, height, layerCount, level0Offset, level0Length);
+  
+  // Open file and mmap only the compressed data portion
+  int fd = open([filePath UTF8String], O_RDONLY);
+  if (fd < 0) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self notifyError:@"Failed to open file for internal zstd streaming"];
+    });
+    return;
+  }
+  
+  // Get file size for validation
+  struct stat st;
+  if (fstat(fd, &st) < 0) {
+    close(fd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self notifyError:@"Failed to stat file"];
+    });
+    return;
+  }
+  
+  // Mmap the compressed data portion (page-aligned)
+  long pageSize = sysconf(_SC_PAGE_SIZE);
+  off_t alignedOffset = (level0Offset / pageSize) * pageSize;
+  size_t offsetAdjustment = level0Offset - alignedOffset;
+  size_t mmapLength = level0Length + offsetAdjustment;
+  
+  void *mmapData = mmap(NULL, mmapLength, PROT_READ, MAP_PRIVATE, fd, alignedOffset);
+  if (mmapData == MAP_FAILED) {
+    close(fd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self notifyError:@"Failed to mmap internal zstd data"];
+    });
+    return;
+  }
+  
+  // Advise kernel for sequential access
+  madvise(mmapData, mmapLength, MADV_SEQUENTIAL);
+  
+  // Create ZSTD_DStream for streaming decompression
+  ZSTD_DStream *dstream = ZSTD_createDStream();
+  if (!dstream) {
+    munmap(mmapData, mmapLength);
+    close(fd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self notifyError:@"Failed to create ZSTD_DStream"];
+    });
+    return;
+  }
+  
+  size_t initResult = ZSTD_initDStream(dstream);
+  if (ZSTD_isError(initResult)) {
+    ZSTD_freeDStream(dstream);
+    munmap(mmapData, mmapLength);
+    close(fd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self notifyError:@"Failed to init ZSTD_DStream"];
+    });
+    return;
+  }
+  
+  // Calculate bytes per layer
+  uint32_t blocksX = (width + 3) / 4;
+  uint32_t blocksY = (height + 3) / 4;
+  uint32_t bytesPerLayer = blocksX * blocksY * 16;
+  
+  // Determine memory strategy
+  BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
+                         [self.memoryStrategy isEqualToString:@"auto"];
+  NSInteger gpuCacheSize = useVramStrategy ? 
+      MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
+      MIN(self.streamingRingSize, (NSInteger)layerCount);
+  
+  NSLog(@"KTX2PlayerView: Internal zstd streaming params: strategy=%@, gpuCache=%ld",
+        self.memoryStrategy, (long)gpuCacheSize);
+  
+  // Store streaming state
+  const uint8_t *compressedDataPtr = (const uint8_t *)mmapData + offsetAdjustment;
+  
+  // Setup on main thread
+  dispatch_sync(dispatch_get_main_queue(), ^{
+    // Apply metadata
+    self.totalFrames = layerCount;
+    self.framesPerRow = 1;
+    self.framesPerPart = layerCount;
+    self.partCount = 1;
+    self.frameWidth = width;
+    self.frameHeight = height;
+    self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+    self.frameInterval = 1.0 / self.frameRate;
+    
+    self->_useTextureArray = YES;
+    self->_textureArrayLayerCount = layerCount;
+    self->_streamingRingBufferMode = YES;
+    self->_streamingRingBufferSize = gpuCacheSize;
+    self->_useVramStrategy = useVramStrategy;
+    
+    // Initialize ring buffer tracking
+    self->_ringSlots = [NSMutableArray arrayWithCapacity:gpuCacheSize];
+    for (NSInteger i = 0; i < gpuCacheSize; i++) {
+      [self->_ringSlots addObject:@(-1)];
+    }
+    self->_frameCache = [NSMutableDictionary dictionary];
+    self->_decoderPosition = 0;
+    self->_decoderLoopIteration = 0;
+    self->_playbackLoopIteration = 0;
+    
+    // Store streaming state - internal zstd doesn't need header skip
+    self->_dstream = dstream;
+    self->_compressedData = [NSData dataWithBytesNoCopy:(void *)compressedDataPtr 
+                                                 length:level0Length 
+                                           freeWhenDone:NO];
+    self->_compressedDataPos = 0;
+    self->_frameAccumulator = [NSMutableData data];
+    self->_streamBytesPerLayer = bytesPerLayer;
+    self->_streamLevel0Offset = 0;  // No header to skip - we start at level0 data directly
+    self->_streamHeaderSkipped = YES;  // Header already skipped
+    
+    // Store mmap info for cleanup and loop restart
+    self->_mmapFd = fd;
+    self->_mmapData = mmapData;
+    self->_mmapSize = mmapLength;
+    
+    // Create texture array with ring buffer size
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
+                                                                                         width:width
+                                                                                        height:height
+                                                                                     mipmapped:NO];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = gpuCacheSize;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    
+    self->_textureArray = [self.device newTextureWithDescriptor:descriptor];
+    
+    if (!self->_textureArray) {
+      [self notifyError:@"Failed to create texture array for internal zstd streaming"];
+      return;
+    }
+    
+    NSLog(@"KTX2PlayerView: Created internal zstd streaming texture array: %ux%u, %ld GPU slots",
+          width, height, (long)gpuCacheSize);
+    
+    // Pre-decode initial frames
+    [self decodeFramesAhead:0];
+    
+    self->_isSourceLoaded = YES;
+    self->_isSourceLoading = NO;
+    [self notifyStateChange:@"ready"];
+    
+    if (self.autoPlay && !self.reactPaused) {
+      [self play];
+    }
+  });
+  
+  NSLog(@"KTX2PlayerView: Internal zstd streaming setup complete");
 }
 
 - (void)loadPartTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri isNativeASTC:(BOOL)isNativeASTC

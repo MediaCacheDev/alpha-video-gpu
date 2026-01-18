@@ -64,6 +64,14 @@ export interface KTX2PlayerViewProps {
    * - ram: small GPU ring buffer, larger CPU cache (lower VRAM usage)
    */
   memoryStrategy?: 'auto' | 'vram' | 'ram';
+  
+  /**
+   * Enable streaming mode for texture array playback.
+   * When true: Use streaming decompression with ring buffer (constant memory usage).
+   * When false (default): Load all frames at once.
+   * Only applies to packingMode='array' files.
+   */
+  stream?: boolean;
 }
 
 interface FrameUV {
@@ -274,6 +282,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   streamingCacheSize = 60,
   streamingPrefetchAhead = 30,
   memoryStrategy = 'auto',
+  stream = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const glRef = useRef<WebGLRenderingContext | WebGL2RenderingContext | null>(null);
@@ -314,6 +323,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   const streamingLayerCountRef = useRef<number>(0);
   const streamingLevel0OffsetRef = useRef<number>(0);
   const streamingAstcFormatRef = useRef<number>(0);
+  const streamingIsInternalZstdRef = useRef<boolean>(false); // true for internal zstd, false for outer .zst
   
   // RAM mode state (non-streaming texture arrays with memoryStrategy='ram')
   const ramHeavyModeRef = useRef<boolean>(false);
@@ -1006,6 +1016,199 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     }
   }, [streamingRingSize, initStreamingRingBuffer]);
 
+  // Load internal zstd streaming texture array (.ktx2 with streamMode: true and supercompressionScheme=2)
+  const loadInternalZstdStreamingTextureArray = useCallback(async (
+    gl: WebGL2RenderingContext,
+    ktx2Data: Uint8Array,
+    metadata: Metadata
+  ): Promise<boolean> => {
+    try {
+      console.log('[KTX2PlayerView] Starting internal zstd streaming playback...');
+      
+      const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
+      
+      const vkFormat = view.getUint32(12, true);
+      const width = view.getUint32(20, true);
+      const height = view.getUint32(24, true);
+      const layerCount = view.getUint32(32, true);
+      
+      // Level 0 index
+      const level0Offset = Number(view.getBigUint64(80, true));
+      const level0Length = Number(view.getBigUint64(88, true));
+      const level0UncompressedLength = Number(view.getBigUint64(96, true));
+      
+      // Calculate bytes per layer (ASTC 4x4)
+      const blocksX = Math.ceil(width / 4);
+      const blocksY = Math.ceil(height / 4);
+      const bytesPerLayer = blocksX * blocksY * 16;
+      
+      console.log(`[KTX2PlayerView] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
+      
+      // Check for ASTC support
+      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
+      if (!astcExt) {
+        throw new Error('ASTC texture compression not supported');
+      }
+      
+      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
+      if (vkFormat === 158) {
+        astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      }
+      
+      // Initialize ZSTD decoder
+      if (!zstdDecoderRef.current) {
+        zstdDecoderRef.current = new ZSTDDecoder();
+        await zstdDecoderRef.current.init();
+      }
+      
+      // Get compressed data view
+      const compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
+      
+      // Initialize ring buffer
+      initStreamingRingBuffer(gl, width, height, astcFormat, layerCount);
+      
+      // Store references for streaming
+      streamingModeRef.current = true;
+      streamingIsInternalZstdRef.current = true; // Mark as internal zstd streaming
+      streamingLayerCountRef.current = layerCount;
+      streamingLevel0OffsetRef.current = level0Offset;
+      streamingFrameCacheRef.current = new Map();
+      streamingDecodePosRef.current = 0;
+      streamingFramesReadyRef.current = 0;
+      
+      // Store compressed chunks for streaming decompression
+      streamingCompressedChunksRef.current = [compressedData];
+      
+      // Initialize streaming decompression state
+      const generator = zstdDecoderRef.current.decodeStreaming(streamingCompressedChunksRef.current);
+      streamingDecompressStateRef.current = {
+        generator,
+        frameAccumulator: new Uint8Array(0),
+        totalBytesDecoded: 0,
+        totalFramesDecoded: 0,
+      };
+      
+      // Pre-decode initial frames
+      const actualRingSize = streamingRingActualSizeRef.current;
+      const prefetchCount = Math.min(streamingPrefetchAhead, layerCount);
+      
+      console.log(`[KTX2PlayerView] Pre-decoding ${prefetchCount} frames...`);
+      
+      for (let i = 0; i < prefetchCount && !streamingCancelledRef.current; i++) {
+        const frameData = await decodeNextFrame();
+        if (!frameData) break;
+        
+        streamingFrameCacheRef.current.set(i, frameData);
+        streamingDecodePosRef.current = i + 1;
+        streamingFramesReadyRef.current = i + 1;
+        
+        // Upload to ring buffer if within ring size
+        if (i < actualRingSize) {
+          gl.bindTexture(gl.TEXTURE_2D_ARRAY, streamingRingBufferRef.current);
+          gl.compressedTexSubImage3D(
+            gl.TEXTURE_2D_ARRAY,
+            0, 0, 0, i,
+            width, height, 1,
+            astcFormat,
+            frameData
+          );
+          streamingRingSlotsRef.current[i] = i;
+        }
+      }
+      
+      // Setup frame UVs
+      const uvs: FrameUV[] = [];
+      for (let i = 0; i < metadata.frameCount; i++) {
+        uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
+      }
+      frameUVsRef.current = uvs;
+      
+      // Use ring buffer as texture array
+      textureArrayRef.current = streamingRingBufferRef.current;
+      useTextureArrayRef.current = true;
+      
+      // Start background decompression
+      startBackgroundDecompression();
+      
+      console.log(`[KTX2PlayerView] ✓ Internal zstd streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
+      return true;
+    } catch (error) {
+      console.error('[KTX2PlayerView] Internal zstd streaming load failed:', error);
+      return false;
+    }
+  }, [streamingRingSize, streamingPrefetchAhead, initStreamingRingBuffer]);
+
+  // Decode next frame from streaming decompression
+  const decodeNextFrame = useCallback(async (): Promise<Uint8Array | null> => {
+    const state = streamingDecompressStateRef.current;
+    if (!state || !state.generator) return null;
+    
+    const bytesPerLayer = streamingBytesPerLayerRef.current;
+    
+    // Accumulate decompressed data until we have a full frame
+    while (state.frameAccumulator.length < bytesPerLayer) {
+      const result = state.generator.next();
+      if (result.done) {
+        // Decompression complete
+        if (state.frameAccumulator.length >= bytesPerLayer) {
+          break;
+        }
+        return null;
+      }
+      
+      const chunk = result.value as Uint8Array;
+      if (chunk && chunk.length > 0) {
+        // Append to accumulator
+        const newAccumulator = new Uint8Array(state.frameAccumulator.length + chunk.length);
+        newAccumulator.set(state.frameAccumulator);
+        newAccumulator.set(chunk, state.frameAccumulator.length);
+        state.frameAccumulator = newAccumulator;
+      }
+    }
+    
+    if (state.frameAccumulator.length >= bytesPerLayer) {
+      // Extract frame
+      const frameData = state.frameAccumulator.slice(0, bytesPerLayer);
+      state.frameAccumulator = state.frameAccumulator.slice(bytesPerLayer);
+      state.totalFramesDecoded++;
+      return frameData;
+    }
+    
+    return null;
+  }, []);
+
+  // Background decompression for internal zstd streaming
+  const startBackgroundDecompression = useCallback(() => {
+    const decompressLoop = async () => {
+      const layerCount = streamingLayerCountRef.current;
+      
+      while (!streamingCancelledRef.current && streamingDecodePosRef.current < layerCount) {
+        // Check if we need more frames
+        const currentFrame = currentFrameRef.current;
+        const framesAhead = streamingDecodePosRef.current - currentFrame;
+        
+        if (framesAhead < streamingPrefetchAhead) {
+          const frameData = await decodeNextFrame();
+          if (frameData) {
+            const frameIndex = streamingDecodePosRef.current;
+            streamingFrameCacheRef.current.set(frameIndex, frameData);
+            streamingDecodePosRef.current++;
+            streamingFramesReadyRef.current = streamingDecodePosRef.current;
+          } else {
+            // Decompression complete or error
+            break;
+          }
+        } else {
+          // Wait a bit before checking again
+          await new Promise(resolve => setTimeout(resolve, 16));
+        }
+      }
+    };
+    
+    // Start decompression in background
+    decompressLoop();
+  }, [streamingPrefetchAhead, decodeNextFrame]);
+
   // Ensure frame is in ring buffer (upload from cache if needed)
   const ensureFrameInRingBuffer = useCallback((frameIndex: number): number => {
     const gl = glRef.current as WebGL2RenderingContext;
@@ -1249,21 +1452,40 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     
     // Re-create decompression generator
     const compressedChunks = streamingCompressedChunksRef.current;
-    if (compressedChunks && zstdDecoderRef.current?.decodeStreaming) {
+    if (compressedChunks && compressedChunks.length > 0 && zstdDecoderRef.current?.decodeStreaming) {
       const generator = zstdDecoderRef.current.decodeStreaming(compressedChunks);
       
       const state = streamingDecompressStateRef.current;
       if (state) {
         state.generator = generator;
-        state.reachedEnd = false;
-        state.frameAccumulatorLength = 0;
-        state.bytesToSkipForHeader = streamingLevel0OffsetRef.current;
+        
+        if (streamingIsInternalZstdRef.current) {
+          // Internal zstd streaming format - reset state for decodeNextFrame
+          state.frameAccumulator = new Uint8Array(0);
+          state.totalBytesDecoded = 0;
+          state.totalFramesDecoded = 0;
+        } else {
+          // Outer zstd streaming format - reset state for continueStreamingDecompression
+          if ('reachedEnd' in state) {
+            state.reachedEnd = false;
+          }
+          if ('frameAccumulatorLength' in state) {
+            state.frameAccumulatorLength = 0;
+          }
+          if ('bytesToSkipForHeader' in state) {
+            state.bytesToSkipForHeader = streamingLevel0OffsetRef.current;
+          }
+        }
       }
       
-      // Restart decompression
-      continueStreamingDecompression();
+      // Restart decompression using appropriate method
+      if (streamingIsInternalZstdRef.current) {
+        startBackgroundDecompression();
+      } else {
+        continueStreamingDecompression();
+      }
     }
-  }, [continueStreamingDecompression]);
+  }, [continueStreamingDecompression, startBackgroundDecompression]);
 
   // Load streaming texture array (.ktx2.zst) with progressive decompression
   const loadStreamingTextureArray = useCallback(async (
@@ -1377,6 +1599,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       
       // Initialize streaming mode
       streamingModeRef.current = true;
+      streamingIsInternalZstdRef.current = false; // Mark as outer zstd streaming
       streamingFrameCacheRef.current = new Map();
       streamingDecodePosRef.current = 0;
       streamingFramesReadyRef.current = 0;
@@ -1732,12 +1955,26 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         if (isTextureArray && gl instanceof WebGL2RenderingContext && arrayProgramRef.current) {
           console.log('[KTX2PlayerView] Using texture array mode');
           
-          // Check for uncompressed streaming mode (streamMode: true in metadata)
-          if ((metadata as any).streamMode === true) {
-            console.log('[KTX2PlayerView] Detected uncompressed streaming mode');
-            const success = await loadUncompressedStreamingTextureArray(gl, data, metadata);
-            if (!success) {
-              throw new Error('Failed to load uncompressed streaming texture array');
+          // Check for streaming mode (stream prop)
+          if (stream) {
+            // Check supercompressionScheme to determine streaming type
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const supercompressionScheme = view.getUint32(44, true);
+            
+            if (supercompressionScheme === 2) {
+              console.log('[KTX2PlayerView] Using internal zstd streaming mode (stream=true)');
+              const success = await loadInternalZstdStreamingTextureArray(gl, data, metadata);
+              if (!success) {
+                throw new Error('Failed to load internal zstd streaming texture array');
+              }
+            } else if (supercompressionScheme === 0) {
+              console.log('[KTX2PlayerView] Using uncompressed streaming mode (stream=true)');
+              const success = await loadUncompressedStreamingTextureArray(gl, data, metadata);
+              if (!success) {
+                throw new Error('Failed to load uncompressed streaming texture array');
+              }
+            } else {
+              throw new Error(`Unsupported supercompressionScheme for streaming: ${supercompressionScheme}`);
             }
           } else {
             const success = await loadTextureArray(gl, data, metadata);
@@ -1814,7 +2051,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       setPlayerState('error');
       onError?.(error as Error);
     }
-  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, loadUncompressedStreamingTextureArray, loadStreamingTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
+  }, [initGL, detectTextureFormat, loadNativeASTCKTX2, transcodeKTX2, loadTextureArray, loadUncompressedStreamingTextureArray, loadInternalZstdStreamingTextureArray, loadStreamingTextureArray, calculateFrameUVs, render, autoPlay, setPlayerState, startAnimationLoop, onError, parts]);
 
   // Effect: Load source when it changes
   useEffect(() => {

@@ -1352,4 +1352,108 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWith
     return JNI_TRUE;
 }
 
+/**
+ * Initialize streaming decompression for internal KTX2 zstd (supercompressionScheme=2).
+ * Unlike outer .zst files, only the level0 data is compressed - header is uncompressed.
+ * 
+ * @param file_path Path to the .ktx2 file
+ * @param data_offset Offset to the compressed level0 data (from KTX2 header)
+ * @param compressed_size Size of compressed data
+ * @return Stream ID (> 0), or 0 on error
+ */
+JNIEXPORT jlong JNICALL
+Java_com_ktx2player_KTX2PlayerModule_nativeInternalZstdStreamingInit(JNIEnv *env, jclass clazz,
+                                                                       jstring file_path,
+                                                                       jlong data_offset,
+                                                                       jlong compressed_size) {
+    const char* path = env->GetStringUTFChars(file_path, nullptr);
+    if (!path) {
+        LOGE("Failed to get file path string");
+        return 0;
+    }
+    
+    // Create new per-instance state
+    auto state = std::make_unique<StreamingDecompressState>();
+    
+    // Open file
+    state->fd = open(path, O_RDONLY);
+    if (state->fd < 0) {
+        LOGE("Failed to open file for internal zstd: %s (errno=%d)", path, errno);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Get file size for validation
+    struct stat st;
+    if (fstat(state->fd, &st) < 0) {
+        LOGE("Failed to stat file: %s", path);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Validate offset and size
+    if (data_offset + compressed_size > st.st_size) {
+        LOGE("Internal zstd data extends beyond file: offset=%lld, size=%lld, fileSize=%lld",
+             (long long)data_offset, (long long)compressed_size, (long long)st.st_size);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Memory-map only the compressed data portion
+    // Use page-aligned offset for mmap
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    off_t aligned_offset = (data_offset / page_size) * page_size;
+    size_t offset_adjustment = data_offset - aligned_offset;
+    size_t mmap_length = compressed_size + offset_adjustment;
+    
+    state->mmap_ptr = mmap(nullptr, mmap_length, PROT_READ, MAP_PRIVATE, state->fd, aligned_offset);
+    if (state->mmap_ptr == MAP_FAILED) {
+        LOGE("Failed to mmap internal zstd data: %s (errno=%d)", path, errno);
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    state->mmap_size = mmap_length;
+    
+    // Advise kernel we'll read sequentially
+    madvise(state->mmap_ptr, state->mmap_size, MADV_SEQUENTIAL);
+    
+    // Set up unified input pointer (adjusted for page alignment)
+    state->input_data = static_cast<const uint8_t*>(state->mmap_ptr) + offset_adjustment;
+    state->input_size = compressed_size;
+    state->input_pos = 0;
+    
+    // Create decompression stream
+    state->dstream = ZSTD_createDStream();
+    if (!state->dstream) {
+        LOGE("Failed to create ZSTD_DStream for internal zstd");
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    size_t initResult = ZSTD_initDStream(state->dstream);
+    if (ZSTD_isError(initResult)) {
+        LOGE("Failed to init ZSTD_DStream for internal zstd: %s", ZSTD_getErrorName(initResult));
+        env->ReleaseStringUTFChars(file_path, path);
+        return 0;
+    }
+    
+    // Allocate output buffer
+    state->output.resize(64 * 1024);
+    
+    // Generate unique stream ID and store state
+    jlong streamId = g_next_stream_id.fetch_add(1);
+    
+    LOGI("Internal zstd streaming initialized: stream %lld, offset=%lld, size=%lld from %s", 
+         (long long)streamId, (long long)data_offset, (long long)compressed_size, path);
+    
+    env->ReleaseStringUTFChars(file_path, path);
+    
+    {
+        std::lock_guard<std::mutex> lock(g_streaming_mutex);
+        g_streaming_states[streamId] = std::move(state);
+    }
+    
+    return streamId;
+}
+
 } // extern "C"

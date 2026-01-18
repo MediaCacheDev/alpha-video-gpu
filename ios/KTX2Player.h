@@ -30,6 +30,7 @@
 @property (nonatomic, assign) NSInteger streamingCacheSize;     // CPU frame cache size (RAM)
 @property (nonatomic, assign) NSInteger streamingPrefetchAhead; // Frames to decode ahead of playback
 @property (nonatomic, copy) NSString *memoryStrategy;           // "auto", "vram", "ram"
+@property (nonatomic, assign) BOOL stream;                      // Enable streaming mode for texture arrays
 
 // Animation properties
 @property (nonatomic, assign) NSInteger currentFrame;

@@ -55,6 +55,7 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     // Streaming decompression methods (per-instance, returns/accepts stream ID)
     public static native long nativeStreamingDecompressInit(byte[] compressedData);
     public static native long nativeStreamingDecompressInitFromFile(String filePath);  // Memory-mapped, preferred
+    public static native long nativeInternalZstdStreamingInit(String filePath, long dataOffset, long compressedSize);  // Internal KTX2 zstd (supercompressionScheme=2)
     public static native byte[] nativeStreamingDecompressContinue(long streamId, int maxOutputBytes);
     public static native long nativeStreamingDecompressContinueToBuffer(long streamId, java.nio.ByteBuffer outputBuffer, int maxOutputBytes);  // Zero-copy
     public static native void nativeStreamingDecompressEnd(long streamId);

@@ -166,6 +166,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     // - ram: Decoded frames in RAM, upload per-frame (lower VRAM usage)
     private String memoryStrategy = "auto";
     
+    // Stream prop - when true, use streaming decompression for texture arrays
+    private boolean streamProp = false;
+    
     // Threading
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private ExecutorService executor;
@@ -460,6 +463,16 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     }
     
     /**
+     * Set streaming mode for texture array playback.
+     * When true: Use streaming decompression with ring buffer (constant memory usage).
+     * When false (default): Load all frames at once.
+     */
+    public void setStream(boolean stream) {
+        this.streamProp = stream;
+        Log.d(TAG, "setStream: " + stream);
+    }
+    
+    /**
      * Set paused state from React prop.
      * When paused, playback stops but resources are retained.
      */
@@ -638,15 +651,19 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             return;
         }
         
-        // Check for internal streaming mode with Zstd compression (streamMode: true in metadata)
-        if (metadataStreamMode && useTextureArray) {
+        // Check for streaming mode with texture arrays (stream prop from React)
+        if (streamProp && useTextureArray) {
             // Check supercompressionScheme from KTX2 header
             int supercompressionScheme = getSupercompressionScheme(fileData);
-            Log.i(TAG, "Internal streaming mode detected, supercompression=" + supercompressionScheme);
+            Log.i(TAG, "Streaming mode enabled (stream=true), supercompression=" + supercompressionScheme);
             
             if (supercompressionScheme == 2) {
-                // Internal Zstd compression - use streaming decompression
-                playStreamingAnimation(localPath);
+                // Internal Zstd compression - use internal zstd streaming (not outer .zst)
+                playInternalZstdStreamingAnimation(localPath, fileData);
+                return;
+            } else if (supercompressionScheme == 0) {
+                // Uncompressed - use mmap streaming
+                playUncompressedStreamingAnimation(localPath);
                 return;
             } else {
                 Log.w(TAG, "Unsupported supercompression for streaming: " + supercompressionScheme + ", falling back to non-stream");
@@ -1762,6 +1779,391 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         Log.i(TAG, "Uncompressed streaming animation ended");
+    }
+    
+    /**
+     * Play streaming animation from KTX2 file with internal zstd compression (supercompressionScheme=2).
+     * Unlike outer .zst files, only the level0 data is compressed - header is uncompressed.
+     * This allows streaming decompression without parsing the header from the compressed stream.
+     * 
+     * @param localPath Path to the .ktx2 file
+     * @param headerData Already-read file data containing the KTX2 header (used to get level0 offset/size)
+     */
+    private void playInternalZstdStreamingAnimation(String localPath, byte[] headerData) {
+        Log.i(TAG, "Starting internal zstd streaming animation: " + localPath);
+        
+        // Parse KTX2 header to get level0 info
+        ByteBuffer header = ByteBuffer.wrap(headerData).order(ByteOrder.LITTLE_ENDIAN);
+        int pixelWidth = header.getInt(20);
+        int pixelHeight = header.getInt(24);
+        int layerCount = header.getInt(32);
+        if (layerCount == 0) layerCount = 1;
+        long level0Offset = header.getLong(80);
+        long level0Length = header.getLong(88);  // Compressed size
+        long level0UncompressedLength = header.getLong(96);
+        
+        Log.i(TAG, "Internal zstd: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + " layers, " +
+              "compressed=" + level0Length + ", uncompressed=" + level0UncompressedLength);
+        
+        // Calculate bytes per layer
+        int blocksX = (pixelWidth + 3) / 4;
+        int blocksY = (pixelHeight + 3) / 4;
+        int bytesPerLayer = blocksX * blocksY * 16;
+        
+        // Verify uncompressed size matches expected
+        long expectedUncompressed = (long)bytesPerLayer * layerCount;
+        if (level0UncompressedLength != expectedUncompressed) {
+            Log.w(TAG, "Uncompressed size mismatch: header=" + level0UncompressedLength + ", expected=" + expectedUncompressed);
+        }
+        
+        // Get file path for mmap
+        String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
+        
+        // Initialize internal zstd streaming decompression
+        final long[] streamId = {KTX2PlayerModule.nativeInternalZstdStreamingInit(filePath, level0Offset, level0Length)};
+        if (streamId[0] == 0) {
+            mainHandler.post(() -> notifyError("Failed to initialize internal zstd streaming"));
+            return;
+        }
+        
+        // Use texture array mode
+        useTextureArray = true;
+        totalFrames = layerCount;
+        frameWidth = pixelWidth;
+        frameHeight = pixelHeight;
+        
+        // Check for ASTC support
+        boolean useAstc = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
+        
+        // Determine memory strategy
+        final boolean useVramStrategy = "vram".equals(memoryStrategy);
+        final int GPU_CACHE_SIZE = useVramStrategy ? configStreamingCacheSize : configStreamingRingSize;
+        final int CPU_CACHE_SIZE = useVramStrategy ? 5 : configStreamingCacheSize;
+        final int PREFETCH_AHEAD = configStreamingPrefetchAhead;
+        
+        Log.i(TAG, "Internal zstd streaming params: strategy=" + memoryStrategy + 
+              ", gpuCache=" + GPU_CACHE_SIZE + ", cpuCache=" + CPU_CACHE_SIZE + 
+              ", prefetch=" + PREFETCH_AHEAD);
+        
+        // Create texture array
+        int textureLayerCount = Math.min(GPU_CACHE_SIZE, layerCount);
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, textureLayerCount, useAstc);
+        if (textureArrayId == 0) {
+            mainHandler.post(() -> notifyError("Failed to create texture array for internal zstd streaming"));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        textureArrayLayerCount = textureLayerCount;
+        
+        Log.i(TAG, "Created internal zstd streaming texture array: ID=" + textureArrayId + 
+              ", " + pixelWidth + "x" + pixelHeight + ", " + textureLayerCount + " GPU slots");
+        
+        streamingRingBufferMode = true;
+        streamingRingSize = textureLayerCount;
+        
+        // Initialize shaders
+        if (!initShaders()) {
+            mainHandler.post(() -> notifyError("Failed to initialize shaders"));
+            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            return;
+        }
+        
+        // Track ring buffer slots
+        int[] ringSlots = new int[textureLayerCount];
+        Arrays.fill(ringSlots, -1);
+        
+        // Decompression state - NO header to skip since we start at level0 data directly
+        final int[] decodePos = {0};
+        final boolean[] decompressEnded = {false};
+        
+        // Buffer for decompression
+        final int bufferSize = 64 * 1024;
+        final ByteBuffer decompressBuffer = ByteBuffer.allocateDirect(bufferSize);
+        
+        // Frame accumulator and cache
+        final ByteBuffer frameAccumulatorBuffer;
+        final java.util.Queue<byte[]> bufferPool;
+        final java.util.Map<Integer, byte[]> frameCache;
+        
+        if (useVramStrategy) {
+            frameAccumulatorBuffer = ByteBuffer.allocateDirect(bytesPerLayer + bufferSize);
+            bufferPool = null;
+            frameCache = new java.util.concurrent.ConcurrentHashMap<>();
+        } else {
+            frameAccumulatorBuffer = null;
+            final int POOL_SIZE = CPU_CACHE_SIZE + 5;
+            bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
+            for (int i = 0; i < POOL_SIZE; i++) {
+                bufferPool.offer(new byte[bytesPerLayer]);
+            }
+            frameCache = new java.util.concurrent.ConcurrentHashMap<>();
+        }
+        
+        ByteArrayOutputStream frameAccumulator = useVramStrategy ? null : new ByteArrayOutputStream(bytesPerLayer + bufferSize);
+        
+        final int finalWidth = pixelWidth;
+        final int finalHeight = pixelHeight;
+        final int finalBytesPerLayer = bytesPerLayer;
+        final int finalLayerCount = layerCount;
+        final boolean finalUseAstc = useAstc;
+        final int finalGpuCacheSize = textureLayerCount;
+        final String finalFilePath = filePath;
+        final long finalLevel0Offset = level0Offset;
+        final long finalLevel0Length = level0Length;
+        
+        mSourceLoaded = true;
+        mainHandler.post(() -> notifyStateChange("ready"));
+        
+        if (autoPlay && !isPaused.get()) {
+            isPlaying.set(true);
+            mainHandler.post(() -> notifyStateChange("playing"));
+        }
+        
+        // Track loop iterations for wrap-around prefetching
+        final int[] decoderLoopIteration = {0};
+        final int vPosModulus = 2 * totalFrames;
+        
+        // Helper: Decode frames into cache
+        java.util.function.IntConsumer decodeFrames = (virtualPlaybackPos) -> {
+            int currentVirtualDecodePos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+            int framesToDecode = (currentVirtualDecodePos - virtualPlaybackPos + vPosModulus) % vPosModulus;
+            int targetFramesAhead = PREFETCH_AHEAD;
+            
+            while (framesToDecode < targetFramesAhead) {
+                if (decompressEnded[0]) {
+                    if (!loop) break;
+                    // Restart decompression for next loop
+                    decoderLoopIteration[0]++;
+                    decodePos[0] = 0;
+                    decompressEnded[0] = false;
+                    if (useVramStrategy) {
+                        frameAccumulatorBuffer.clear();
+                    } else {
+                        frameAccumulator.reset();
+                    }
+                    KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                    streamId[0] = KTX2PlayerModule.nativeInternalZstdStreamingInit(finalFilePath, finalLevel0Offset, finalLevel0Length);
+                    Log.i(TAG, "Internal zstd prefetch wrap-around: restarting for loop " + decoderLoopIteration[0]);
+                    continue;
+                }
+                
+                int accumulatorSize = useVramStrategy ? frameAccumulatorBuffer.position() : frameAccumulator.size();
+                
+                // Decompress until we have a full frame
+                while (accumulatorSize < finalBytesPerLayer && !decompressEnded[0]) {
+                    decompressBuffer.clear();
+                    long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    if (result == -1) { decompressEnded[0] = true; break; }
+                    int status = (int)(result >> 32);
+                    int bytesWritten = (int)(result & 0xFFFFFFFFL);
+                    if (bytesWritten > 0) {
+                        decompressBuffer.limit(bytesWritten);
+                        decompressBuffer.position(0);
+                        if (useVramStrategy) {
+                            frameAccumulatorBuffer.put(decompressBuffer);
+                        } else {
+                            byte[] temp = new byte[bytesWritten];
+                            decompressBuffer.get(temp);
+                            frameAccumulator.write(temp, 0, temp.length);
+                        }
+                        accumulatorSize += bytesWritten;
+                    }
+                    if (status == 1) { decompressEnded[0] = true; break; }
+                }
+                
+                if (accumulatorSize >= finalBytesPerLayer) {
+                    int virtualPos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+                    int actualFrame = decodePos[0];
+                    decodePos[0]++;
+                    
+                    if (useVramStrategy) {
+                        int gpuSlot = actualFrame % finalGpuCacheSize;
+                        int slotCurrentVPos = ringSlots[gpuSlot];
+                        int slotAge = (virtualPlaybackPos - slotCurrentVPos + vPosModulus) % vPosModulus;
+                        boolean slotIsOld = slotAge > 0 && slotAge < vPosModulus / 2;
+                        boolean canOverwrite = (slotCurrentVPos == -1) || (slotCurrentVPos == virtualPos) || slotIsOld;
+                        
+                        if (canOverwrite && ringSlots[gpuSlot] != virtualPos) {
+                            frameAccumulatorBuffer.flip();
+                            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
+                                textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc);
+                            if (uploaded) {
+                                ringSlots[gpuSlot] = virtualPos;
+                            }
+                            if (frameAccumulatorBuffer.remaining() > finalBytesPerLayer) {
+                                frameAccumulatorBuffer.position(finalBytesPerLayer);
+                                frameAccumulatorBuffer.compact();
+                            } else {
+                                frameAccumulatorBuffer.clear();
+                            }
+                        } else {
+                            byte[] tempData = new byte[finalBytesPerLayer];
+                            frameAccumulatorBuffer.flip();
+                            frameAccumulatorBuffer.get(tempData, 0, finalBytesPerLayer);
+                            frameCache.put(virtualPos, tempData);
+                            if (frameAccumulatorBuffer.remaining() > 0) {
+                                frameAccumulatorBuffer.compact();
+                            } else {
+                                frameAccumulatorBuffer.clear();
+                            }
+                        }
+                    } else {
+                        byte[] frameData = bufferPool.poll();
+                        if (frameData == null) {
+                            frameData = new byte[finalBytesPerLayer];
+                        }
+                        byte[] accData = frameAccumulator.toByteArray();
+                        System.arraycopy(accData, 0, frameData, 0, finalBytesPerLayer);
+                        frameCache.put(virtualPos, frameData);
+                        frameAccumulator.reset();
+                        if (accData.length > finalBytesPerLayer) {
+                            frameAccumulator.write(accData, finalBytesPerLayer, accData.length - finalBytesPerLayer);
+                        }
+                    }
+                    
+                    int newDecodePos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+                    framesToDecode = (newDecodePos - virtualPlaybackPos + vPosModulus) % vPosModulus;
+                } else if (!decompressEnded[0]) {
+                    break;
+                }
+            }
+        };
+        
+        // Helper: Evict old frames
+        java.util.function.IntConsumer evictOldFrames = (virtualPlaybackPos) -> {
+            java.util.List<Integer> toRemove = new java.util.ArrayList<>();
+            if (useVramStrategy) {
+                for (Integer virtualPos : frameCache.keySet()) {
+                    int age = (virtualPlaybackPos - virtualPos + vPosModulus) % vPosModulus;
+                    if (age > 0 && age < vPosModulus / 2) {
+                        toRemove.add(virtualPos);
+                    }
+                }
+            } else {
+                for (Integer virtualPos : frameCache.keySet()) {
+                    int distance = (virtualPos - virtualPlaybackPos + vPosModulus) % vPosModulus;
+                    boolean isBehind = distance > vPosModulus - 2;
+                    boolean isAhead = distance <= CPU_CACHE_SIZE;
+                    if (!isBehind && !isAhead) {
+                        toRemove.add(virtualPos);
+                    }
+                }
+            }
+            for (Integer virtualPos : toRemove) {
+                byte[] buffer = frameCache.remove(virtualPos);
+                if (buffer != null && bufferPool != null && buffer.length == finalBytesPerLayer) {
+                    bufferPool.offer(buffer);
+                }
+            }
+        };
+        
+        // Helper: Ensure frame in GPU
+        java.util.function.IntConsumer ensureFrameInGpu = (virtualPos) -> {
+            int actualFrame = virtualPos % totalFrames;
+            int gpuSlot = actualFrame % finalGpuCacheSize;
+            if (ringSlots[gpuSlot] == virtualPos) return;
+            byte[] frameData = frameCache.get(virtualPos);
+            if (frameData == null) return;
+            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
+                textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc);
+            if (uploaded) {
+                ringSlots[gpuSlot] = virtualPos;
+                if (useVramStrategy) {
+                    frameCache.remove(virtualPos);
+                }
+            }
+        };
+        
+        // Main playback loop
+        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
+        long loopStartTime = System.nanoTime();
+        int playbackLoopIteration = 0;
+        
+        while (!shouldStop.get() && !isDestroyed.get()) {
+            currentFrame = 0;
+            loopStartTime = System.nanoTime();
+            
+            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
+                int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
+                
+                if (isPaused.get()) {
+                    try { Thread.sleep(50); } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        return;
+                    }
+                    continue;
+                }
+                
+                decodeFrames.accept(virtualPlaybackPos);
+                evictOldFrames.accept(virtualPlaybackPos);
+                
+                int currentGpuSlot = currentFrame % finalGpuCacheSize;
+                boolean frameInGpu = ringSlots[currentGpuSlot] == virtualPlaybackPos;
+                boolean frameInCpuCache = frameCache.containsKey(virtualPlaybackPos);
+                
+                if (frameInGpu || frameInCpuCache) {
+                    ensureFrameInGpu.accept(virtualPlaybackPos);
+                    
+                    if (!useVramStrategy) {
+                        for (int i = 1; i <= 2; i++) {
+                            int nextVirtualPos = virtualPlaybackPos + i;
+                            if (frameCache.containsKey(nextVirtualPos) || ringSlots[((currentFrame + i) % totalFrames) % finalGpuCacheSize] == nextVirtualPos) {
+                                ensureFrameInGpu.accept(nextVirtualPos);
+                            }
+                        }
+                    }
+                    
+                    if (isPlaying.get()) {
+                        renderFrame();
+                        if (enableFrameEvents) {
+                            mainHandler.post(() -> notifyFrameUpdate());
+                        }
+                        
+                        currentFrame++;
+                        if (currentFrame >= totalFrames) {
+                            if (loop) {
+                                break;
+                            } else {
+                                mainHandler.post(() -> {
+                                    notifyFinished();
+                                    notifyStateChange("stopped");
+                                });
+                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                return;
+                            }
+                        }
+                        
+                        long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
+                        long sleepNs = targetTimeNs - System.nanoTime();
+                        if (sleepNs > 1_000_000) {
+                            try {
+                                Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
+                    try { Thread.sleep(8); } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        return;
+                    }
+                }
+            }
+            
+            if (!loop) break;
+            playbackLoopIteration++;
+            Log.i(TAG, "Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
+        }
+        
+        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+        Log.i(TAG, "Internal zstd streaming animation ended");
     }
     
     private boolean initGL(SurfaceTexture surfaceTexture) {
