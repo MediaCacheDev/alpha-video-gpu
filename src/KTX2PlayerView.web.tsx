@@ -251,6 +251,83 @@ function extractKTX2Metadata(ktx2Data: Uint8Array): Metadata | null {
 let basisModulePromise: Promise<any> | null = null;
 let basisModule: any = null;
 
+// IndexedDB cache for downloaded files (disk-backed, not RAM)
+const KTX2_CACHE_DB_NAME = 'ktx2-player-cache';
+const KTX2_CACHE_STORE_NAME = 'files';
+const KTX2_CACHE_VERSION = 1;
+
+let cacheDbPromise: Promise<IDBDatabase> | null = null;
+
+function openCacheDb(): Promise<IDBDatabase> {
+  if (cacheDbPromise) return cacheDbPromise;
+  
+  cacheDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(KTX2_CACHE_DB_NAME, KTX2_CACHE_VERSION);
+    
+    request.onerror = () => {
+      console.warn('[KTX2PlayerView] IndexedDB cache unavailable:', request.error);
+      reject(request.error);
+    };
+    
+    request.onsuccess = () => {
+      resolve(request.result);
+    };
+    
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(KTX2_CACHE_STORE_NAME)) {
+        db.createObjectStore(KTX2_CACHE_STORE_NAME, { keyPath: 'url' });
+      }
+    };
+  });
+  
+  return cacheDbPromise;
+}
+
+async function getCachedFile(url: string): Promise<ArrayBuffer | null> {
+  try {
+    const db = await openCacheDb();
+    return new Promise((resolve) => {
+      const tx = db.transaction(KTX2_CACHE_STORE_NAME, 'readonly');
+      const store = tx.objectStore(KTX2_CACHE_STORE_NAME);
+      const request = store.get(url);
+      
+      request.onsuccess = () => {
+        if (request.result) {
+          console.log(`[KTX2PlayerView] Cache hit: ${url}`);
+          resolve(request.result.data);
+        } else {
+          resolve(null);
+        }
+      };
+      
+      request.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function setCachedFile(url: string, data: ArrayBuffer): Promise<void> {
+  try {
+    const db = await openCacheDb();
+    return new Promise((resolve) => {
+      const tx = db.transaction(KTX2_CACHE_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(KTX2_CACHE_STORE_NAME);
+      store.put({ url, data, timestamp: Date.now() });
+      
+      tx.oncomplete = () => {
+        console.log(`[KTX2PlayerView] Cached: ${url} (${(data.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+        resolve();
+      };
+      
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // Ignore cache errors
+  }
+}
+
 async function initBasisTranscoder(): Promise<any> {
   if (basisModule) return basisModule;
   
@@ -1262,33 +1339,43 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     const toRemove: number[] = [];
     
     if (useVramStrategyRef.current) {
-      // VRAM mode: Only evict frames that have been played
-      // Use relative distance to handle wraparound
-      for (const virtualPos of frameCache.keys()) {
-        const age = (currentPlaybackFrame - virtualPos + vPosModulus) % vPosModulus;
-        // Frame is "old" if it's behind playback (age > 0) but not wrapped around (age < half modulus)
-        if (age > 0 && age < vPosModulus / 2) {
-          toRemove.push(virtualPos);
+      // VRAM mode: Keep minimal CPU cache (5 frames like Android)
+      // Evict all frames that are behind playback
+      for (const frameIndex of frameCache.keys()) {
+        if (frameIndex < currentPlaybackFrame - 2) {
+          toRemove.push(frameIndex);
+        }
+      }
+      // Also limit total cache size
+      if (frameCache.size - toRemove.length > 5) {
+        const sorted = Array.from(frameCache.keys()).sort((a, b) => a - b);
+        for (const frameIndex of sorted) {
+          if (frameIndex < currentPlaybackFrame && !toRemove.includes(frameIndex)) {
+            toRemove.push(frameIndex);
+            if (frameCache.size - toRemove.length <= 5) break;
+          }
         }
       }
     } else {
-      // RAM mode: Use sliding window with relative distance
-      // Keep frames within [-2, +streamingCacheSize] window
-      for (const virtualPos of frameCache.keys()) {
-        const distance = (virtualPos - currentPlaybackFrame + vPosModulus) % vPosModulus;
-        // distance > vPosModulus - 2 means frame is 1-2 behind (wrapped)
-        // distance <= streamingCacheSize means frame is ahead
-        const isBehind = distance > vPosModulus - 2;
-        const isAhead = distance <= streamingCacheSize;
-        if (!isBehind && !isAhead) {
-          toRemove.push(virtualPos);
+      // RAM mode: Simple sliding window - keep only frames within [current - 2, current + cacheSize]
+      const minFrame = currentPlaybackFrame - 2;
+      const maxFrame = currentPlaybackFrame + streamingCacheSize;
+      
+      for (const frameIndex of frameCache.keys()) {
+        if (frameIndex < minFrame || frameIndex > maxFrame) {
+          toRemove.push(frameIndex);
         }
       }
     }
     
     // Remove evicted frames
-    for (const virtualPos of toRemove) {
-      frameCache.delete(virtualPos);
+    for (const frameIndex of toRemove) {
+      frameCache.delete(frameIndex);
+    }
+    
+    // Log cache size periodically for debugging
+    if (frameCache.size > streamingCacheSize + 10) {
+      console.warn(`[KTX2PlayerView] Frame cache too large: ${frameCache.size} frames (max: ${streamingCacheSize}), playback: ${currentPlaybackFrame}`);
     }
   }, [streamingCacheSize]);
 
@@ -1313,6 +1400,8 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       if (!streamingDecompressPausedRef.current) {
         streamingDecompressPausedRef.current = true;
       }
+      // Still evict old frames even when paused
+      evictOldFramesFromCache(currentFrame);
       // Schedule check later (but check cancellation first)
       if (!streamingCancelledRef.current) {
         requestAnimationFrame(() => continueStreamingDecompression());
@@ -1329,8 +1418,20 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     const startTime = performance.now();
     const maxTimePerBatch = 8; // ms
     let chunksProcessed = 0;
+    const maxCacheSize = useVramStrategyRef.current ? 5 : streamingCacheSize;
     
     while (performance.now() - startTime < maxTimePerBatch) {
+      // Stop decompression if cache is full - prevents unbounded memory growth
+      if (frameCache.size >= maxCacheSize) {
+        break;
+      }
+      
+      // Also stop if accumulator has too much unprocessed data (prevents memory growth)
+      // Allow up to 2 frames worth of buffered data
+      if (state.frameAccumulatorLength > bytesPerLayer * 2) {
+        break;
+      }
+      
       const result = state.generator.next();
       
       if (result.done) {
@@ -1396,31 +1497,34 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         continue;
       }
       
-      // Accumulate frame data
+      // Accumulate frame data (cap at 4 frames worth to prevent unbounded growth)
+      const maxAccumulatorSize = bytesPerLayer * 4;
       if (state.frameAccumulatorLength + chunk.length > state.frameAccumulator.length) {
-        // Grow accumulator
-        const newAccum = new Uint8Array(state.frameAccumulator.length * 2);
-        newAccum.set(state.frameAccumulator.subarray(0, state.frameAccumulatorLength));
-        state.frameAccumulator = newAccum;
+        // Grow accumulator but cap at max size
+        const newSize = Math.min(state.frameAccumulator.length * 2, maxAccumulatorSize);
+        if (newSize > state.frameAccumulator.length) {
+          const newAccum = new Uint8Array(newSize);
+          newAccum.set(state.frameAccumulator.subarray(0, state.frameAccumulatorLength));
+          state.frameAccumulator = newAccum;
+        }
       }
-      state.frameAccumulator.set(chunk, state.frameAccumulatorLength);
-      state.frameAccumulatorLength += chunk.length;
+      // Only accumulate if there's room
+      if (state.frameAccumulatorLength + chunk.length <= state.frameAccumulator.length) {
+        state.frameAccumulator.set(chunk, state.frameAccumulatorLength);
+        state.frameAccumulatorLength += chunk.length;
+      }
       
       // Extract complete frames into cache
       while (state.frameAccumulatorLength >= bytesPerLayer) {
+        // Stop if cache is full (checked at top of loop too, but double-check here)
+        if (frameCache.size >= maxCacheSize) {
+          break;
+        }
+        
         const frameData = state.frameAccumulator.slice(0, bytesPerLayer);
         frameCache.set(streamingDecodePosRef.current, frameData);
         streamingDecodePosRef.current++;
         streamingFramesReadyRef.current = streamingDecodePosRef.current;
-        
-        // In VRAM mode, limit CPU cache to minimal size (5 frames like Android)
-        // This ensures frames are uploaded to GPU and evicted from CPU quickly
-        if (useVramStrategyRef.current) {
-          const maxCpuCache = 5;
-          if (frameCache.size > maxCpuCache) {
-            evictOldFramesFromCache(currentFrameRef.current);
-          }
-        }
         
         // Shift remaining data
         const remaining = state.frameAccumulatorLength - bytesPerLayer;
@@ -1432,10 +1536,17 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     }
     
     // Continue if not done and not cancelled
+    // BUT: Don't schedule if cache is full - let render loop trigger when needed
     if (!state.reachedEnd && !streamingCancelledRef.current) {
-      requestAnimationFrame(() => continueStreamingDecompression());
+      const cacheIsFull = frameCache.size >= maxCacheSize;
+      if (!cacheIsFull) {
+        requestAnimationFrame(() => continueStreamingDecompression());
+      } else {
+        // Cache is full - mark as paused, render loop will resume when needed
+        streamingDecompressPausedRef.current = true;
+      }
     }
-  }, [streamingPrefetchAhead, evictOldFramesFromCache]);
+  }, [streamingPrefetchAhead, streamingCacheSize, evictOldFramesFromCache]);
 
   // Handle streaming loop restart
   const handleStreamingLoop = useCallback(() => {
@@ -1450,12 +1561,27 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     streamingFramesReadyRef.current = 0;
     streamingDecompressPausedRef.current = false;
     
+    const state = streamingDecompressStateRef.current;
+    
+    // IMPORTANT: Drain the old generator to completion to free WASM resources
+    // The zstd decoder allocates buffers that are only freed when generator completes
+    if (state?.generator && !state.reachedEnd) {
+      try {
+        // Drain remaining chunks (they're already decompressed, just not consumed)
+        let result = state.generator.next();
+        while (!result.done) {
+          result = state.generator.next();
+        }
+      } catch (e) {
+        // Ignore errors during drain
+      }
+    }
+    
     // Re-create decompression generator
     const compressedChunks = streamingCompressedChunksRef.current;
     if (compressedChunks && compressedChunks.length > 0 && zstdDecoderRef.current?.decodeStreaming) {
       const generator = zstdDecoderRef.current.decodeStreaming(compressedChunks);
       
-      const state = streamingDecompressStateRef.current;
       if (state) {
         state.generator = generator;
         
@@ -1466,14 +1592,13 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
           state.totalFramesDecoded = 0;
         } else {
           // Outer zstd streaming format - reset state for continueStreamingDecompression
-          if ('reachedEnd' in state) {
-            state.reachedEnd = false;
-          }
-          if ('frameAccumulatorLength' in state) {
-            state.frameAccumulatorLength = 0;
-          }
-          if ('bytesToSkipForHeader' in state) {
-            state.bytesToSkipForHeader = streamingLevel0OffsetRef.current;
+          state.reachedEnd = false;
+          state.frameAccumulatorLength = 0;
+          state.bytesToSkipForHeader = streamingLevel0OffsetRef.current;
+          // Reset accumulator to fixed size to prevent unbounded growth
+          const bytesPerLayer = streamingBytesPerLayerRef.current;
+          if (bytesPerLayer > 0) {
+            state.frameAccumulator = new Uint8Array(bytesPerLayer * 2);
           }
         }
       }
@@ -1677,13 +1802,22 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         // Check if frame is ready
         if (currentFrame >= streamingFramesReadyRef.current) {
           // Frame not yet decoded - skip render but don't advance frame
+          // Resume decompression if paused
+          if (streamingDecompressPausedRef.current) {
+            streamingDecompressPausedRef.current = false;
+            continueStreamingDecompression();
+          }
           return;
         }
         
         // Ensure current frame and next few frames are in ring buffer
         const slot = ensureFrameInRingBuffer(currentFrame);
         if (slot === -1) {
-          // Frame not available in cache
+          // Frame not available in cache - resume decompression
+          if (streamingDecompressPausedRef.current) {
+            streamingDecompressPausedRef.current = false;
+            continueStreamingDecompression();
+          }
           return;
         }
         layerIndex = slot;
@@ -1694,6 +1828,13 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
           if (nextFrame < metadata.frameCount) {
             ensureFrameInRingBuffer(nextFrame);
           }
+        }
+        
+        // Resume decompression if paused and cache has room
+        const maxCacheSize = useVramStrategyRef.current ? 5 : streamingCacheSize;
+        if (streamingDecompressPausedRef.current && streamingFrameCacheRef.current.size < maxCacheSize) {
+          streamingDecompressPausedRef.current = false;
+          continueStreamingDecompression();
         }
       } else if (ramHeavyModeRef.current && ramFrameDataRef.current) {
         // Non-streaming RAM mode: upload current frame on demand
@@ -1773,7 +1914,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
     
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-  }, [ensureFrameInRingBuffer]);
+  }, [ensureFrameInRingBuffer, continueStreamingDecompression, streamingCacheSize]);
 
   // Animation loop
   const startAnimationLoop = useCallback(() => {
@@ -1863,6 +2004,13 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       streamingCompressedChunksRef.current = null;
       streamingDecompressStateRef.current = null;
       
+      // Clean up RAM mode state (prevents memory leak)
+      ramFrameDataRef.current = null;
+      ramHeavyModeRef.current = false;
+      ramBytesPerFrameRef.current = 0;
+      ramFrameCountRef.current = 0;
+      ramUploadedFrameRef.current = -1;
+      
       // Check for streaming mode (.ktx2.zst files)
       // Metro bundler may insert hash: .ktx2.{hash}.zst
       const isStreamingZst = uri.endsWith('.zst') || uri.includes('.zst?') || /\.ktx2\.[a-f0-9]+\.zst/.test(uri);
@@ -1889,10 +2037,15 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         return;
       }
       
-      const response = await fetch(uri);
-      if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
-      
-      const arrayBuffer = await response.arrayBuffer();
+      // Try cache first, then fetch
+      let arrayBuffer = await getCachedFile(uri);
+      if (!arrayBuffer) {
+        const response = await fetch(uri);
+        if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
+        arrayBuffer = await response.arrayBuffer();
+        // Cache for future use (async, don't await)
+        setCachedFile(uri, arrayBuffer);
+      }
       const data = new Uint8Array(arrayBuffer);
       
       // Check if this is a GLB container
@@ -2136,6 +2289,13 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       streamingFrameCacheRef.current.clear();
       streamingCompressedChunksRef.current = null;
       streamingDecompressStateRef.current = null;
+      
+      // Clear RAM mode state (prevents memory leak)
+      ramFrameDataRef.current = null;
+      ramHeavyModeRef.current = false;
+      ramBytesPerFrameRef.current = 0;
+      ramFrameCountRef.current = 0;
+      ramUploadedFrameRef.current = -1;
     };
   }, [stopAnimationLoop]);
 
