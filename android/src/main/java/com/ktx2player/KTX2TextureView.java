@@ -375,6 +375,16 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         sendEvent("onStateChange", event);
     }
     
+    private void notifyLoad() {
+        WritableMap event = Arguments.createMap();
+        event.putInt("width", frameWidth);
+        event.putInt("height", frameHeight);
+        event.putInt("frameCount", totalFrames);
+        event.putDouble("frameRate", frameRate);
+        event.putDouble("duration", totalFrames > 0 && frameRate > 0 ? (double) totalFrames / frameRate : 0);
+        sendEvent("onLoad", event);
+    }
+    
     private void notifyFrameUpdate() {
         WritableMap event = Arguments.createMap();
         event.putInt("frame", currentFrame);
@@ -685,7 +695,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         mSourceLoaded = true;
-        mainHandler.post(() -> notifyStateChange("ready"));
+        mainHandler.post(() -> {
+            notifyLoad();
+            notifyStateChange("ready");
+        });
         
         // Start playing if autoPlay
         if (autoPlay) {
@@ -1070,7 +1083,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         final long finalLevel0Offset = level0Offset;
         
         mSourceLoaded = true;
-        mainHandler.post(() -> notifyStateChange("ready"));
+        mainHandler.post(() -> {
+            notifyLoad();
+            notifyStateChange("ready");
+        });
         
         if (autoPlay && !isPaused.get()) {
             isPlaying.set(true);
@@ -1679,7 +1695,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         mSourceLoaded = true;
-        mainHandler.post(() -> notifyStateChange("ready"));
+        mainHandler.post(() -> {
+            notifyLoad();
+            notifyStateChange("ready");
+        });
         
         if (autoPlay) {
             isPlaying.set(true);
@@ -1912,7 +1931,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         final long finalLevel0Length = level0Length;
         
         mSourceLoaded = true;
-        mainHandler.post(() -> notifyStateChange("ready"));
+        mainHandler.post(() -> {
+            notifyLoad();
+            notifyStateChange("ready");
+        });
         
         if (autoPlay && !isPaused.get()) {
             isPlaying.set(true);

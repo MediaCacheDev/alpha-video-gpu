@@ -246,6 +246,20 @@
   }
 }
 
+- (void)notifyLoad
+{
+  if (self.onLoad) {
+    CGFloat duration = self.totalFrames > 0 && self.frameRate > 0 ? (CGFloat)self.totalFrames / self.frameRate : 0;
+    self.onLoad(@{
+      @"width": @(self.frameWidth),
+      @"height": @(self.frameHeight),
+      @"frameCount": @(self.totalFrames),
+      @"frameRate": @(self.frameRate),
+      @"duration": @(duration)
+    });
+  }
+}
+
 - (void)notifyFrameUpdate
 {
   if (self.onFrameUpdate) {
@@ -989,6 +1003,7 @@
       
       self->_isSourceLoaded = YES;
       self->_isSourceLoading = NO;
+      [self notifyLoad];
       [self notifyStateChange:@"ready"];
       
       if (self.autoPlay && !self.reactPaused) {
@@ -1505,6 +1520,7 @@
     
     self->_isSourceLoaded = YES;
     self->_isSourceLoading = NO;
+    [self notifyLoad];
     [self notifyStateChange:@"ready"];
     
     // Pre-decode initial frames on background thread to avoid freeze
@@ -2234,6 +2250,7 @@
       
       NSLog(@"KTX2PlayerView: ✓ Texture array loaded: %ux%u, %u layers", width, height, layerCount);
       
+      [self notifyLoad];
       [self notifyStateChange:@"ready"];
       
       if (self.autoPlay) {
@@ -2407,6 +2424,7 @@
     
     self->_isSourceLoaded = YES;
     self->_isSourceLoading = NO;
+    [self notifyLoad];
     [self notifyStateChange:@"ready"];
     
     if (self.autoPlay && !self.reactPaused) {
@@ -2678,6 +2696,7 @@
       self->_isSourceLoading = NO;
       self.currentTexture = self.partTextures[0];
       [self updateUniforms];
+      [self notifyLoad];
       [self notifyStateChange:@"ready"];
       
       if (self.autoPlay && self.partTextures.count > 0) {

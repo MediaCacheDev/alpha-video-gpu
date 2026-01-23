@@ -53,6 +53,7 @@
 @property (nonatomic, assign) CFTimeInterval lastFrameTime;
 
 // Event callbacks
+@property (nonatomic, copy) RCTDirectEventBlock onLoad;
 @property (nonatomic, copy) RCTDirectEventBlock onFrameUpdate;
 @property (nonatomic, copy) RCTDirectEventBlock onStateChange;
 @property (nonatomic, copy) RCTDirectEventBlock onFinished;

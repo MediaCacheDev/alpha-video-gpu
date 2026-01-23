@@ -349,6 +349,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     @Override
     public Map<String, Object> getExportedCustomDirectEventTypeConstants() {
         return MapBuilder.<String, Object>builder()
+                .put("onLoad", MapBuilder.of("registrationName", "onLoad"))
                 .put("onFrameUpdate", MapBuilder.of("registrationName", "onFrameUpdate"))
                 .put("onStateChange", MapBuilder.of("registrationName", "onStateChange"))
                 .put("onFinished", MapBuilder.of("registrationName", "onFinished"))

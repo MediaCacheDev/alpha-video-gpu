@@ -35,6 +35,14 @@ export interface SourceType {
   cacheKey?: string;
 }
 
+export interface KTX2LoadEvent {
+  width: number;
+  height: number;
+  frameCount: number;
+  frameRate: number;
+  duration: number; // in seconds
+}
+
 export interface KTX2PlayerViewProps {
   source?: SourceType | string | null;
   /** For multi-part animations: array of all part sources (first part contains metadata) */
@@ -46,6 +54,8 @@ export interface KTX2PlayerViewProps {
   paused?: boolean;
   cacheKey?: string;
   style?: any;
+  /** Called when file metadata is loaded, provides dimensions and frame info */
+  onLoad?: (event: KTX2LoadEvent) => void;
   onStateChange?: (state: string) => void;
   onFrameUpdate?: (frame: number, total: number) => void;
   onFinished?: () => void;
@@ -251,6 +261,203 @@ function extractKTX2Metadata(ktx2Data: Uint8Array): Metadata | null {
 let basisModulePromise: Promise<any> | null = null;
 let basisModule: any = null;
 
+// ============================================================================
+// Shared WebGL Context Manager
+// ============================================================================
+// Browsers limit WebGL contexts to ~8-16 per page. To support many players,
+// we share a single offscreen WebGL context and copy rendered frames to each
+// player's visible canvas using 2D context.
+
+interface SharedGLResources {
+  gl: WebGL2RenderingContext | WebGLRenderingContext;
+  canvas: HTMLCanvasElement;
+  program: WebGLProgram;
+  arrayProgram: WebGLProgram | null;
+  positionBuffer: WebGLBuffer;
+  texCoordBuffer: WebGLBuffer;
+  refCount: number;
+  maxWidth: number;
+  maxHeight: number;
+}
+
+let sharedGLResources: SharedGLResources | null = null;
+
+// Ensure shared canvas is large enough for the given dimensions
+// Only grows, never shrinks (to avoid thrashing with different resolutions)
+function ensureSharedCanvasSize(width: number, height: number): void {
+  if (!sharedGLResources) return;
+  
+  const needsResize = width > sharedGLResources.maxWidth || height > sharedGLResources.maxHeight;
+  if (!needsResize) return;
+  
+  const newWidth = Math.max(sharedGLResources.maxWidth, width);
+  const newHeight = Math.max(sharedGLResources.maxHeight, height);
+  
+  sharedGLResources.canvas.width = newWidth;
+  sharedGLResources.canvas.height = newHeight;
+  sharedGLResources.maxWidth = newWidth;
+  sharedGLResources.maxHeight = newHeight;
+  
+  console.log(`[KTX2PlayerView] Shared canvas resized to ${newWidth}x${newHeight}`);
+}
+
+function getSharedGL(): SharedGLResources | null {
+  if (sharedGLResources) {
+    sharedGLResources.refCount++;
+    return sharedGLResources;
+  }
+  
+  // Create offscreen canvas for shared rendering - start with reasonable default
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 512;
+  
+  const gl = canvas.getContext('webgl2', { 
+    alpha: true, 
+    premultipliedAlpha: true,
+    preserveDrawingBuffer: true // Needed to read pixels back
+  }) || canvas.getContext('webgl', {
+    alpha: true,
+    premultipliedAlpha: true,
+    preserveDrawingBuffer: true
+  });
+  
+  if (!gl) {
+    console.warn('[KTX2PlayerView] Failed to create shared WebGL context');
+    return null;
+  }
+  
+  // Create shaders
+  const vertexShaderSource = `
+    attribute vec2 a_position;
+    attribute vec2 a_texCoord;
+    varying vec2 v_texCoord;
+    void main() {
+      gl_Position = vec4(a_position, 0.0, 1.0);
+      v_texCoord = a_texCoord;
+    }
+  `;
+  
+  const fragmentShaderSource = `
+    precision mediump float;
+    varying vec2 v_texCoord;
+    uniform sampler2D u_texture;
+    uniform vec4 u_frameUV;
+    void main() {
+      vec2 uv = mix(u_frameUV.xy, u_frameUV.zw, v_texCoord);
+      gl_FragColor = texture2D(u_texture, uv);
+    }
+  `;
+  
+  const vertexShader = gl.createShader(gl.VERTEX_SHADER)!;
+  gl.shaderSource(vertexShader, vertexShaderSource);
+  gl.compileShader(vertexShader);
+  
+  const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER)!;
+  gl.shaderSource(fragmentShader, fragmentShaderSource);
+  gl.compileShader(fragmentShader);
+  
+  const program = gl.createProgram()!;
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  
+  // Create texture array shader (WebGL2 only)
+  let arrayProgram: WebGLProgram | null = null;
+  if (gl instanceof WebGL2RenderingContext) {
+    const arrayVertexSource = `#version 300 es
+      in vec2 a_position;
+      in vec2 a_texCoord;
+      out vec2 v_texCoord;
+      void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+      }
+    `;
+    
+    const arrayFragmentSource = `#version 300 es
+      precision mediump float;
+      precision mediump sampler2DArray;
+      in vec2 v_texCoord;
+      out vec4 fragColor;
+      uniform sampler2DArray u_textureArray;
+      uniform float u_layer;
+      void main() {
+        fragColor = texture(u_textureArray, vec3(v_texCoord, u_layer));
+      }
+    `;
+    
+    const arrayVS = gl.createShader(gl.VERTEX_SHADER)!;
+    gl.shaderSource(arrayVS, arrayVertexSource);
+    gl.compileShader(arrayVS);
+    
+    const arrayFS = gl.createShader(gl.FRAGMENT_SHADER)!;
+    gl.shaderSource(arrayFS, arrayFragmentSource);
+    gl.compileShader(arrayFS);
+    
+    arrayProgram = gl.createProgram()!;
+    gl.attachShader(arrayProgram, arrayVS);
+    gl.attachShader(arrayProgram, arrayFS);
+    gl.linkProgram(arrayProgram);
+  }
+  
+  // Create buffers
+  const positionBuffer = gl.createBuffer()!;
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1, -1, 1, -1, -1, 1,
+    -1, 1, 1, -1, 1, 1
+  ]), gl.STATIC_DRAW);
+  
+  const texCoordBuffer = gl.createBuffer()!;
+  gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    0, 1, 1, 1, 0, 0,
+    0, 0, 1, 1, 1, 0
+  ]), gl.STATIC_DRAW);
+  
+  // Setup GL state
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  
+  sharedGLResources = {
+    gl,
+    canvas,
+    program,
+    arrayProgram,
+    positionBuffer,
+    texCoordBuffer,
+    refCount: 1,
+    maxWidth: 512,
+    maxHeight: 512
+  };
+  
+  console.log('[KTX2PlayerView] Created shared WebGL context');
+  return sharedGLResources;
+}
+
+function releaseSharedGL(): void {
+  if (!sharedGLResources) return;
+  
+  sharedGLResources.refCount--;
+  
+  if (sharedGLResources.refCount <= 0) {
+    // Clean up shared resources
+    const { gl, program, arrayProgram, positionBuffer, texCoordBuffer } = sharedGLResources;
+    gl.deleteProgram(program);
+    if (arrayProgram) gl.deleteProgram(arrayProgram);
+    gl.deleteBuffer(positionBuffer);
+    gl.deleteBuffer(texCoordBuffer);
+    
+    // Lose the context to free GPU resources
+    const loseContext = gl.getExtension('WEBGL_lose_context');
+    if (loseContext) loseContext.loseContext();
+    
+    sharedGLResources = null;
+    console.log('[KTX2PlayerView] Released shared WebGL context');
+  }
+}
+
 // IndexedDB cache for downloaded files (disk-backed, not RAM)
 const KTX2_CACHE_DB_NAME = 'ktx2-player-cache';
 const KTX2_CACHE_STORE_NAME = 'files';
@@ -351,6 +558,7 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   playbackSpeed = 1.0,
   paused = false,
   style,
+  onLoad,
   onStateChange,
   onFrameUpdate,
   onFinished,
@@ -362,6 +570,8 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
   stream = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null); // 2D context for visible canvas
+  const usingSharedGLRef = useRef<boolean>(false); // Track if using shared GL
   const glRef = useRef<WebGLRenderingContext | WebGL2RenderingContext | null>(null);
   const programRef = useRef<WebGLProgram | null>(null);
   const positionBufferRef = useRef<WebGLBuffer | null>(null);
@@ -429,16 +639,38 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     onStateChange?.(newState);
   }, [onStateChange]);
 
-  // Initialize WebGL
+  // Initialize WebGL - uses shared context to avoid browser's context limit
   const initGL = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     
+    // Try to use shared WebGL context first
+    const shared = getSharedGL();
+    if (shared) {
+      // Use shared context - get 2D context for visible canvas to copy frames
+      const ctx2d = canvas.getContext('2d', { alpha: true });
+      if (ctx2d) {
+        ctx2dRef.current = ctx2d;
+        usingSharedGLRef.current = true;
+        glRef.current = shared.gl;
+        programRef.current = shared.program;
+        arrayProgramRef.current = shared.arrayProgram;
+        positionBufferRef.current = shared.positionBuffer;
+        texCoordBufferRef.current = shared.texCoordBuffer;
+        console.log('[KTX2PlayerView] Using shared WebGL context');
+        return shared.gl;
+      }
+    }
+    
+    // Fallback: create own WebGL context (may hit browser limit)
+    console.log('[KTX2PlayerView] Creating dedicated WebGL context');
     const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
     if (!gl) {
       onError?.(new Error('WebGL not supported'));
       return null;
     }
+    
+    usingSharedGLRef.current = false;
     
     // Vertex shader
     const vertexShaderSource = `
@@ -1705,6 +1937,16 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         throw new Error('No metadata found in streaming KTX2');
       }
       metadataRef.current = metadata;
+      
+      // Report dimensions via onLoad callback
+      onLoad?.({
+        width: metadata.frameWidth,
+        height: metadata.frameHeight,
+        frameCount: metadata.frameCount,
+        frameRate: metadata.frameRate,
+        duration: metadata.frameCount / metadata.frameRate,
+      });
+      
       streamingLayerCountRef.current = layerCount;
       streamingLevel0OffsetRef.current = level0Offset;
       
@@ -1787,6 +2029,16 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
     const currentFrame = currentFrameRef.current;
     const frameUV = frameUVs[currentFrame];
     if (!frameUV) return;
+    
+    // If using shared GL context, ensure shared canvas is large enough and set viewport
+    if (usingSharedGLRef.current && sharedGLResources) {
+      const frameWidth = metadata.frameWidth;
+      const frameHeight = metadata.frameHeight;
+      // Grow shared canvas if needed (never shrinks to avoid thrashing)
+      ensureSharedCanvasSize(frameWidth, frameHeight);
+      // Set viewport to render only the area we need
+      gl.viewport(0, 0, frameWidth, frameHeight);
+    }
     
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -1885,35 +2137,57 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       gl2.vertexAttribPointer(texCoordLoc, 2, gl2.FLOAT, false, 0, 0);
       
       gl2.drawArrays(gl2.TRIANGLES, 0, 6);
-      return;
+    } else {
+      // Standard 2D texture rendering (atlas mode)
+      if (!program || !textures.length) return;
+      
+      // Determine which texture to use
+      const framesPerPart = metadata.framesPerPart || metadata.framesPerStrip || metadata.frameCount;
+      const partIndex = Math.floor(currentFrame / framesPerPart);
+      const texture = textures[partIndex] || textures[0];
+      
+      gl.useProgram(program);
+      
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.uniform1i(gl.getUniformLocation(program, 'u_texture'), 0);
+      gl.uniform4f(gl.getUniformLocation(program, 'u_frameUV'), frameUV.minU, frameUV.minV, frameUV.maxU, frameUV.maxV);
+      
+      const positionLoc = gl.getAttribLocation(program, 'a_position');
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBufferRef.current);
+      gl.enableVertexAttribArray(positionLoc);
+      gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+      
+      const texCoordLoc = gl.getAttribLocation(program, 'a_texCoord');
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBufferRef.current);
+      gl.enableVertexAttribArray(texCoordLoc);
+      gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+      
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
     
-    // Standard 2D texture rendering (atlas mode)
-    if (!program || !textures.length) return;
-    
-    // Determine which texture to use
-    const framesPerPart = metadata.framesPerPart || metadata.framesPerStrip || metadata.frameCount;
-    const partIndex = Math.floor(currentFrame / framesPerPart);
-    const texture = textures[partIndex] || textures[0];
-    
-    gl.useProgram(program);
-    
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.uniform1i(gl.getUniformLocation(program, 'u_texture'), 0);
-    gl.uniform4f(gl.getUniformLocation(program, 'u_frameUV'), frameUV.minU, frameUV.minV, frameUV.maxU, frameUV.maxV);
-    
-    const positionLoc = gl.getAttribLocation(program, 'a_position');
-    gl.bindBuffer(gl.ARRAY_BUFFER, positionBufferRef.current);
-    gl.enableVertexAttribArray(positionLoc);
-    gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
-    
-    const texCoordLoc = gl.getAttribLocation(program, 'a_texCoord');
-    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBufferRef.current);
-    gl.enableVertexAttribArray(texCoordLoc);
-    gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
-    
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    // If using shared GL context, copy rendered frame to visible canvas
+    if (usingSharedGLRef.current && ctx2dRef.current && sharedGLResources) {
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const ctx2d = ctx2dRef.current;
+        const sharedCanvas = sharedGLResources.canvas;
+        const frameWidth = metadata.frameWidth;
+        const frameHeight = metadata.frameHeight;
+        
+        // WebGL renders with Y=0 at bottom, but 2D canvas has Y=0 at top.
+        // The viewport renders to bottom-left of the GL canvas, so we need to
+        // copy from (0, sharedCanvas.height - frameHeight) in 2D canvas coordinates.
+        const srcY = sharedCanvas.height - frameHeight;
+        
+        ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+        ctx2d.drawImage(
+          sharedCanvas,
+          0, srcY, frameWidth, frameHeight,  // Source rect (bottom-left of shared canvas)
+          0, 0, canvas.width, canvas.height  // Dest rect (visible canvas)
+        );
+      }
+    }
   }, [ensureFrameInRingBuffer, continueStreamingDecompression, streamingCacheSize]);
 
   // Animation loop
@@ -2060,6 +2334,15 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         const { metadata, ktx2Parts } = glbResult;
         metadataRef.current = metadata;
         
+        // Report dimensions via onLoad callback
+        onLoad?.({
+          width: metadata.frameWidth,
+          height: metadata.frameHeight,
+          frameCount: metadata.frameCount,
+          frameRate: metadata.frameRate,
+          duration: metadata.frameCount / metadata.frameRate,
+        });
+        
         const isNativeASTC = metadata.mode === 'astc';
         const isTextureArray = metadata.packingMode === 'array';
         
@@ -2099,6 +2382,15 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
         console.log('[KTX2PlayerView] Using embedded KTX2 metadata');
         console.log(`[KTX2PlayerView] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
         metadataRef.current = metadata;
+        
+        // Report dimensions via onLoad callback
+        onLoad?.({
+          width: metadata.frameWidth,
+          height: metadata.frameHeight,
+          frameCount: metadata.frameCount,
+          frameRate: metadata.frameRate,
+          duration: metadata.frameCount / metadata.frameRate,
+        });
         
         const partCount = metadata.partCount || metadata.stripCount || 1;
         const isNativeASTC = metadata.mode === 'astc';
@@ -2276,14 +2568,26 @@ export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
       stopAnimationLoop();
       const gl = glRef.current;
       if (gl) {
+        // Delete textures (these are per-player, not shared)
         texturesRef.current.forEach(tex => gl.deleteTexture(tex));
         if (textureArrayRef.current) gl.deleteTexture(textureArrayRef.current);
         if (streamingRingBufferRef.current) gl.deleteTexture(streamingRingBufferRef.current);
-        if (programRef.current) gl.deleteProgram(programRef.current);
-        if (arrayProgramRef.current) gl.deleteProgram(arrayProgramRef.current);
-        if (positionBufferRef.current) gl.deleteBuffer(positionBufferRef.current);
-        if (texCoordBufferRef.current) gl.deleteBuffer(texCoordBufferRef.current);
+        
+        // Only delete programs/buffers if NOT using shared context
+        if (!usingSharedGLRef.current) {
+          if (programRef.current) gl.deleteProgram(programRef.current);
+          if (arrayProgramRef.current) gl.deleteProgram(arrayProgramRef.current);
+          if (positionBufferRef.current) gl.deleteBuffer(positionBufferRef.current);
+          if (texCoordBufferRef.current) gl.deleteBuffer(texCoordBufferRef.current);
+        }
       }
+      
+      // Release shared GL context reference
+      if (usingSharedGLRef.current) {
+        releaseSharedGL();
+        usingSharedGLRef.current = false;
+      }
+      
       // Clear streaming state
       streamingModeRef.current = false;
       streamingFrameCacheRef.current.clear();
