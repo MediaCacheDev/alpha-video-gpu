@@ -28,19 +28,101 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
+// GL_COMPRESSED_RGBA_ASTC constants for all 14 block sizes
 #ifndef GL_COMPRESSED_RGBA_ASTC_4x4_KHR
-#define GL_COMPRESSED_RGBA_ASTC_4x4_KHR 0x93B0
+#define GL_COMPRESSED_RGBA_ASTC_4x4_KHR   0x93B0
 #endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_5x4_KHR
+#define GL_COMPRESSED_RGBA_ASTC_5x4_KHR   0x93B1
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_5x5_KHR
+#define GL_COMPRESSED_RGBA_ASTC_5x5_KHR   0x93B2
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_6x5_KHR
+#define GL_COMPRESSED_RGBA_ASTC_6x5_KHR   0x93B3
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_6x6_KHR
+#define GL_COMPRESSED_RGBA_ASTC_6x6_KHR   0x93B4
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_8x5_KHR
+#define GL_COMPRESSED_RGBA_ASTC_8x5_KHR   0x93B5
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_8x6_KHR
+#define GL_COMPRESSED_RGBA_ASTC_8x6_KHR   0x93B6
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_8x8_KHR
+#define GL_COMPRESSED_RGBA_ASTC_8x8_KHR   0x93B7
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_10x5_KHR
+#define GL_COMPRESSED_RGBA_ASTC_10x5_KHR  0x93B8
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_10x6_KHR
+#define GL_COMPRESSED_RGBA_ASTC_10x6_KHR  0x93B9
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_10x8_KHR
+#define GL_COMPRESSED_RGBA_ASTC_10x8_KHR  0x93BA
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_10x10_KHR
+#define GL_COMPRESSED_RGBA_ASTC_10x10_KHR 0x93BB
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_12x10_KHR
+#define GL_COMPRESSED_RGBA_ASTC_12x10_KHR 0x93BC
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_12x12_KHR
+#define GL_COMPRESSED_RGBA_ASTC_12x12_KHR 0x93BD
+#endif
+
+// ASTC format info: maps VkFormat to GL format and block dimensions
+struct ASTCFormatInfo {
+    uint32_t vk_format_unorm;
+    uint32_t vk_format_srgb;
+    GLenum   gl_format;
+    int      block_width;
+    int      block_height;
+};
+
+static const ASTCFormatInfo g_astc_formats[] = {
+    { 157, 158, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,   4,  4 },
+    { 159, 160, GL_COMPRESSED_RGBA_ASTC_5x4_KHR,   5,  4 },
+    { 161, 162, GL_COMPRESSED_RGBA_ASTC_5x5_KHR,   5,  5 },
+    { 163, 164, GL_COMPRESSED_RGBA_ASTC_6x5_KHR,   6,  5 },
+    { 165, 166, GL_COMPRESSED_RGBA_ASTC_6x6_KHR,   6,  6 },
+    { 167, 168, GL_COMPRESSED_RGBA_ASTC_8x5_KHR,   8,  5 },
+    { 169, 170, GL_COMPRESSED_RGBA_ASTC_8x6_KHR,   8,  6 },
+    { 171, 172, GL_COMPRESSED_RGBA_ASTC_8x8_KHR,   8,  8 },
+    { 173, 174, GL_COMPRESSED_RGBA_ASTC_10x5_KHR,  10, 5 },
+    { 175, 176, GL_COMPRESSED_RGBA_ASTC_10x6_KHR,  10, 6 },
+    { 177, 178, GL_COMPRESSED_RGBA_ASTC_10x8_KHR,  10, 8 },
+    { 179, 180, GL_COMPRESSED_RGBA_ASTC_10x10_KHR, 10, 10 },
+    { 181, 182, GL_COMPRESSED_RGBA_ASTC_12x10_KHR, 12, 10 },
+    { 183, 184, GL_COMPRESSED_RGBA_ASTC_12x12_KHR, 12, 12 },
+};
+
+// Look up ASTC format info from VkFormat. Returns nullptr if not found.
+static const ASTCFormatInfo* get_astc_format_info(uint32_t vk_format) {
+    for (const auto& fmt : g_astc_formats) {
+        if (vk_format == fmt.vk_format_unorm || vk_format == fmt.vk_format_srgb) {
+            return &fmt;
+        }
+    }
+    return nullptr;
+}
+
+// Calculate bytes per layer for an ASTC texture (all blocks are 16 bytes)
+static uint32_t astc_bytes_per_layer(int width, int height, int block_width, int block_height) {
+    int blocks_x = (width + block_width - 1) / block_width;
+    int blocks_y = (height + block_height - 1) / block_height;
+    return blocks_x * blocks_y * 16;
+}
 
 // Initialize transcoder once
 static bool g_transcoder_initialized = false;
 
-// Decode entire ASTC 4x4 texture to RGBA using proper decoder
+// Decode ASTC texture to RGBA using proper decoder (supports all block sizes)
 static bool decode_astc_to_rgba(const uint8_t* astc_data, size_t astc_size,
                                  int width, int height,
+                                 int block_width, int block_height,
                                  std::vector<uint8_t>& rgba_output) {
-    const int block_width = 4;
-    const int block_height = 4;
     int blocks_x = (width + block_width - 1) / block_width;
     int blocks_y = (height + block_height - 1) / block_height;
     size_t expected_size = blocks_x * blocks_y * 16; // 16 bytes per block
@@ -53,8 +135,8 @@ static bool decode_astc_to_rgba(const uint8_t* astc_data, size_t astc_size,
     rgba_output.resize(width * height * 4);
     memset(rgba_output.data(), 0, rgba_output.size());
     
-    // Temporary buffer for one decoded block (4x4 RGBA)
-    uint8_t block_pixels[block_width * block_height * 4];
+    // Temporary buffer for one decoded block (max 12x12)
+    uint8_t block_pixels[12 * 12 * 4];
     
     for (int by = 0; by < blocks_y; by++) {
         for (int bx = 0; bx < blocks_x; bx++) {
@@ -65,7 +147,8 @@ static bool decode_astc_to_rgba(const uint8_t* astc_data, size_t astc_size,
             if (!success) {
                 LOGW("Failed to decode ASTC block at (%d, %d)", bx, by);
                 // Fill with magenta to indicate error
-                for (int i = 0; i < 16; i++) {
+                int pixels_in_block = block_width * block_height;
+                for (int i = 0; i < pixels_in_block; i++) {
                     block_pixels[i * 4 + 0] = 255;
                     block_pixels[i * 4 + 1] = 0;
                     block_pixels[i * 4 + 2] = 255;
@@ -89,7 +172,7 @@ static bool decode_astc_to_rgba(const uint8_t* astc_data, size_t astc_size,
         }
     }
     
-    LOGI("Decoded ASTC %dx%d (%d x %d blocks) to RGBA", width, height, blocks_x, blocks_y);
+    LOGI("Decoded ASTC %dx%d (%d x %d blocks, block=%dx%d) to RGBA", width, height, blocks_x, blocks_y, block_width, block_height);
     return true;
 }
 
@@ -565,8 +648,12 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstdToBuffer(JNIEnv *env, j
 JNIEXPORT jintArray JNICALL
 Java_com_ktx2player_KTX2PlayerModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass clazz,
                                                              jbyteArray astc_data,
-                                                             jint width, jint height) {
+                                                             jint width, jint height,
+                                                             jint block_w, jint block_h) {
     LOGW("ASTC software decode fallback - this is for emulator testing only!");
+    
+    int bw = (block_w > 0) ? block_w : 4;
+    int bh = (block_h > 0) ? block_h : 4;
     
     jbyte* input_bytes = env->GetByteArrayElements(astc_data, nullptr);
     if (!input_bytes) {
@@ -579,7 +666,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass 
     
     // Decode ASTC to RGBA
     std::vector<uint8_t> rgba_data;
-    bool success = decode_astc_to_rgba(astc_ptr, astc_size, width, height, rgba_data);
+    bool success = decode_astc_to_rgba(astc_ptr, astc_size, width, height, bw, bh, rgba_data);
     
     env->ReleaseByteArrayElements(astc_data, input_bytes, JNI_ABORT);
     
@@ -643,6 +730,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass 
     const uint8_t* bytes = (const uint8_t*)data;
     
     // Parse KTX2 header
+    uint32_t vkFormat = *(uint32_t*)(bytes + 12);
     uint32_t width = *(uint32_t*)(bytes + 20);
     uint32_t height = *(uint32_t*)(bytes + 24);
     uint32_t layerCount = *(uint32_t*)(bytes + 32);
@@ -653,8 +741,14 @@ Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass 
     uint64_t level0Length = *(uint64_t*)(bytes + 88);
     uint64_t level0UncompressedLength = *(uint64_t*)(bytes + 96);
     
-    LOGI("Texture array: %ux%u, %u layers, supercompression=%u",
-         width, height, layerCount, supercompressionScheme);
+    // Look up ASTC format info from vkFormat
+    const ASTCFormatInfo* astcInfo = get_astc_format_info(vkFormat);
+    int bw = astcInfo ? astcInfo->block_width : 4;
+    int bh = astcInfo ? astcInfo->block_height : 4;
+    GLenum astcGlFormat = astcInfo ? astcInfo->gl_format : GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    
+    LOGI("Texture array: %ux%u, %u layers, supercompression=%u, vkFormat=%u (ASTC %dx%d)",
+         width, height, layerCount, supercompressionScheme, vkFormat, bw, bh);
     
     // Extract ASTC data
     std::vector<uint8_t> astcData;
@@ -683,13 +777,11 @@ Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass 
     
     env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
     
-    // Calculate bytes per layer
-    uint32_t blocksX = (width + 3) / 4;
-    uint32_t blocksY = (height + 3) / 4;
-    uint32_t bytesPerLayer = blocksX * blocksY * 16;
+    // Calculate bytes per layer using dynamic block dimensions
+    uint32_t bytesPerLayer = astc_bytes_per_layer(width, height, bw, bh);
     
-    LOGI("ASTC data: %zu bytes, %u bytes/layer, %u layers",
-         astcData.size(), bytesPerLayer, layerCount);
+    LOGI("ASTC data: %zu bytes, %u bytes/layer (block=%dx%d), %u layers",
+         astcData.size(), bytesPerLayer, bw, bh, layerCount);
     
     // Clear any pending GL errors
     while (glGetError() != GL_NO_ERROR) {}
@@ -707,8 +799,8 @@ Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass 
     }
     
     if (use_astc) {
-        // Upload compressed ASTC data directly
-        glCompressedTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+        // Upload compressed ASTC data directly using correct GL format
+        glCompressedTexImage3D(GL_TEXTURE_2D_ARRAY, 0, astcGlFormat,
                                 width, height, layerCount, 0,
                                 astcData.size(), astcData.data());
     } else {
@@ -721,7 +813,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass 
             const uint8_t* layerData = astcData.data() + (layer * bytesPerLayer);
             std::vector<uint8_t> rgbaData;
             
-            if (decode_astc_to_rgba(layerData, bytesPerLayer, width, height, rgbaData)) {
+            if (decode_astc_to_rgba(layerData, bytesPerLayer, width, height, bw, bh, rgbaData)) {
                 glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
                                 0, 0, layer,
                                 width, height, 1,
@@ -1128,7 +1220,13 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayer(JNIEnv *env, 
                                                                      jint layer,
                                                                      jint width, jint height,
                                                                      jbyteArray astc_data,
-                                                                     jboolean use_astc) {
+                                                                     jboolean use_astc,
+                                                                     jint gl_format,
+                                                                     jint block_w, jint block_h) {
+    int bw = (block_w > 0) ? block_w : 4;
+    int bh = (block_h > 0) ? block_h : 4;
+    GLenum astcGlFormat = (gl_format > 0) ? (GLenum)gl_format : GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    
     jsize data_length = env->GetArrayLength(astc_data);
     jbyte* data = env->GetByteArrayElements(astc_data, nullptr);
     if (!data) {
@@ -1146,16 +1244,16 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayer(JNIEnv *env, 
     }
     
     if (use_astc) {
-        // Upload compressed ASTC data
+        // Upload compressed ASTC data using correct GL format
         glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
                                    0, 0, layer,
                                    width, height, 1,
-                                   GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                   astcGlFormat,
                                    data_length, data);
     } else {
         // Decode ASTC to RGBA and upload
         std::vector<uint8_t> rgbaData;
-        if (!decode_astc_to_rgba((const uint8_t*)data, data_length, width, height, rgbaData)) {
+        if (!decode_astc_to_rgba((const uint8_t*)data, data_length, width, height, bw, bh, rgbaData)) {
             LOGE("Failed to decode ASTC for layer %d", layer);
             env->ReleaseByteArrayElements(astc_data, data, JNI_ABORT);
             return JNI_FALSE;
@@ -1186,7 +1284,10 @@ JNIEXPORT jint JNICALL
 Java_com_ktx2player_KTX2PlayerModule_nativeCreateTextureArray(JNIEnv *env, jclass clazz,
                                                                 jint width, jint height,
                                                                 jint layer_count,
-                                                                jboolean use_astc) {
+                                                                jboolean use_astc,
+                                                                jint gl_format) {
+    GLenum astcGlFormat = (gl_format > 0) ? (GLenum)gl_format : GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    
     // Clear any pending GL errors
     while (glGetError() != GL_NO_ERROR) {}
     
@@ -1202,14 +1303,8 @@ Java_com_ktx2player_KTX2PlayerModule_nativeCreateTextureArray(JNIEnv *env, jclas
     }
     
     if (use_astc) {
-        // Allocate compressed texture storage
-        // Calculate total size for all layers
-        uint32_t blocksX = (width + 3) / 4;
-        uint32_t blocksY = (height + 3) / 4;
-        uint32_t bytesPerLayer = blocksX * blocksY * 16;
-        
-        // Use glTexStorage3D for immutable storage
-        glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+        // Use glTexStorage3D for immutable storage with correct ASTC format
+        glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, astcGlFormat,
                        width, height, layer_count);
     } else {
         // Allocate RGBA texture storage
@@ -1247,7 +1342,13 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBuffer(JNI
                                                                                jint width, jint height,
                                                                                jobject buffer,
                                                                                jint data_length,
-                                                                               jboolean use_astc) {
+                                                                               jboolean use_astc,
+                                                                               jint gl_format,
+                                                                               jint block_w, jint block_h) {
+    int bw = (block_w > 0) ? block_w : 4;
+    int bh = (block_h > 0) ? block_h : 4;
+    GLenum astcGlFormat = (gl_format > 0) ? (GLenum)gl_format : GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    
     void* data = env->GetDirectBufferAddress(buffer);
     if (!data) {
         LOGE("Failed to get direct buffer address for layer upload");
@@ -1267,12 +1368,12 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBuffer(JNI
         glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
                                    0, 0, layer,
                                    width, height, 1,
-                                   GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                   astcGlFormat,
                                    data_length, data);
     } else {
         // Decode ASTC to RGBA and upload
         std::vector<uint8_t> rgbaData;
-        if (!decode_astc_to_rgba((const uint8_t*)data, data_length, width, height, rgbaData)) {
+        if (!decode_astc_to_rgba((const uint8_t*)data, data_length, width, height, bw, bh, rgbaData)) {
             LOGE("Failed to decode ASTC for layer %d", layer);
             return JNI_FALSE;
         }
@@ -1304,7 +1405,13 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWith
                                                                                         jobject buffer,
                                                                                         jint offset,
                                                                                         jint data_length,
-                                                                                        jboolean use_astc) {
+                                                                                        jboolean use_astc,
+                                                                                        jint gl_format,
+                                                                                        jint block_w, jint block_h) {
+    int bw = (block_w > 0) ? block_w : 4;
+    int bh = (block_h > 0) ? block_h : 4;
+    GLenum astcGlFormat = (gl_format > 0) ? (GLenum)gl_format : GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    
     void* buffer_base = env->GetDirectBufferAddress(buffer);
     if (!buffer_base) {
         LOGE("Failed to get direct buffer address for layer upload with offset");
@@ -1327,12 +1434,12 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWith
         glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
                                    0, 0, layer,
                                    width, height, 1,
-                                   GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                   astcGlFormat,
                                    data_length, data);
     } else {
         // Decode ASTC to RGBA and upload
         std::vector<uint8_t> rgbaData;
-        if (!decode_astc_to_rgba(data, data_length, width, height, rgbaData)) {
+        if (!decode_astc_to_rgba(data, data_length, width, height, bw, bh, rgbaData)) {
             LOGE("Failed to decode ASTC for layer %d (offset=%d)", layer, offset);
             return JNI_FALSE;
         }

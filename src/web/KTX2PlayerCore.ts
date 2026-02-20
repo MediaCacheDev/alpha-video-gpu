@@ -30,6 +30,8 @@ import {
   detectTextureFormat,
   getGLCompressedFormat,
   ASTC_FORMAT_MAP,
+  getASTCBlockSize,
+  getASTCBytesPerLayer,
 } from './ktx2-parser';
 
 import { getCachedFile, setCachedFile } from './cache';
@@ -730,17 +732,15 @@ export class KTX2PlayerCore {
 
       const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
       if (!astcExt) throw new Error('ASTC texture compression not supported. Texture arrays require ASTC support.');
-      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
-      if (vkFormat === 158) astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
+      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
       const textureArray = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, textureArray);
 
       if (useRamMode) {
         const gpuRingSize = 2;
-        const blocksX = Math.ceil(width / 4);
-        const blocksY = Math.ceil(height / 4);
-        const bytesPerLayer = blocksX * blocksY * 16;
+        const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
         const emptyData = new Uint8Array(bytesPerLayer * gpuRingSize);
         gl.compressedTexImage3D(gl.TEXTURE_2D_ARRAY, 0, astcFormat, width, height, gpuRingSize, 0, emptyData);
 
@@ -794,7 +794,7 @@ export class KTX2PlayerCore {
 
   private _initStreamingRingBuffer(
     gl: WebGL2RenderingContext, width: number, height: number,
-    astcFormat: number, layerCount: number
+    astcFormat: number, layerCount: number, vkFormat?: number
   ): void {
     const useVram = this._memoryStrategy === 'vram';
     this._useVramStrategy = useVram;
@@ -804,9 +804,9 @@ export class KTX2PlayerCore {
 
     console.log(`[KTX2Core] Memory strategy: ${this._memoryStrategy} (useVram=${useVram}), GPU cache: ${ringSize} slots`);
 
-    const blocksX = Math.ceil(width / 4);
-    const blocksY = Math.ceil(height / 4);
-    const bytesPerLayer = blocksX * blocksY * 16;
+    const bytesPerLayer = vkFormat != null
+      ? getASTCBytesPerLayer(width, height, vkFormat)
+      : Math.ceil(width / 4) * Math.ceil(height / 4) * 16; // fallback for legacy callers
 
     const ringBuffer = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, ringBuffer);
@@ -844,18 +844,16 @@ export class KTX2PlayerCore {
       if (supercompressionScheme !== 0) throw new Error('Uncompressed streaming requires supercompressionScheme=0');
 
       const level0Offset = Number(view.getBigUint64(80, true));
-      const blocksX = Math.ceil(width / 4);
-      const blocksY = Math.ceil(height / 4);
-      const bytesPerLayer = blocksX * blocksY * 16;
+      const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
 
       console.log(`[KTX2Core] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
 
       const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
       if (!astcExt) throw new Error('ASTC texture compression not supported');
-      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
-      if (vkFormat === 158) astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
+      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
-      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount);
+      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
 
       this._streamingMode = true;
       this._streamingLayerCount = layerCount;
@@ -933,21 +931,19 @@ export class KTX2PlayerCore {
       const level0Length = Number(view.getBigUint64(88, true));
       const level0UncompressedLength = Number(view.getBigUint64(96, true));
 
-      const blocksX = Math.ceil(width / 4);
-      const blocksY = Math.ceil(height / 4);
-      const bytesPerLayer = blocksX * blocksY * 16;
+      const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
 
       console.log(`[KTX2Core] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
 
       const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
       if (!astcExt) throw new Error('ASTC texture compression not supported');
-      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
-      if (vkFormat === 158) astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
+      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
       const decoder = await this._ensureZstdDecoder();
       const compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
 
-      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount);
+      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
 
       this._streamingMode = true;
       this._streamingIsInternalZstd = true;
@@ -1380,10 +1376,10 @@ export class KTX2PlayerCore {
 
       const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
       if (!astcExt) throw new Error('ASTC texture compression not supported');
-      let astcFormat: number = astcExt.COMPRESSED_RGBA_ASTC_4x4_KHR;
-      if (vkFormat === 158) astcFormat = astcExt.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR as number;
+      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
+      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
-      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount);
+      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
 
       this._streamingMode = true;
       this._streamingIsInternalZstd = false;
@@ -1399,9 +1395,7 @@ export class KTX2PlayerCore {
       this._useTextureArray = true;
       this._textures.push(gl.createTexture()!);
 
-      const blocksX = Math.ceil(width / 4);
-      const blocksY = Math.ceil(height / 4);
-      const bytesPerLayer = blocksX * blocksY * 16;
+      const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
 
       const newGenerator = decoder.decodeStreaming(compressedChunks);
       this._streamingDecompressState = {

@@ -52,8 +52,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class KTX2TextureView extends TextureView implements TextureView.SurfaceTextureListener {
     private static final String TAG = "KTX2TextureView";
     
-    // GL constants
-    private static final int GL_COMPRESSED_RGBA_ASTC_4x4_KHR = 0x93B0;
+    // GL constants - ASTC formats for all 14 block sizes
+    private static final int GL_COMPRESSED_RGBA_ASTC_4x4_KHR   = 0x93B0;
+    private static final int GL_COMPRESSED_RGBA_ASTC_5x4_KHR   = 0x93B1;
+    private static final int GL_COMPRESSED_RGBA_ASTC_5x5_KHR   = 0x93B2;
+    private static final int GL_COMPRESSED_RGBA_ASTC_6x5_KHR   = 0x93B3;
+    private static final int GL_COMPRESSED_RGBA_ASTC_6x6_KHR   = 0x93B4;
+    private static final int GL_COMPRESSED_RGBA_ASTC_8x5_KHR   = 0x93B5;
+    private static final int GL_COMPRESSED_RGBA_ASTC_8x6_KHR   = 0x93B6;
+    private static final int GL_COMPRESSED_RGBA_ASTC_8x8_KHR   = 0x93B7;
+    private static final int GL_COMPRESSED_RGBA_ASTC_10x5_KHR  = 0x93B8;
+    private static final int GL_COMPRESSED_RGBA_ASTC_10x6_KHR  = 0x93B9;
+    private static final int GL_COMPRESSED_RGBA_ASTC_10x8_KHR  = 0x93BA;
+    private static final int GL_COMPRESSED_RGBA_ASTC_10x10_KHR = 0x93BB;
+    private static final int GL_COMPRESSED_RGBA_ASTC_12x10_KHR = 0x93BC;
+    private static final int GL_COMPRESSED_RGBA_ASTC_12x12_KHR = 0x93BD;
     private static final int GL_COMPRESSED_RGBA8_ETC2_EAC = 0x9278;
     
     // React Native context
@@ -136,6 +149,11 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     
     // Native ASTC mode flag
     private boolean isNativeASTC = false;
+    
+    // ASTC block dimensions and GL format (derived from vkFormat, default 4x4)
+    private int astcBlockWidth = 4;
+    private int astcBlockHeight = 4;
+    private int astcGlFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
     
     // Stream mode flag from metadata (for internal KTX2 streaming)
     private boolean metadataStreamMode = false;
@@ -914,12 +932,17 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 // Check KTX2 magic
                 if (headerData[0] == (byte)0xAB && headerData[1] == 0x4B) {
                     ByteBuffer bb = ByteBuffer.wrap(headerData).order(ByteOrder.LITTLE_ENDIAN);
+                    int vkFormat = bb.getInt(12);
                     width = bb.getInt(20);
                     height = bb.getInt(24);
                     layerCount = bb.getInt(32);
                     level0Offset = bb.getLong(80);
                     headerParsed = true;
-                    Log.i(TAG, "Streaming texture: " + width + "x" + height + ", " + layerCount + " layers, offset=" + level0Offset);
+                    
+                    // Configure ASTC format from vkFormat
+                    configureASTCFromVkFormat(vkFormat);
+                    
+                    Log.i(TAG, "Streaming texture: " + width + "x" + height + ", " + layerCount + " layers, offset=" + level0Offset + ", vkFormat=" + vkFormat);
                 }
             }
             
@@ -981,7 +1004,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // - VRAM mode: Larger GPU cache (e.g., 60 slots) - this IS the sliding window
         // - RAM mode: Small ring buffer (e.g., 16 slots) - CPU RAM is the sliding window
         int textureLayerCount = Math.min(GPU_CACHE_SIZE, layerCount);
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(width, height, textureLayerCount, useAstc);
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(width, height, textureLayerCount, useAstc, astcGlFormat);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array"));
             KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
@@ -1014,9 +1037,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // IMPORTANT: The KTX2 file always contains ASTC data (zstd compressed).
         // Transcoding to RGBA32 happens at GPU upload time in nativeUploadTextureArrayLayer.
         // So for streaming decode, we always use ASTC size regardless of useAstc flag.
-        int blocksX = (width + 3) / 4;
-        int blocksY = (height + 3) / 4;
-        int bytesPerLayer = blocksX * blocksY * 16;  // ASTC 4x4: 16 bytes per block
+        int bytesPerLayer = astcBytesPerLayer(width, height);  // Dynamic ASTC block size
         
         // Track which virtual position is in each GPU slot (for both RAM and VRAM modes)
         // ringSlots[slot] = virtualPos of frame currently in that GPU slot (-1 if empty)
@@ -1216,7 +1237,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                             frameAccumulatorBuffer.flip();
                             boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
                                 textureArrayId, gpuSlot, finalWidth, finalHeight, 
-                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc);
+                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
+                                astcGlFormat, astcBlockWidth, astcBlockHeight);
                             if (uploaded) {
                                 ringSlots[gpuSlot] = virtualPos;
                             }
@@ -1326,7 +1348,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             if (frameData == null) return; // Not decoded yet (or already in GPU for VRAM mode)
             
             boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
-                textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc);
+                textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc,
+                astcGlFormat, astcBlockWidth, astcBlockHeight);
             if (uploaded) {
                 ringSlots[gpuSlot] = virtualPos;
                 
@@ -1648,19 +1671,21 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         }
         
         // Parse KTX2 header directly from mmap buffer (no RAM copy needed)
+        int vkFormat = mmapBuffer.getInt(12);
         int pixelWidth = mmapBuffer.getInt(20);
         int pixelHeight = mmapBuffer.getInt(24);
         int layerCount = mmapBuffer.getInt(32);
         if (layerCount == 0) layerCount = 1;
         long level0ByteOffset = mmapBuffer.getLong(80);
         
-        // Calculate bytes per frame
-        int blocksX = (pixelWidth + 3) / 4;
-        int blocksY = (pixelHeight + 3) / 4;
-        int bytesPerLayer = blocksX * blocksY * 16;
+        // Configure ASTC format from vkFormat
+        configureASTCFromVkFormat(vkFormat);
+        
+        // Calculate bytes per frame using dynamic ASTC block size
+        int bytesPerLayer = astcBytesPerLayer(pixelWidth, pixelHeight);
         
         Log.i(TAG, "Uncompressed streaming: " + pixelWidth + "x" + pixelHeight + ", " + 
-              layerCount + " layers, " + bytesPerLayer + " bytes/layer, data offset=" + level0ByteOffset);
+              layerCount + " layers, " + bytesPerLayer + " bytes/layer (ASTC " + astcBlockWidth + "x" + astcBlockHeight + "), data offset=" + level0ByteOffset);
         
         // Determine GPU cache size based on memory strategy
         boolean useVramStrategy = "vram".equals(memoryStrategy);
@@ -1673,7 +1698,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
               ", gpuCache=" + gpuCacheSize + ", vramMode=" + useVramStrategy);
         
         // Create GPU texture array
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, gpuCacheSize, useAstc);
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, gpuCacheSize, useAstc, astcGlFormat);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array for uncompressed streaming"));
             return;
@@ -1753,7 +1778,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     
                     boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
                         textureArrayId, gpuSlot, finalWidth, finalHeight, 
-                        frameSlice, finalBytesPerLayer, finalUseAstc);
+                        frameSlice, finalBytesPerLayer, finalUseAstc,
+                        astcGlFormat, astcBlockWidth, astcBlockHeight);
                     
                     if (uploaded) {
                         ringSlots[gpuSlot] = currentFrame;
@@ -1813,6 +1839,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Parse KTX2 header to get level0 info
         ByteBuffer header = ByteBuffer.wrap(headerData).order(ByteOrder.LITTLE_ENDIAN);
+        int vkFormat = header.getInt(12);
         int pixelWidth = header.getInt(20);
         int pixelHeight = header.getInt(24);
         int layerCount = header.getInt(32);
@@ -1821,13 +1848,14 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         long level0Length = header.getLong(88);  // Compressed size
         long level0UncompressedLength = header.getLong(96);
         
-        Log.i(TAG, "Internal zstd: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + " layers, " +
-              "compressed=" + level0Length + ", uncompressed=" + level0UncompressedLength);
+        // Configure ASTC format from vkFormat
+        configureASTCFromVkFormat(vkFormat);
         
-        // Calculate bytes per layer
-        int blocksX = (pixelWidth + 3) / 4;
-        int blocksY = (pixelHeight + 3) / 4;
-        int bytesPerLayer = blocksX * blocksY * 16;
+        Log.i(TAG, "Internal zstd: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + " layers, " +
+              "compressed=" + level0Length + ", uncompressed=" + level0UncompressedLength + ", vkFormat=" + vkFormat);
+        
+        // Calculate bytes per layer using dynamic ASTC block size
+        int bytesPerLayer = astcBytesPerLayer(pixelWidth, pixelHeight);
         
         // Verify uncompressed size matches expected
         long expectedUncompressed = (long)bytesPerLayer * layerCount;
@@ -1866,7 +1894,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Create texture array
         int textureLayerCount = Math.min(GPU_CACHE_SIZE, layerCount);
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, textureLayerCount, useAstc);
+        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, textureLayerCount, useAstc, astcGlFormat);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array for internal zstd streaming"));
             KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
@@ -2009,7 +2037,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                             frameAccumulatorBuffer.flip();
                             boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
                                 textureArrayId, gpuSlot, finalWidth, finalHeight, 
-                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc);
+                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
+                                astcGlFormat, astcBlockWidth, astcBlockHeight);
                             if (uploaded) {
                                 ringSlots[gpuSlot] = virtualPos;
                             }
@@ -2088,7 +2117,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             byte[] frameData = frameCache.get(virtualPos);
             if (frameData == null) return;
             boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
-                textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc);
+                textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc,
+                astcGlFormat, astcBlockWidth, astcBlockHeight);
             if (uploaded) {
                 ringSlots[gpuSlot] = virtualPos;
                 if (useVramStrategy) {
@@ -2606,6 +2636,43 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     }
     
     /**
+     * Configure ASTC block dimensions and GL format from a KTX2 vkFormat value.
+     * VkFormat 157-184 are ASTC UNORM/SRGB pairs for all 14 block sizes.
+     */
+    private void configureASTCFromVkFormat(int vkFormat) {
+        // Normalize to base (UNORM) value
+        int base = (vkFormat % 2 == 0) ? vkFormat - 1 : vkFormat;
+        switch (base) {
+            case 157: astcBlockWidth = 4;  astcBlockHeight = 4;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR;   break;
+            case 159: astcBlockWidth = 5;  astcBlockHeight = 4;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_5x4_KHR;   break;
+            case 161: astcBlockWidth = 5;  astcBlockHeight = 5;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_5x5_KHR;   break;
+            case 163: astcBlockWidth = 6;  astcBlockHeight = 5;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_6x5_KHR;   break;
+            case 165: astcBlockWidth = 6;  astcBlockHeight = 6;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_6x6_KHR;   break;
+            case 167: astcBlockWidth = 8;  astcBlockHeight = 5;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_8x5_KHR;   break;
+            case 169: astcBlockWidth = 8;  astcBlockHeight = 6;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_8x6_KHR;   break;
+            case 171: astcBlockWidth = 8;  astcBlockHeight = 8;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_8x8_KHR;   break;
+            case 173: astcBlockWidth = 10; astcBlockHeight = 5;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_10x5_KHR;  break;
+            case 175: astcBlockWidth = 10; astcBlockHeight = 6;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_10x6_KHR;  break;
+            case 177: astcBlockWidth = 10; astcBlockHeight = 8;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_10x8_KHR;  break;
+            case 179: astcBlockWidth = 10; astcBlockHeight = 10; astcGlFormat = GL_COMPRESSED_RGBA_ASTC_10x10_KHR; break;
+            case 181: astcBlockWidth = 12; astcBlockHeight = 10; astcGlFormat = GL_COMPRESSED_RGBA_ASTC_12x10_KHR; break;
+            case 183: astcBlockWidth = 12; astcBlockHeight = 12; astcGlFormat = GL_COMPRESSED_RGBA_ASTC_12x12_KHR; break;
+            default:  astcBlockWidth = 4;  astcBlockHeight = 4;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR;   break;
+        }
+        Log.i(TAG, "ASTC format: " + astcBlockWidth + "x" + astcBlockHeight + " (vkFormat=" + vkFormat + ", glFormat=0x" + Integer.toHexString(astcGlFormat) + ")");
+    }
+    
+    /**
+     * Calculate bytes per layer for the current ASTC block size.
+     * All ASTC blocks are 16 bytes (128 bits) regardless of block dimensions.
+     */
+    private int astcBytesPerLayer(int width, int height) {
+        int blocksX = (width + astcBlockWidth - 1) / astcBlockWidth;
+        int blocksY = (height + astcBlockHeight - 1) / astcBlockHeight;
+        return blocksX * blocksY * 16;
+    }
+    
+    /**
      * Decompress ASTC data from KTX2 without uploading to GPU.
      * Used for background thread preloading - upload happens on render thread.
      * Returns Object[] { byte[] textureData, int width, int height } or null on failure.
@@ -2616,9 +2683,13 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             
             ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
             
+            int vkFormat = header.getInt(12);
             int pixelWidth = header.getInt(20);
             int pixelHeight = header.getInt(24);
             int supercompressionScheme = header.getInt(44);
+            
+            // Configure ASTC format from vkFormat
+            configureASTCFromVkFormat(vkFormat);
             
             long level0ByteOffset = header.getLong(80);
             long level0ByteLength = header.getLong(88);
@@ -2652,7 +2723,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private int[] uploadASTCToGPU(byte[] textureData, int pixelWidth, int pixelHeight) {
         try {
             if (!isASTCSupported()) {
-                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight);
+                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight, astcBlockWidth, astcBlockHeight);
             }
             
             int[] textureIds = new int[1];
@@ -2665,7 +2736,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             textureBuffer.position(0);
             
             GLES30.glCompressedTexImage2D(
-                GLES30.GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                GLES30.GL_TEXTURE_2D, 0, astcGlFormat,
                 pixelWidth, pixelHeight, 0, textureData.length, textureBuffer);
             
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
@@ -2741,6 +2812,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             int pixelHeight = header.getInt(24);
             int supercompressionScheme = header.getInt(44);
             
+            // Configure ASTC format from vkFormat
+            configureASTCFromVkFormat(vkFormat);
+            
             Log.d(TAG, "Native ASTC - VkFormat=" + vkFormat + ", " + pixelWidth + "x" + pixelHeight + 
                   ", supercompression=" + supercompressionScheme);
             
@@ -2778,7 +2852,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 // Fallback: decode ASTC to RGBA in software (for emulator)
                 Log.w(TAG, "ASTC not supported - using software decode fallback (emulator mode)");
                 Log.w(TAG, "Note: ASTC textures require a real device for optimal performance");
-                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight);
+                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight, astcBlockWidth, astcBlockHeight);
             }
             
             // Upload to GPU as compressed texture
@@ -2794,7 +2868,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             GLES30.glCompressedTexImage2D(
                 GLES30.GL_TEXTURE_2D,
                 0,
-                GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
+                astcGlFormat,
                 pixelWidth,
                 pixelHeight,
                 0,
@@ -2837,20 +2911,22 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 return null;
             }
             
+            int vkFormat = header.getInt(12);
             int pixelWidth = header.getInt(20);
             int pixelHeight = header.getInt(24);
             int layerCount = header.getInt(32);
             if (layerCount == 0) layerCount = 1;
             int supercompressionScheme = header.getInt(44);  // Offset 44, not 48
             
+            // Configure ASTC format from vkFormat
+            configureASTCFromVkFormat(vkFormat);
+            
             // Get level 0 data offset and length
             long level0ByteOffset = header.getLong(80);
             long level0ByteLength = header.getLong(88);
             
-            // Calculate ASTC frame size
-            int blocksX = (pixelWidth + 3) / 4;
-            int blocksY = (pixelHeight + 3) / 4;
-            int bytesPerLayer = blocksX * blocksY * 16;
+            // Calculate ASTC frame size using dynamic block dimensions
+            int bytesPerLayer = astcBytesPerLayer(pixelWidth, pixelHeight);
             int totalSize = bytesPerLayer * layerCount;
             
             Log.d(TAG, "KTX2 header: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + 
@@ -2970,7 +3046,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     
                     // Create small ring buffer on GPU (2 frames for double buffering)
                     int gpuRingSize = 2;
-                    textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(texWidth, texHeight, gpuRingSize, useAstc);
+                    textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(texWidth, texHeight, gpuRingSize, useAstc, astcGlFormat);
                     if (textureArrayId == 0) {
                         throw new Exception("Failed to create GPU ring buffer for RAM mode");
                     }
@@ -3194,7 +3270,8 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 int offset = currentFrame * ramBytesPerFrame;
                 boolean useAstc = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
                 boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBufferWithOffset(
-                    textureArrayId, slot, frameWidth, frameHeight, ramFrameBuffer, offset, ramBytesPerFrame, useAstc);
+                    textureArrayId, slot, frameWidth, frameHeight, ramFrameBuffer, offset, ramBytesPerFrame, useAstc,
+                    astcGlFormat, astcBlockWidth, astcBlockHeight);
                 if (uploaded) {
                     ramUploadedFrame = currentFrame;
                 }

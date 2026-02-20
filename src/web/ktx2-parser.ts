@@ -158,18 +158,79 @@ export function extractKTX2Metadata(ktx2Data: Uint8Array): Metadata | null {
 
 /**
  * ASTC VkFormat → WebGL compressed format mapping.
+ * Covers all 14 ASTC block sizes (UNORM and SRGB variants).
  */
 export const ASTC_FORMAT_MAP: Record<number, number> = {
-  157: 0x93b0, // COMPRESSED_RGBA_ASTC_4x4_KHR
-  158: 0x93d0, // COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR
-  159: 0x93b1, 160: 0x93d1, 161: 0x93b2, 162: 0x93d2,
-  163: 0x93b3, 164: 0x93d3, 165: 0x93b4, 166: 0x93d4,
-  167: 0x93b5, 168: 0x93d5, 169: 0x93b6, 170: 0x93d6,
-  171: 0x93b7, 172: 0x93d7, 173: 0x93b8, 174: 0x93d8,
-  175: 0x93b9, 176: 0x93d9, 177: 0x93ba, 178: 0x93da,
-  179: 0x93bb, 180: 0x93db, 181: 0x93bc, 182: 0x93dc,
+  // 4x4
+  157: 0x93b0, 158: 0x93d0,
+  // 5x4
+  159: 0x93b1, 160: 0x93d1,
+  // 5x5
+  161: 0x93b2, 162: 0x93d2,
+  // 6x5
+  163: 0x93b3, 164: 0x93d3,
+  // 6x6
+  165: 0x93b4, 166: 0x93d4,
+  // 8x5
+  167: 0x93b5, 168: 0x93d5,
+  // 8x6
+  169: 0x93b6, 170: 0x93d6,
+  // 8x8
+  171: 0x93b7, 172: 0x93d7,
+  // 10x5
+  173: 0x93b8, 174: 0x93d8,
+  // 10x6
+  175: 0x93b9, 176: 0x93d9,
+  // 10x8
+  177: 0x93ba, 178: 0x93da,
+  // 10x10
+  179: 0x93bb, 180: 0x93db,
+  // 12x10
+  181: 0x93bc, 182: 0x93dc,
+  // 12x12
   183: 0x93bd, 184: 0x93dd,
 };
+
+/**
+ * ASTC VkFormat → block dimensions (width, height).
+ * All ASTC blocks are 128 bits (16 bytes), but pixel coverage varies.
+ * VkFormat values come in UNORM/SRGB pairs; both map to the same block size.
+ */
+export function getASTCBlockSize(vkFormat: number): { blockWidth: number; blockHeight: number } {
+  // VkFormat 157–184: ASTC UNORM/SRGB pairs
+  // Each pair shares the same block size. Normalize to the base (UNORM) value.
+  const base = (vkFormat % 2 === 0) ? vkFormat - 1 : vkFormat;
+  switch (base) {
+    case 157: return { blockWidth: 4,  blockHeight: 4 };
+    case 159: return { blockWidth: 5,  blockHeight: 4 };
+    case 161: return { blockWidth: 5,  blockHeight: 5 };
+    case 163: return { blockWidth: 6,  blockHeight: 5 };
+    case 165: return { blockWidth: 6,  blockHeight: 6 };
+    case 167: return { blockWidth: 8,  blockHeight: 5 };
+    case 169: return { blockWidth: 8,  blockHeight: 6 };
+    case 171: return { blockWidth: 8,  blockHeight: 8 };
+    case 173: return { blockWidth: 10, blockHeight: 5 };
+    case 175: return { blockWidth: 10, blockHeight: 6 };
+    case 177: return { blockWidth: 10, blockHeight: 8 };
+    case 179: return { blockWidth: 10, blockHeight: 10 };
+    case 181: return { blockWidth: 12, blockHeight: 10 };
+    case 183: return { blockWidth: 12, blockHeight: 12 };
+    default:  return { blockWidth: 4,  blockHeight: 4 }; // fallback
+  }
+}
+
+/**
+ * Calculate bytes per layer for an ASTC-compressed texture.
+ * All ASTC blocks are 16 bytes regardless of block dimensions.
+ */
+export function getASTCBytesPerLayer(
+  width: number, height: number, vkFormat: number
+): number {
+  const { blockWidth, blockHeight } = getASTCBlockSize(vkFormat);
+  const blocksX = Math.ceil(width / blockWidth);
+  const blocksY = Math.ceil(height / blockHeight);
+  return blocksX * blocksY * 16;
+}
 
 /**
  * Detect the best GPU-compressed texture format supported by the browser.

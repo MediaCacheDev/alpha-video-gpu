@@ -86,6 +86,10 @@
   NSInteger _uncompressedDecoderPosition;
   dispatch_queue_t _astcDecodeQueue;
   
+  // ASTC block dimensions (derived from vkFormat, default 4x4)
+  uint32_t _astcBlockWidth;
+  uint32_t _astcBlockHeight;
+  
   // React paused state (backing ivar for property)
   BOOL _reactPaused;
 }
@@ -155,6 +159,8 @@
     _decodedRgbaCache = nil;
     _uncompressedDecoderPosition = 0;
     _astcDecodeQueue = dispatch_queue_create("com.ktx2player.astcdecode", DISPATCH_QUEUE_SERIAL);
+    _astcBlockWidth = 4;
+    _astcBlockHeight = 4;
     
     // Initialize Basis transcoder (only once)
     if (!_basisInitialized) {
@@ -202,6 +208,70 @@
   _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
   _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
   _useCompressedFormat = NO;
+}
+
+/**
+ * Map a KTX2 vkFormat to the corresponding MTLPixelFormat and ASTC block dimensions.
+ * Supports all 14 ASTC block sizes (UNORM/SRGB pairs, VkFormat 157–184).
+ * Updates _metalPixelFormat, _astcBlockWidth, _astcBlockHeight.
+ * Returns YES if the vkFormat is a recognized ASTC format.
+ */
+- (BOOL)configureASTCFormatFromVkFormat:(uint32_t)vkFormat
+{
+  // All ASTC VkFormats come in UNORM/SRGB pairs.
+  // We use the sRGB MTLPixelFormat for both (matches visual output).
+  struct ASTCFormatInfo {
+    uint32_t vkFormatUnorm;
+    uint32_t vkFormatSrgb;
+    MTLPixelFormat pixelFormat;
+    uint32_t blockWidth;
+    uint32_t blockHeight;
+  };
+  
+  static const ASTCFormatInfo formats[] = {
+    { 157, 158, MTLPixelFormatASTC_4x4_sRGB,   4,  4 },
+    { 159, 160, MTLPixelFormatASTC_5x4_sRGB,   5,  4 },
+    { 161, 162, MTLPixelFormatASTC_5x5_sRGB,   5,  5 },
+    { 163, 164, MTLPixelFormatASTC_6x5_sRGB,   6,  5 },
+    { 165, 166, MTLPixelFormatASTC_6x6_sRGB,   6,  6 },
+    { 167, 168, MTLPixelFormatASTC_8x5_sRGB,   8,  5 },
+    { 169, 170, MTLPixelFormatASTC_8x6_sRGB,   8,  6 },
+    { 171, 172, MTLPixelFormatASTC_8x8_sRGB,   8,  8 },
+    { 173, 174, MTLPixelFormatASTC_10x5_sRGB,  10, 5 },
+    { 175, 176, MTLPixelFormatASTC_10x6_sRGB,  10, 6 },
+    { 177, 178, MTLPixelFormatASTC_10x8_sRGB,  10, 8 },
+    { 179, 180, MTLPixelFormatASTC_10x10_sRGB, 10, 10 },
+    { 181, 182, MTLPixelFormatASTC_12x10_sRGB, 12, 10 },
+    { 183, 184, MTLPixelFormatASTC_12x12_sRGB, 12, 12 },
+  };
+  
+  for (const auto &fmt : formats) {
+    if (vkFormat == fmt.vkFormatUnorm || vkFormat == fmt.vkFormatSrgb) {
+      _metalPixelFormat = fmt.pixelFormat;
+      _astcBlockWidth = fmt.blockWidth;
+      _astcBlockHeight = fmt.blockHeight;
+      NSLog(@"KTX2PlayerView: ASTC format: %ux%u (VkFormat=%u, MTLPixelFormat=%lu)",
+            fmt.blockWidth, fmt.blockHeight, vkFormat, (unsigned long)fmt.pixelFormat);
+      return YES;
+    }
+  }
+  
+  NSLog(@"KTX2PlayerView: Unknown ASTC VkFormat: %u, falling back to 4x4", vkFormat);
+  _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
+  _astcBlockWidth = 4;
+  _astcBlockHeight = 4;
+  return NO;
+}
+
+/**
+ * Calculate bytes per layer for the current ASTC block size.
+ * All ASTC blocks are 16 bytes (128 bits) regardless of block dimensions.
+ */
+- (uint32_t)astcBytesPerLayerForWidth:(uint32_t)width height:(uint32_t)height
+{
+  uint32_t blocksX = (width + _astcBlockWidth - 1) / _astcBlockWidth;
+  uint32_t blocksY = (height + _astcBlockHeight - 1) / _astcBlockHeight;
+  return blocksX * blocksY * 16;
 }
 
 - (void)setSource:(NSDictionary *)source
@@ -865,12 +935,19 @@
       if (decompressedHeader.length >= 104 && !headerParsed) {
         const uint8_t *bytes = (const uint8_t *)decompressedHeader.bytes;
         if (bytes[0] == 0xAB && bytes[1] == 0x4B) {
+          uint32_t vkFormat = *(uint32_t *)(bytes + 12);
           width = *(uint32_t *)(bytes + 20);
           height = *(uint32_t *)(bytes + 24);
           layerCount = *(uint32_t *)(bytes + 32);
           level0Offset = *(uint64_t *)(bytes + 80);
           headerParsed = YES;
-          NSLog(@"KTX2PlayerView: Streaming texture: %ux%u, %u layers, offset=%llu", width, height, layerCount, level0Offset);
+          
+          // Configure ASTC format from vkFormat
+          dispatch_sync(dispatch_get_main_queue(), ^{
+            [self configureASTCFormatFromVkFormat:vkFormat];
+          });
+          
+          NSLog(@"KTX2PlayerView: Streaming texture: %ux%u, %u layers, offset=%llu, vkFormat=%u", width, height, layerCount, level0Offset, vkFormat);
         }
       }
     }
@@ -912,12 +989,10 @@
       return;
     }
     
-    // Calculate bytes per layer
-    uint32_t blocksX = (width + 3) / 4;
-    uint32_t blocksY = (height + 3) / 4;
-    uint32_t bytesPerLayer = blocksX * blocksY * 16;
+    // Calculate bytes per layer using current ASTC block dimensions
+    uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
     
-    NSLog(@"KTX2PlayerView: Bytes per layer: %u, level0Offset: %llu", bytesPerLayer, level0Offset);
+    NSLog(@"KTX2PlayerView: Bytes per layer: %u (ASTC %ux%u), level0Offset: %llu", bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
     
     // Determine memory strategy
     BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
@@ -1240,23 +1315,25 @@
                    bytesPerImage:_streamBytesPerLayer];
   } else {
     // Decode ASTC to RGBA for simulator
-    uint32_t blocksX = (self.frameWidth + 3) / 4;
-    uint32_t blocksY = (self.frameHeight + 3) / 4;
+    uint32_t bw = _astcBlockWidth;
+    uint32_t bh = _astcBlockHeight;
+    uint32_t blocksX = (self.frameWidth + bw - 1) / bw;
+    uint32_t blocksY = (self.frameHeight + bh - 1) / bh;
     std::vector<uint8_t> rgbaData(self.frameWidth * self.frameHeight * 4);
     
     const uint8_t *astcData = (const uint8_t *)frameData;
     for (uint32_t by = 0; by < blocksY; by++) {
       for (uint32_t bx = 0; bx < blocksX; bx++) {
         const uint8_t *block = astcData + (by * blocksX + bx) * 16;
-        uint8_t blockPixels[4 * 4 * 4];
-        basisu::astc::decompress(blockPixels, block, false, 4, 4);
+        uint8_t blockPixels[12 * 12 * 4]; // max ASTC block size
+        basisu::astc::decompress(blockPixels, block, false, bw, bh);
         
-        for (int y = 0; y < 4 && (by * 4 + y) < self.frameHeight; y++) {
-          for (int x = 0; x < 4 && (bx * 4 + x) < self.frameWidth; x++) {
-            uint32_t dstX = bx * 4 + x;
-            uint32_t dstY = by * 4 + y;
+        for (uint32_t y = 0; y < bh && (by * bh + y) < self.frameHeight; y++) {
+          for (uint32_t x = 0; x < bw && (bx * bw + x) < self.frameWidth; x++) {
+            uint32_t dstX = bx * bw + x;
+            uint32_t dstY = by * bh + y;
             uint8_t *dst = rgbaData.data() + (dstY * self.frameWidth + dstX) * 4;
-            uint8_t *src = blockPixels + (y * 4 + x) * 4;
+            uint8_t *src = blockPixels + (y * bw + x) * 4;
             memcpy(dst, src, 4);
           }
         }
@@ -1446,18 +1523,19 @@
   
   // Parse KTX2 header from mmap
   const uint8_t *data = (const uint8_t *)mmapData;
+  uint32_t vkFormat = *(uint32_t *)(data + 12);
   uint32_t width = *(uint32_t *)(data + 20);
   uint32_t height = *(uint32_t *)(data + 24);
   uint32_t layerCount = *(uint32_t *)(data + 32);
   if (layerCount == 0) layerCount = 1;
   uint64_t level0Offset = *(uint64_t *)(data + 80);
   
-  uint32_t blocksX = (width + 3) / 4;
-  uint32_t blocksY = (height + 3) / 4;
-  uint32_t bytesPerLayer = blocksX * blocksY * 16;
+  // Configure ASTC format from vkFormat
+  [self configureASTCFormatFromVkFormat:vkFormat];
+  uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
   
-  NSLog(@"KTX2PlayerView: Uncompressed streaming: %ux%u, %u layers, %u bytes/layer, offset=%llu",
-        width, height, layerCount, bytesPerLayer, level0Offset);
+  NSLog(@"KTX2PlayerView: Uncompressed streaming: %ux%u, %u layers, %u bytes/layer (ASTC %ux%u), offset=%llu",
+        width, height, layerCount, bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
   
   // Determine GPU cache size
   BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
@@ -1536,23 +1614,25 @@
           uint64_t frameOffset = self->_streamLevel0Offset + (uint64_t)i * self->_streamBytesPerLayer;
           const uint8_t *frameData = data + frameOffset;
           
-          uint32_t blocksX = (width + 3) / 4;
-          uint32_t blocksY = (height + 3) / 4;
+          uint32_t bw = self->_astcBlockWidth;
+          uint32_t bh = self->_astcBlockHeight;
+          uint32_t blocksX = (width + bw - 1) / bw;
+          uint32_t blocksY = (height + bh - 1) / bh;
           NSMutableData *rgbaData = [NSMutableData dataWithLength:width * height * 4];
           uint8_t *rgba = (uint8_t *)rgbaData.mutableBytes;
           
           for (uint32_t by = 0; by < blocksY; by++) {
             for (uint32_t bx = 0; bx < blocksX; bx++) {
               const uint8_t *block = frameData + (by * blocksX + bx) * 16;
-              uint8_t blockPixels[4 * 4 * 4];
-              basisu::astc::decompress(blockPixels, block, false, 4, 4);
+              uint8_t blockPixels[12 * 12 * 4]; // max ASTC block size
+              basisu::astc::decompress(blockPixels, block, false, bw, bh);
               
-              for (int y = 0; y < 4 && (by * 4 + y) < height; y++) {
-                for (int x = 0; x < 4 && (bx * 4 + x) < width; x++) {
-                  uint32_t dstX = bx * 4 + x;
-                  uint32_t dstY = by * 4 + y;
+              for (uint32_t y = 0; y < bh && (by * bh + y) < height; y++) {
+                for (uint32_t x = 0; x < bw && (bx * bw + x) < width; x++) {
+                  uint32_t dstX = bx * bw + x;
+                  uint32_t dstY = by * bh + y;
                   uint8_t *dst = rgba + (dstY * width + dstX) * 4;
-                  uint8_t *src = blockPixels + (y * 4 + x) * 4;
+                  uint8_t *src = blockPixels + (y * bw + x) * 4;
                   memcpy(dst, src, 4);
                 }
               }
@@ -1674,22 +1754,24 @@
                    bytesPerImage:_streamBytesPerLayer];
   } else {
     // Decode ASTC to RGBA for simulator
-    uint32_t blocksX = (self.frameWidth + 3) / 4;
-    uint32_t blocksY = (self.frameHeight + 3) / 4;
+    uint32_t bw = _astcBlockWidth;
+    uint32_t bh = _astcBlockHeight;
+    uint32_t blocksX = (self.frameWidth + bw - 1) / bw;
+    uint32_t blocksY = (self.frameHeight + bh - 1) / bh;
     std::vector<uint8_t> rgbaData(self.frameWidth * self.frameHeight * 4);
     
     for (uint32_t by = 0; by < blocksY; by++) {
       for (uint32_t bx = 0; bx < blocksX; bx++) {
         const uint8_t *block = frameData + (by * blocksX + bx) * 16;
-        uint8_t blockPixels[4 * 4 * 4];
-        basisu::astc::decompress(blockPixels, block, false, 4, 4);
+        uint8_t blockPixels[12 * 12 * 4]; // max ASTC block size
+        basisu::astc::decompress(blockPixels, block, false, bw, bh);
         
-        for (int y = 0; y < 4 && (by * 4 + y) < self.frameHeight; y++) {
-          for (int x = 0; x < 4 && (bx * 4 + x) < self.frameWidth; x++) {
-            uint32_t dstX = bx * 4 + x;
-            uint32_t dstY = by * 4 + y;
+        for (uint32_t y = 0; y < bh && (by * bh + y) < self.frameHeight; y++) {
+          for (uint32_t x = 0; x < bw && (bx * bw + x) < self.frameWidth; x++) {
+            uint32_t dstX = bx * bw + x;
+            uint32_t dstY = by * bh + y;
             uint8_t *dst = rgbaData.data() + (dstY * self.frameWidth + dstX) * 4;
-            uint8_t *src = blockPixels + (y * 4 + x) * 4;
+            uint8_t *src = blockPixels + (y * bw + x) * 4;
             memcpy(dst, src, 4);
           }
         }
@@ -1741,23 +1823,25 @@
       uint64_t frameOffset = self->_streamLevel0Offset + (uint64_t)frameIndex * self->_streamBytesPerLayer;
       const uint8_t *frameData = data + frameOffset;
       
-      uint32_t blocksX = (self.frameWidth + 3) / 4;
-      uint32_t blocksY = (self.frameHeight + 3) / 4;
+      uint32_t bw = self->_astcBlockWidth;
+      uint32_t bh = self->_astcBlockHeight;
+      uint32_t blocksX = (self.frameWidth + bw - 1) / bw;
+      uint32_t blocksY = (self.frameHeight + bh - 1) / bh;
       NSMutableData *rgbaData = [NSMutableData dataWithLength:self.frameWidth * self.frameHeight * 4];
       uint8_t *rgba = (uint8_t *)rgbaData.mutableBytes;
       
       for (uint32_t by = 0; by < blocksY; by++) {
         for (uint32_t bx = 0; bx < blocksX; bx++) {
           const uint8_t *block = frameData + (by * blocksX + bx) * 16;
-          uint8_t blockPixels[4 * 4 * 4];
-          basisu::astc::decompress(blockPixels, block, false, 4, 4);
+          uint8_t blockPixels[12 * 12 * 4]; // max ASTC block size
+          basisu::astc::decompress(blockPixels, block, false, bw, bh);
           
-          for (int y = 0; y < 4 && (by * 4 + y) < self.frameHeight; y++) {
-            for (int x = 0; x < 4 && (bx * 4 + x) < self.frameWidth; x++) {
-              uint32_t dstX = bx * 4 + x;
-              uint32_t dstY = by * 4 + y;
+          for (uint32_t y = 0; y < bh && (by * bh + y) < self.frameHeight; y++) {
+            for (uint32_t x = 0; x < bw && (bx * bw + x) < self.frameWidth; x++) {
+              uint32_t dstX = bx * bw + x;
+              uint32_t dstY = by * bh + y;
               uint8_t *dst = rgba + (dstY * self.frameWidth + dstX) * 4;
-              uint8_t *src = blockPixels + (y * 4 + x) * 4;
+              uint8_t *src = blockPixels + (y * bw + x) * 4;
               memcpy(dst, src, 4);
             }
           }
@@ -1858,33 +1942,35 @@
 }
 
 /**
- * Decode ASTC 4x4 compressed data to RGBA using proper decoder.
+ * Decode ASTC compressed data to RGBA using proper decoder.
  * Uses basisu::astc::decompress from astc_decomp.cpp
+ * Supports all ASTC block sizes via _astcBlockWidth/_astcBlockHeight.
  */
 - (NSData *)decodeASTCToRGBA:(NSData *)astcData width:(uint32_t)width height:(uint32_t)height
 {
   const uint8_t *blocks = (const uint8_t *)[astcData bytes];
-  const int blockWidth = 4;
-  const int blockHeight = 4;
-  uint32_t blocksX = (width + blockWidth - 1) / blockWidth;
-  uint32_t blocksY = (height + blockHeight - 1) / blockHeight;
+  const uint32_t bw = _astcBlockWidth;
+  const uint32_t bh = _astcBlockHeight;
+  uint32_t blocksX = (width + bw - 1) / bw;
+  uint32_t blocksY = (height + bh - 1) / bh;
   
   NSMutableData *rgbaData = [NSMutableData dataWithLength:width * height * 4];
   uint8_t *rgba = (uint8_t *)[rgbaData mutableBytes];
   memset(rgba, 0, width * height * 4);
   
-  // Temporary buffer for one decoded block
-  uint8_t blockPixels[blockWidth * blockHeight * 4];
+  // Temporary buffer for one decoded block (max 12x12)
+  uint8_t blockPixels[12 * 12 * 4];
   
   for (uint32_t by = 0; by < blocksY; by++) {
     for (uint32_t bx = 0; bx < blocksX; bx++) {
       const uint8_t *block = blocks + (by * blocksX + bx) * 16;
       
       // Use proper ASTC decoder (sRGB = false for linear decoding)
-      bool success = basisu::astc::decompress(blockPixels, block, false, blockWidth, blockHeight);
+      bool success = basisu::astc::decompress(blockPixels, block, false, bw, bh);
       if (!success) {
         // Fill with magenta to indicate decode error
-        for (int i = 0; i < 16; i++) {
+        uint32_t pixelsInBlock = bw * bh;
+        for (uint32_t i = 0; i < pixelsInBlock; i++) {
           blockPixels[i * 4 + 0] = 255;
           blockPixels[i * 4 + 1] = 0;
           blockPixels[i * 4 + 2] = 255;
@@ -1893,12 +1979,12 @@
       }
       
       // Copy block to output
-      for (uint32_t y = 0; y < blockHeight && (by * blockHeight + y) < height; y++) {
-        for (uint32_t x = 0; x < blockWidth && (bx * blockWidth + x) < width; x++) {
-          uint32_t dstX = bx * blockWidth + x;
-          uint32_t dstY = by * blockHeight + y;
+      for (uint32_t y = 0; y < bh && (by * bh + y) < height; y++) {
+        for (uint32_t x = 0; x < bw && (bx * bw + x) < width; x++) {
+          uint32_t dstX = bx * bw + x;
+          uint32_t dstY = by * bh + y;
           uint8_t *dst = rgba + (dstY * width + dstX) * 4;
-          uint8_t *src = blockPixels + (y * blockWidth + x) * 4;
+          uint8_t *src = blockPixels + (y * bw + x) * 4;
           dst[0] = src[0];
           dst[1] = src[1];
           dst[2] = src[2];
@@ -1908,7 +1994,7 @@
     }
   }
   
-  NSLog(@"KTX2PlayerView: Decoded ASTC %ux%u (%u x %u blocks) to RGBA", width, height, blocksX, blocksY);
+  NSLog(@"KTX2PlayerView: Decoded ASTC %ux%u (%u x %u blocks, block=%ux%u) to RGBA", width, height, blocksX, blocksY, bw, bh);
   return rgbaData;
 }
 
@@ -1933,6 +2019,9 @@
   
   NSLog(@"KTX2PlayerView: Native ASTC - VkFormat=%u, %ux%u, supercompression=%u",
         vkFormat, pixelWidth, pixelHeight, supercompressionScheme);
+  
+  // Configure ASTC format from vkFormat (sets _metalPixelFormat, _astcBlockWidth, _astcBlockHeight)
+  [self configureASTCFormatFromVkFormat:vkFormat];
   
   // Read level index (after 80-byte header)
   // Level index: array of { byteOffset: uint64, byteLength: uint64, uncompressedByteLength: uint64 }
@@ -2013,9 +2102,10 @@
   *outHeight = height;
   
   // Calculate transcoded data size
+  // Note: Basis Universal transcoding always targets ASTC 4x4
   uint32_t dataSize;
   if (_useCompressedFormat) {
-    uint32_t blocksX = (width + 3) / 4;
+    uint32_t blocksX = (width + 3) / 4;  // Always 4x4 for Basis transcoding
     uint32_t blocksY = (height + 3) / 4;
     dataSize = blocksX * blocksY * 16;
   } else {
@@ -2111,6 +2201,7 @@
     
     // Parse KTX2 header
     const uint8_t *bytes = (const uint8_t *)[ktx2Data bytes];
+    uint32_t vkFormat = *(uint32_t *)(bytes + 12);
     uint32_t width = *(uint32_t *)(bytes + 20);
     uint32_t height = *(uint32_t *)(bytes + 24);
     uint32_t layerCount = *(uint32_t *)(bytes + 32);
@@ -2121,8 +2212,13 @@
     uint64_t level0Length = *(uint64_t *)(bytes + 88);
     uint64_t level0UncompressedLength = *(uint64_t *)(bytes + 96);
     
-    NSLog(@"KTX2PlayerView: Texture array: %ux%u, %u layers, supercompression=%u, streamMode=%d",
-          width, height, layerCount, supercompressionScheme, streamMode);
+    // Configure ASTC format from vkFormat
+    dispatch_sync(dispatch_get_main_queue(), ^{
+      [self configureASTCFormatFromVkFormat:vkFormat];
+    });
+    
+    NSLog(@"KTX2PlayerView: Texture array: %ux%u, %u layers, supercompression=%u, streamMode=%d, vkFormat=%u",
+          width, height, layerCount, supercompressionScheme, streamMode, vkFormat);
     
     // Check for internal zstd streaming mode
     if (streamMode && supercompressionScheme == 2 && filePath) {
@@ -2165,13 +2261,13 @@
       astcData = [NSData dataWithBytes:bytes + level0Offset length:(NSUInteger)level0Length];
     }
     
-    // Calculate bytes per layer
-    uint32_t blocksX = (width + 3) / 4;
-    uint32_t blocksY = (height + 3) / 4;
+    // Calculate bytes per layer using current ASTC block dimensions
+    uint32_t blocksX = (width + _astcBlockWidth - 1) / _astcBlockWidth;
+    uint32_t blocksY = (height + _astcBlockHeight - 1) / _astcBlockHeight;
     uint32_t bytesPerLayer = blocksX * blocksY * 16;
     
-    NSLog(@"KTX2PlayerView: ASTC data: %lu bytes, %u bytes/layer, %u layers",
-          (unsigned long)astcData.length, bytesPerLayer, layerCount);
+    NSLog(@"KTX2PlayerView: ASTC data: %lu bytes, %u bytes/layer (ASTC %ux%u), %u layers",
+          (unsigned long)astcData.length, bytesPerLayer, _astcBlockWidth, _astcBlockHeight, layerCount);
     
     // Pre-decode ASTC to RGBA on background thread for simulator (avoid main thread freeze)
     NSMutableArray<NSData *> *decodedLayers = nil;
@@ -2201,7 +2297,7 @@
       // Create texture array descriptor
       MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
       descriptor.textureType = MTLTextureType2DArray;
-      descriptor.pixelFormat = self->_useCompressedFormat ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatRGBA8Unorm;
+      descriptor.pixelFormat = self->_useCompressedFormat ? self->_metalPixelFormat : MTLPixelFormatRGBA8Unorm;
       descriptor.width = width;
       descriptor.height = height;
       descriptor.arrayLength = layerCount;
@@ -2338,10 +2434,8 @@
     return;
   }
   
-  // Calculate bytes per layer
-  uint32_t blocksX = (width + 3) / 4;
-  uint32_t blocksY = (height + 3) / 4;
-  uint32_t bytesPerLayer = blocksX * blocksY * 16;
+  // Calculate bytes per layer using current ASTC block dimensions
+  uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
   
   // Determine memory strategy
   BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
@@ -2350,8 +2444,8 @@
       MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
       MIN(self.streamingRingSize, (NSInteger)layerCount);
   
-  NSLog(@"KTX2PlayerView: Internal zstd streaming params: strategy=%@, gpuCache=%ld",
-        self.memoryStrategy, (long)gpuCacheSize);
+  NSLog(@"KTX2PlayerView: Internal zstd streaming params: strategy=%@, gpuCache=%ld, bytesPerLayer=%u (ASTC %ux%u)",
+        self.memoryStrategy, (long)gpuCacheSize, bytesPerLayer, _astcBlockWidth, _astcBlockHeight);
   
   // Store streaming state
   const uint8_t *compressedDataPtr = (const uint8_t *)mmapData + offsetAdjustment;
@@ -2466,8 +2560,8 @@
             continue;
           }
           
-          blocksX = (width + 3) / 4;
-          blocksY = (height + 3) / 4;
+          blocksX = (width + self->_astcBlockWidth - 1) / self->_astcBlockWidth;
+          blocksY = (height + self->_astcBlockHeight - 1) / self->_astcBlockHeight;
           
           if (!self->_useCompressedFormat) {
             NSLog(@"KTX2PlayerView: ASTC not supported - decoding to RGBA");
@@ -2494,7 +2588,7 @@
           
           uint32_t dataSize;
           if (self->_useCompressedFormat) {
-            blocksX = (width + 3) / 4;
+            blocksX = (width + 3) / 4;  // Always 4x4 for Basis transcoding
             blocksY = (height + 3) / 4;
             dataSize = blocksX * blocksY * 16;
           } else {
@@ -2577,8 +2671,8 @@
             continue;
           }
           
-          blocksX = (width + 3) / 4;
-          blocksY = (height + 3) / 4;
+          blocksX = (width + self->_astcBlockWidth - 1) / self->_astcBlockWidth;
+          blocksY = (height + self->_astcBlockHeight - 1) / self->_astcBlockHeight;
           
           // Check if we need to decode ASTC to RGBA (simulator or unsupported device)
           if (!self->_useCompressedFormat) {
@@ -2611,7 +2705,7 @@
           uint32_t dataSize;
           
           if (self->_useCompressedFormat) {
-            blocksX = (width + 3) / 4;
+            blocksX = (width + 3) / 4;  // Always 4x4 for Basis transcoding
             blocksY = (height + 3) / 4;
             dataSize = blocksX * blocksY * 16;
           } else {

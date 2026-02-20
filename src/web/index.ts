@@ -26,6 +26,8 @@ export {
   detectTextureFormat,
   getGLCompressedFormat,
   ASTC_FORMAT_MAP,
+  getASTCBlockSize,
+  getASTCBytesPerLayer,
 } from './ktx2-parser';
 
 export { getCachedFile, setCachedFile } from './cache';
