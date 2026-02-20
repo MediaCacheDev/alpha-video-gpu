@@ -36,11 +36,18 @@
   "bugs": {
     "url": "https://github.com/user/react-native-ktx2player/issues"
   },
+  "exports": {
+    ".": "./index.js",
+    "./web": "./src/web/index.ts",
+    "./standalone": "./standalone/index.ts",
+    "./standalone/react": "./standalone/react.tsx"
+  },
   "files": [
     "android/src/",
     "android/build.gradle",
     "ios/",
     "src/",
+    "standalone/",
     "scripts/",
     "index.js",
     "react-native.config.js",
