@@ -247,17 +247,25 @@
   
   for (const auto &fmt : formats) {
     if (vkFormat == fmt.vkFormatUnorm || vkFormat == fmt.vkFormatSrgb) {
-      _metalPixelFormat = fmt.pixelFormat;
+      // Always set block dimensions (needed for software decoding on simulator)
       _astcBlockWidth = fmt.blockWidth;
       _astcBlockHeight = fmt.blockHeight;
-      NSLog(@"KTX2PlayerView: ASTC format: %ux%u (VkFormat=%u, MTLPixelFormat=%lu)",
-            fmt.blockWidth, fmt.blockHeight, vkFormat, (unsigned long)fmt.pixelFormat);
+      
+      // Only update pixel format if using compressed format (real device)
+      // On simulator, _useCompressedFormat is NO and _metalPixelFormat is RGBA8Unorm
+#if !TARGET_OS_SIMULATOR
+      _metalPixelFormat = fmt.pixelFormat;
+#endif
+      NSLog(@"KTX2PlayerView: ASTC format: %ux%u (VkFormat=%u, MTLPixelFormat=%lu, useCompressed=%d)",
+            fmt.blockWidth, fmt.blockHeight, vkFormat, (unsigned long)_metalPixelFormat, _useCompressedFormat);
       return YES;
     }
   }
   
   NSLog(@"KTX2PlayerView: Unknown ASTC VkFormat: %u, falling back to 4x4", vkFormat);
+#if !TARGET_OS_SIMULATOR
   _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
+#endif
   _astcBlockWidth = 4;
   _astcBlockHeight = 4;
   return NO;
