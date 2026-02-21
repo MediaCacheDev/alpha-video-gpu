@@ -2328,12 +2328,13 @@
         
         if (self->_useCompressedFormat) {
           // Upload compressed ASTC directly (real device)
+          // bytesPerRow must be 0 for compressed textures per Apple docs
           const uint8_t *layerData = astcBytes + (layer * bytesPerLayer);
           [self->_textureArray replaceRegion:region
                                  mipmapLevel:0
                                        slice:layer
                                    withBytes:layerData
-                                 bytesPerRow:blocksX * 16
+                                 bytesPerRow:0
                                bytesPerImage:bytesPerLayer];
         } else {
           // Upload pre-decoded RGBA (simulator)
