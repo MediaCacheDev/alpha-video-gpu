@@ -1,6 +1,7 @@
 /**
- * KTX2PlayerView - React Native Web Implementation
+ * AlphaVideoGpuView - React Native Web Implementation
  *
+ * GPU-accelerated transparent alpha video player.
  * Thin wrapper around KTX2PlayerCore for React Native Web.
  * Same API as native iOS/Android implementations.
  *
@@ -21,14 +22,15 @@ import { KTX2PlayerCore } from './web/KTX2PlayerCore';
 import type { KTX2LoadEvent } from './web/types';
 
 // Re-export types from core for API compatibility
-export type { KTX2LoadEvent, PlayerState } from './web/types';
+export type { KTX2LoadEvent as AlphaVideoGpuLoadEvent, PlayerState } from './web/types';
+export type { KTX2LoadEvent } from './web/types'; // Legacy alias
 
 export interface SourceType {
   uri?: string;
   cacheKey?: string;
 }
 
-export interface KTX2PlayerViewProps {
+export interface AlphaVideoGpuViewProps {
   source?: SourceType | string | null;
   /** For multi-part animations: array of all part sources (first part contains metadata) */
   parts?: SourceType[] | null;
@@ -60,10 +62,10 @@ export interface KTX2PlayerViewProps {
 }
 
 // ============================================================================
-// KTX2PlayerView Component — Thin React Native Web wrapper
+// AlphaVideoGpuView Component — Thin React Native Web wrapper
 // ============================================================================
 
-export const KTX2PlayerView: React.FC<KTX2PlayerViewProps> = ({
+export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
   source,
   parts,
   autoPlay = true,
@@ -208,6 +210,10 @@ const styles = StyleSheet.create({
   },
 });
 
-KTX2PlayerView.displayName = 'KTX2PlayerView';
+AlphaVideoGpuView.displayName = 'AlphaVideoGpuView';
 
-export default KTX2PlayerView;
+// Legacy alias for backwards compatibility
+export const KTX2PlayerView = AlphaVideoGpuView;
+export type KTX2PlayerViewProps = AlphaVideoGpuViewProps;
+
+export default AlphaVideoGpuView;

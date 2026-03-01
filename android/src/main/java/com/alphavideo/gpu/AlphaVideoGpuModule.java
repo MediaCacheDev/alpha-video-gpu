@@ -1,4 +1,4 @@
-package com.ktx2player;
+package com.alphavideo.gpu;
 
 import androidx.annotation.NonNull;
 
@@ -7,25 +7,25 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.module.annotations.ReactModule;
 
 /**
- * Native module for KTX2 texture transcoding.
+ * Native module for GPU texture transcoding.
  * Provides JNI bindings to the Basis Universal transcoder.
  */
-@ReactModule(name = KTX2PlayerModule.NAME)
-public class KTX2PlayerModule extends ReactContextBaseJavaModule {
+@ReactModule(name = AlphaVideoGpuModule.NAME)
+public class AlphaVideoGpuModule extends ReactContextBaseJavaModule {
 
-    public static final String NAME = "KTX2PlayerModule";
+    public static final String NAME = "AlphaVideoGpuModule";
     private static boolean sLibraryLoaded = false;
 
     static {
         try {
-            System.loadLibrary("ktx2player");
+            System.loadLibrary("alphavideogpu");
             sLibraryLoaded = true;
         } catch (UnsatisfiedLinkError e) {
             sLibraryLoaded = false;
         }
     }
 
-    public KTX2PlayerModule(ReactApplicationContext reactContext) {
+    public AlphaVideoGpuModule(ReactApplicationContext reactContext) {
         super(reactContext);
         if (sLibraryLoaded) {
             nativeInit();
@@ -42,7 +42,7 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
         return sLibraryLoaded;
     }
 
-    // Native methods used by KTX2TextureView
+    // Native methods used by AlphaVideoGpuTextureView
     private static native void nativeInit();
     public static native int[] nativeTranscodeKTX2(byte[] ktx2Data, int textureFormat);
     public static native byte[] nativeTranscodeKTX2NoUpload(byte[] ktx2Data, int textureFormat);
@@ -65,4 +65,9 @@ public class KTX2PlayerModule extends ReactContextBaseJavaModule {
     public static native boolean nativeUploadTextureArrayLayer(int textureId, int layer, int width, int height, byte[] astcData, boolean useAstc, int glFormat, int blockW, int blockH);
     public static native boolean nativeUploadTextureArrayLayerFromBuffer(int textureId, int layer, int width, int height, java.nio.ByteBuffer buffer, int dataLength, boolean useAstc, int glFormat, int blockW, int blockH);  // Zero-copy from direct ByteBuffer
     public static native boolean nativeUploadTextureArrayLayerFromBufferWithOffset(int textureId, int layer, int width, int height, java.nio.ByteBuffer buffer, int offset, int dataLength, boolean useAstc, int glFormat, int blockW, int blockH);  // Zero-copy with offset
+    
+    // PBO-based async upload methods (reduces CPU stalls during texture upload)
+    public static native boolean nativeInitPBOs(int textureId, int bufferSize);  // Initialize double-buffered PBOs for a texture array
+    public static native void nativeCleanupPBOs(int textureId);  // Cleanup PBOs when texture array is destroyed
+    public static native boolean nativeUploadTextureArrayLayerPBO(int textureId, int layer, int width, int height, java.nio.ByteBuffer buffer, int dataLength, boolean useAstc, int glFormat, int blockW, int blockH);  // Async upload via PBO
 }

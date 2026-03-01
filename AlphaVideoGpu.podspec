@@ -1,15 +1,15 @@
 Pod::Spec.new do |s|
-  s.name             = 'react-native-ktx2player'
+  s.name             = 'AlphaVideoGpu'
   s.version          = '1.0.0'
-  s.summary          = 'KTX2 animated texture player for React Native'
+  s.summary          = 'GPU-accelerated transparent alpha video player'
   s.description      = <<-DESC
-    A React Native module for playing KTX2 animated textures with 2D grid layout and multi-strip support.
-    Uses Basis Universal transcoder and Metal rendering.
+    GPU-accelerated transparent alpha video player for iOS using texture compression (ASTC).
+    Provides smooth playback with low CPU/battery usage for animations with transparency.
                        DESC
-  s.homepage         = 'https://github.com/your-repo/react-native-ktx2player'
+  s.homepage         = 'https://github.com/danielkpl2/alpha-video-gpu'
   s.license          = { :type => 'MIT', :file => 'LICENSE' }
-  s.author           = { 'Your Name' => 'your.email@example.com' }
-  s.source           = { :git => 'https://github.com/your-repo/react-native-ktx2player.git', :tag => "#{s.version}" }
+  s.author           = { 'Alpha Video' => 'contact@alphavideo.dev' }
+  s.source           = { :git => 'https://github.com/danielkpl2/alpha-video-gpu.git', :tag => "#{s.version}" }
 
   s.ios.deployment_target = '12.0'
   s.requires_arc = true

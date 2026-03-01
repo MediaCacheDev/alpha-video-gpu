@@ -1,10 +1,12 @@
 /**
- * KTX2Player - React-only Wrapper (no React Native dependency)
+ * AlphaVideoGpuPlayer - React-only Wrapper (no React Native dependency)
+ *
+ * GPU-accelerated transparent alpha video player.
  *
  * Usage:
- *   import { KTX2Player } from 'react-native-ktx2player/standalone/react';
+ *   import { AlphaVideoGpuPlayer } from 'alpha-video-gpu/standalone/react';
  *
- *   <KTX2Player
+ *   <AlphaVideoGpuPlayer
  *     src="https://example.com/animation.ktx2"
  *     width={300}
  *     height={300}
@@ -22,9 +24,10 @@ import type { KTX2LoadEvent, PlayerState, MemoryStrategy } from '../src/web/type
 import { initBasisTranscoder } from '../src/web/bundled-deps';
 import { ZSTDDecoder } from '../src/web/bundled-deps';
 
-export type { KTX2LoadEvent, PlayerState, MemoryStrategy };
+export type { KTX2LoadEvent as AlphaVideoGpuLoadEvent, PlayerState, MemoryStrategy };
+export type { KTX2LoadEvent }; // Legacy alias
 
-export interface KTX2PlayerProps {
+export interface AlphaVideoGpuPlayerProps {
   /** Source URL for the KTX2 file */
   src?: string;
   /** Optional array of part URIs for multi-part animations */
@@ -58,7 +61,7 @@ export interface KTX2PlayerProps {
   onError?: (error: Error) => void;
 }
 
-export const KTX2Player: React.FC<KTX2PlayerProps> = ({
+export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
   src,
   parts,
   width = 300,
@@ -159,4 +162,8 @@ export const KTX2Player: React.FC<KTX2PlayerProps> = ({
   );
 };
 
-export default KTX2Player;
+// Legacy aliases
+export const KTX2Player = AlphaVideoGpuPlayer;
+export type KTX2PlayerProps = AlphaVideoGpuPlayerProps;
+
+export default AlphaVideoGpuPlayer;

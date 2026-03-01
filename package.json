@@ -1,9 +1,9 @@
 {
-  "name": "react-native-ktx2player",
-  "version": "1.0.1",
-  "description": "React Native module for playing KTX2 animated textures with GPU acceleration on iOS, Android, and Web",
+  "name": "alpha-video-gpu",
+  "version": "1.0.0",
+  "description": "GPU-accelerated transparent alpha video player for iOS, Android, and Web using texture compression",
   "main": "index.js",
-  "types": "src/index.d.ts",
+  "types": "src/index.ts",
   "scripts": {
     "setup": "bash scripts/setup.sh",
     "bundle-basis": "node scripts/bundle-basis.js",
@@ -12,35 +12,47 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
+    "alpha-video",
+    "transparent-video",
+    "video-player",
+    "gpu-texture",
     "react-native",
     "react-native-web",
-    "ktx2",
-    "basis-universal",
-    "animation",
-    "texture",
-    "sprite-sheet",
+    "ios",
+    "android",
+    "webgl",
     "astc",
-    "uastc",
-    "gpu-texture",
+    "ktx2",
     "metal",
-    "opengl",
-    "webgl"
+    "opengl"
   ],
   "author": "",
   "license": "MIT",
-  "homepage": "https://github.com/user/react-native-ktx2player#readme",
+  "homepage": "https://github.com/danielkpl2/alpha-video-gpu#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/user/react-native-ktx2player.git"
+    "url": "git+https://github.com/danielkpl2/alpha-video-gpu.git"
   },
   "bugs": {
-    "url": "https://github.com/user/react-native-ktx2player/issues"
+    "url": "https://github.com/danielkpl2/alpha-video-gpu/issues"
   },
   "exports": {
-    ".": "./index.js",
-    "./web": "./src/web/index.ts",
-    "./standalone": "./standalone/index.ts",
-    "./standalone/react": "./standalone/react.tsx"
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./index.js"
+    },
+    "./web": {
+      "types": "./src/web/index.ts",
+      "default": "./src/web/index.ts"
+    },
+    "./standalone": {
+      "types": "./standalone/index.ts",
+      "default": "./standalone/index.ts"
+    },
+    "./standalone/react": {
+      "types": "./standalone/react.tsx",
+      "default": "./standalone/react.tsx"
+    }
   },
   "files": [
     "android/src/",
@@ -51,7 +63,7 @@
     "scripts/",
     "index.js",
     "react-native.config.js",
-    "react-native-ktx2player.podspec",
+    "AlphaVideoGpu.podspec",
     "README.md",
     "LICENSE"
   ],

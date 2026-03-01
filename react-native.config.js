@@ -3,12 +3,10 @@ module.exports = {
     platforms: {
       android: {
         sourceDir: './android',
-        packageImportPath: 'import com.ktx2player.KTX2PlayerPackage;',
-        packageInstance: 'new KTX2PlayerPackage()',
+        packageImportPath: 'import com.alphavideo.gpu.AlphaVideoGpuPackage;',
+        packageInstance: 'new AlphaVideoGpuPackage()',
       },
-      ios: {
-        podspecPath: './react-native-ktx2player.podspec',
-      },
+      ios: {},
     },
   },
 };

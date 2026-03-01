@@ -4,9 +4,9 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 
-// View manager is in separate KTX2PlayerViewManager.m file
+// View manager is in separate AlphaVideoGpuViewManager.m file
 
-@interface KTX2PlayerView : MTKView <MTKViewDelegate>
+@interface AlphaVideoGpuView : MTKView <MTKViewDelegate>
 
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;

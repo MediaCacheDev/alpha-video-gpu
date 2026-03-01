@@ -118,6 +118,24 @@ static uint32_t astc_bytes_per_layer(int width, int height, int block_width, int
 // Initialize transcoder once
 static bool g_transcoder_initialized = false;
 
+// PBO context for async texture uploads (per texture array)
+struct PBOContext {
+    GLuint pbos[2];           // Double-buffered PBOs
+    GLsync fences[2];         // Fence sync objects to prevent overwriting in-flight PBOs
+    int current_pbo;          // Index of PBO to use next (0 or 1)
+    GLsizei buffer_size;      // Size of each PBO in bytes
+    bool initialized;
+    
+    PBOContext() : current_pbo(0), buffer_size(0), initialized(false) {
+        pbos[0] = pbos[1] = 0;
+        fences[0] = fences[1] = nullptr;
+    }
+};
+
+// Map texture array ID to its PBO context
+static std::map<GLuint, PBOContext> g_pbo_contexts;
+static std::mutex g_pbo_mutex;
+
 // Decode ASTC texture to RGBA using proper decoder (supports all block sizes)
 static bool decode_astc_to_rgba(const uint8_t* astc_data, size_t astc_size,
                                  int width, int height,
@@ -247,12 +265,12 @@ static bool is_compressed_format(basist::transcoder_texture_format format) {
 extern "C" {
 
 JNIEXPORT void JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeInit(JNIEnv *env, jclass clazz) {
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeInit(JNIEnv *env, jclass clazz) {
     init_transcoder();
 }
 
 JNIEXPORT jintArray JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeTranscodeKTX2(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeTranscodeKTX2(JNIEnv *env, jclass clazz,
                                                           jbyteArray ktx2_data,
                                                           jint gl_texture_format) {
     init_transcoder();
@@ -440,7 +458,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeTranscodeKTX2(JNIEnv *env, jclass cla
 // Transcode KTX2 without GPU upload - returns byte array with transcoded data + dimensions
 // Result format: first 8 bytes are width (4) + height (4), rest is texture data
 JNIEXPORT jbyteArray JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeTranscodeKTX2NoUpload(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeTranscodeKTX2NoUpload(JNIEnv *env, jclass clazz,
                                                                    jbyteArray ktx2_data,
                                                                    jint gl_texture_format) {
     init_transcoder();
@@ -543,14 +561,14 @@ Java_com_ktx2player_KTX2PlayerModule_nativeTranscodeKTX2NoUpload(JNIEnv *env, jc
 }
 
 JNIEXPORT void JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeDeleteTexture(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeDeleteTexture(JNIEnv *env, jclass clazz,
                                                           jint texture_id) {
     GLuint id = (GLuint)texture_id;
     glDeleteTextures(1, &id);
 }
 
 JNIEXPORT jbyteArray JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstd(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeDecompressZstd(JNIEnv *env, jclass clazz,
                                                            jbyteArray data, jint offset,
                                                            jint compressed_length, jint uncompressed_length) {
     // Get input data
@@ -599,7 +617,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstd(JNIEnv *env, jclass cl
 
 // Zero-copy Zstd decompression directly to a direct ByteBuffer
 JNIEXPORT jboolean JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstdToBuffer(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeDecompressZstdToBuffer(JNIEnv *env, jclass clazz,
                                                                    jbyteArray data, jint offset,
                                                                    jint compressed_length,
                                                                    jobject output_buffer,
@@ -646,7 +664,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecompressZstdToBuffer(JNIEnv *env, j
 
 // Decode ASTC to RGBA and create texture (for emulator fallback)
 JNIEXPORT jintArray JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass clazz,
                                                              jbyteArray astc_data,
                                                              jint width, jint height,
                                                              jint block_w, jint block_h) {
@@ -713,7 +731,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeDecodeASTCToRGBA(JNIEnv *env, jclass 
  * Returns [textureId, width, height, layerCount]
  */
 JNIEXPORT jintArray JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeLoadTextureArray(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeLoadTextureArray(JNIEnv *env, jclass clazz,
                                                              jbyteArray ktx2_data,
                                                              jboolean use_astc) {
     init_transcoder();
@@ -906,7 +924,7 @@ static std::atomic<jlong> g_next_stream_id{1};
  * Returns a unique stream ID (> 0), or 0 on error.
  */
 JNIEXPORT jlong JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressInitFromFile(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressInitFromFile(JNIEnv *env, jclass clazz,
                                                                             jstring file_path) {
     const char* path = env->GetStringUTFChars(file_path, nullptr);
     if (!path) {
@@ -990,7 +1008,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressInitFromFile(JNIEn
  * Returns a unique stream ID (> 0), or 0 on error.
  */
 JNIEXPORT jlong JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressInit(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressInit(JNIEnv *env, jclass clazz,
                                                                      jbyteArray compressed_data) {
     // Create new per-instance state
     auto state = std::make_unique<StreamingDecompressState>();
@@ -1047,7 +1065,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressInit(JNIEnv *env, 
  * Status: 0 = more data available, 1 = done, 2 = error
  */
 JNIEXPORT jbyteArray JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressContinue(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressContinue(JNIEnv *env, jclass clazz,
                                                                          jlong stream_id,
                                                                          jint max_output_bytes) {
     StreamingDecompressState* state = nullptr;
@@ -1132,7 +1150,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressContinue(JNIEnv *e
  *         High 32 bits = status, low 32 bits = bytes written
  */
 JNIEXPORT jlong JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressContinueToBuffer(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressContinueToBuffer(JNIEnv *env, jclass clazz,
                                                                                  jlong stream_id,
                                                                                  jobject output_buffer,
                                                                                  jint max_output_bytes) {
@@ -1200,7 +1218,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressContinueToBuffer(J
  * Clean up streaming decompression resources for a specific stream.
  */
 JNIEXPORT void JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressEnd(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressEnd(JNIEnv *env, jclass clazz,
                                                                     jlong stream_id) {
     std::lock_guard<std::mutex> lock(g_streaming_mutex);
     auto it = g_streaming_states.find(stream_id);
@@ -1215,7 +1233,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeStreamingDecompressEnd(JNIEnv *env, j
  * Used for streaming mode where layers are uploaded progressively.
  */
 JNIEXPORT jboolean JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayer(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayer(JNIEnv *env, jclass clazz,
                                                                      jint texture_id,
                                                                      jint layer,
                                                                      jint width, jint height,
@@ -1281,7 +1299,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayer(JNIEnv *env, 
  * Returns texture ID, or 0 on error.
  */
 JNIEXPORT jint JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeCreateTextureArray(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeCreateTextureArray(JNIEnv *env, jclass clazz,
                                                                 jint width, jint height,
                                                                 jint layer_count,
                                                                 jboolean use_astc,
@@ -1336,7 +1354,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeCreateTextureArray(JNIEnv *env, jclas
  * Zero-copy version for VRAM streaming mode - avoids Java byte[] allocation.
  */
 JNIEXPORT jboolean JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBuffer(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayerFromBuffer(JNIEnv *env, jclass clazz,
                                                                                jint texture_id,
                                                                                jint layer,
                                                                                jint width, jint height,
@@ -1398,7 +1416,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBuffer(JNI
  * Zero-copy version for non-stream RAM mode - reads from contiguous buffer at specified offset.
  */
 JNIEXPORT jboolean JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWithOffset(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayerFromBufferWithOffset(JNIEnv *env, jclass clazz,
                                                                                         jint texture_id,
                                                                                         jint layer,
                                                                                         jint width, jint height,
@@ -1460,6 +1478,195 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWith
 }
 
 /**
+ * Initialize PBOs for a texture array (call once per texture array).
+ * Creates double-buffered PBOs for async uploads.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeInitPBOs(JNIEnv *env, jclass clazz,
+                                                           jint texture_id,
+                                                           jint buffer_size) {
+    std::lock_guard<std::mutex> lock(g_pbo_mutex);
+    
+    GLuint texId = (GLuint)texture_id;
+    
+    // Check if already initialized
+    if (g_pbo_contexts.find(texId) != g_pbo_contexts.end() && g_pbo_contexts[texId].initialized) {
+        LOGI("PBOs already initialized for texture %u", texId);
+        return JNI_TRUE;
+    }
+    
+    PBOContext ctx;
+    ctx.buffer_size = buffer_size;
+    
+    // Generate two PBOs for double-buffering
+    glGenBuffers(2, ctx.pbos);
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        LOGE("glGenBuffers failed: 0x%x", err);
+        return JNI_FALSE;
+    }
+    
+    // Allocate storage for both PBOs
+    for (int i = 0; i < 2; i++) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, ctx.pbos[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, buffer_size, nullptr, GL_STREAM_DRAW);
+        err = glGetError();
+        if (err != GL_NO_ERROR) {
+            LOGE("glBufferData for PBO %d failed: 0x%x", i, err);
+            glDeleteBuffers(2, ctx.pbos);
+            return JNI_FALSE;
+        }
+        ctx.fences[i] = nullptr;
+    }
+    
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    
+    ctx.current_pbo = 0;
+    ctx.initialized = true;
+    g_pbo_contexts[texId] = ctx;
+    
+    LOGI("Initialized PBOs for texture %u: size=%d bytes each", texId, buffer_size);
+    return JNI_TRUE;
+}
+
+/**
+ * Cleanup PBOs for a texture array.
+ */
+JNIEXPORT void JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeCleanupPBOs(JNIEnv *env, jclass clazz,
+                                                              jint texture_id) {
+    std::lock_guard<std::mutex> lock(g_pbo_mutex);
+    
+    GLuint texId = (GLuint)texture_id;
+    auto it = g_pbo_contexts.find(texId);
+    if (it == g_pbo_contexts.end()) {
+        return;
+    }
+    
+    PBOContext& ctx = it->second;
+    
+    // Wait for any pending fences
+    for (int i = 0; i < 2; i++) {
+        if (ctx.fences[i]) {
+            glClientWaitSync(ctx.fences[i], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000); // 1 second timeout
+            glDeleteSync(ctx.fences[i]);
+        }
+    }
+    
+    glDeleteBuffers(2, ctx.pbos);
+    g_pbo_contexts.erase(it);
+    
+    LOGI("Cleaned up PBOs for texture %u", texId);
+}
+
+/**
+ * Upload texture layer using PBO for async DMA.
+ * The glCompressedTexSubImage3D call returns immediately while GPU DMAs in background.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayerPBO(JNIEnv *env, jclass clazz,
+                                                                              jint texture_id,
+                                                                              jint layer,
+                                                                              jint width, jint height,
+                                                                              jobject buffer,
+                                                                              jint data_length,
+                                                                              jboolean use_astc,
+                                                                              jint gl_format,
+                                                                              jint block_w, jint block_h) {
+    // PBO upload only supports ASTC (no CPU decode path)
+    if (!use_astc) {
+        LOGW("PBO upload only supports ASTC, falling back to regular upload");
+        return Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayerFromBuffer(
+            env, clazz, texture_id, layer, width, height, buffer, data_length, use_astc, gl_format, block_w, block_h);
+    }
+    
+    GLuint texId = (GLuint)texture_id;
+    GLenum astcGlFormat = (gl_format > 0) ? (GLenum)gl_format : GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+    
+    void* srcData = env->GetDirectBufferAddress(buffer);
+    if (!srcData) {
+        LOGE("Failed to get direct buffer address for PBO upload");
+        return JNI_FALSE;
+    }
+    
+    PBOContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_pbo_mutex);
+        auto it = g_pbo_contexts.find(texId);
+        if (it == g_pbo_contexts.end() || !it->second.initialized) {
+            LOGW("PBOs not initialized for texture %u, falling back to regular upload", texId);
+            return Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayerFromBuffer(
+                env, clazz, texture_id, layer, width, height, buffer, data_length, use_astc, gl_format, block_w, block_h);
+        }
+        ctx = &it->second;
+    }
+    
+    if (data_length > ctx->buffer_size) {
+        LOGE("Data length %d exceeds PBO size %d", data_length, ctx->buffer_size);
+        return JNI_FALSE;
+    }
+    
+    int pboIndex = ctx->current_pbo;
+    GLuint pbo = ctx->pbos[pboIndex];
+    
+    // Wait for previous upload using this PBO to complete
+    if (ctx->fences[pboIndex]) {
+        GLenum waitResult = glClientWaitSync(ctx->fences[pboIndex], GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+        if (waitResult == GL_TIMEOUT_EXPIRED) {
+            // PBO still in use, wait with timeout
+            waitResult = glClientWaitSync(ctx->fences[pboIndex], GL_SYNC_FLUSH_COMMANDS_BIT, 10000000); // 10ms
+            if (waitResult == GL_TIMEOUT_EXPIRED) {
+                LOGW("PBO fence timeout, upload may stall");
+            }
+        }
+        glDeleteSync(ctx->fences[pboIndex]);
+        ctx->fences[pboIndex] = nullptr;
+    }
+    
+    // Bind PBO and map it
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    
+    // Use glMapBufferRange for potentially better performance
+    void* pboPtr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, data_length,
+                                     GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (!pboPtr) {
+        LOGE("glMapBufferRange failed");
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return JNI_FALSE;
+    }
+    
+    // Copy data into PBO
+    memcpy(pboPtr, srcData, data_length);
+    
+    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    
+    // Upload from PBO (async - returns immediately)
+    glBindTexture(GL_TEXTURE_2D_ARRAY, texId);
+    glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
+                               0, 0, layer,
+                               width, height, 1,
+                               astcGlFormat,
+                               data_length, (void*)0);  // Offset 0 in bound PBO
+    
+    // Create fence for this upload
+    ctx->fences[pboIndex] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    
+    // Unbind PBO
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    
+    // Swap to other PBO for next upload
+    ctx->current_pbo = 1 - pboIndex;
+    
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        LOGE("PBO upload error: 0x%x", err);
+        return JNI_FALSE;
+    }
+    
+    return JNI_TRUE;
+}
+
+/**
  * Initialize streaming decompression for internal KTX2 zstd (supercompressionScheme=2).
  * Unlike outer .zst files, only the level0 data is compressed - header is uncompressed.
  * 
@@ -1469,7 +1676,7 @@ Java_com_ktx2player_KTX2PlayerModule_nativeUploadTextureArrayLayerFromBufferWith
  * @return Stream ID (> 0), or 0 on error
  */
 JNIEXPORT jlong JNICALL
-Java_com_ktx2player_KTX2PlayerModule_nativeInternalZstdStreamingInit(JNIEnv *env, jclass clazz,
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeInternalZstdStreamingInit(JNIEnv *env, jclass clazz,
                                                                        jstring file_path,
                                                                        jlong data_offset,
                                                                        jlong compressed_size) {

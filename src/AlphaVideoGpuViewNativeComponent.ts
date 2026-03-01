@@ -6,7 +6,7 @@ export interface SourceType {
   cacheKey?: string;
 }
 
-export interface KTX2LoadEvent {
+export interface AlphaVideoGpuLoadEvent {
   width: number;
   height: number;
   frameCount: number;
@@ -16,7 +16,7 @@ export interface KTX2LoadEvent {
 
 export interface NativeProps extends ViewProps {
   source?: SourceType | null;
-  onLoad?: (event: { nativeEvent: KTX2LoadEvent }) => void;
+  onLoad?: (event: { nativeEvent: AlphaVideoGpuLoadEvent }) => void;
   /** For multi-part animations: array of all part sources (first part contains metadata) */
   parts?: ReadonlyArray<SourceType> | null;
   autoPlay?: boolean;
@@ -62,5 +62,5 @@ export interface NativeProps extends ViewProps {
 }
 
 export default requireNativeComponent<NativeProps>(
-  'KTX2PlayerView'
+  'AlphaVideoGpuView'
 ) as HostComponent<NativeProps>;

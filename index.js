@@ -2,25 +2,25 @@ import React, { useMemo } from 'react';
 import { View, StyleSheet, Platform } from 'react-native';
 
 // Platform-specific imports
-let NativeKTX2PlayerView;
-let WebKTX2PlayerView;
+let NativeAlphaVideoGpuView;
+let WebAlphaVideoGpuView;
 
 if (Platform.OS === 'web') {
   // Web implementation using WebGL + Basis Universal
-  WebKTX2PlayerView = require('./src/KTX2PlayerView.web').default;
+  WebAlphaVideoGpuView = require('./src/AlphaVideoGpuView.web').default;
 } else {
   // Native implementation using codegenNativeComponent
   // This supports both New Architecture (Fabric) and Legacy Architecture (auto-fallback)
-  NativeKTX2PlayerView = require('./src/KTX2PlayerViewNativeComponent').default;
+  NativeAlphaVideoGpuView = require('./src/AlphaVideoGpuViewNativeComponent').default;
 }
 
 /**
- * KTX2PlayerView - React Native component for playing KTX2 animated textures
+ * AlphaVideoGpuView - React Native component for GPU-accelerated alpha video playback
  * 
  * Features:
- * - Supports KTX2 files with Basis Universal compression
+ * - GPU texture compression (ASTC) for efficient transparent video
  * - GPU-accelerated playback (Metal on iOS, OpenGL ES on Android, WebGL on Web)
- * - Automatic transcoding to device-optimal format (ASTC, ETC2, BC7, etc.)
+ * - Low CPU/battery usage compared to traditional video codecs
  * - Multiple source formats: HTTP/HTTPS URLs, local files, Android assets
  * - Works on iOS, Android, and Web (React Native Web)
  * 
@@ -36,7 +36,7 @@ if (Platform.OS === 'web') {
  * @param {Function} [props.onError] - Callback on error
  * @param {Object} [props.style] - View style
  */
-export const KTX2PlayerView = React.memo(({
+export const AlphaVideoGpuView = React.memo(({
   source,
   autoPlay = true,
   loop = true,
@@ -69,7 +69,7 @@ export const KTX2PlayerView = React.memo(({
   // Web implementation
   if (Platform.OS === 'web') {
     return (
-      <WebKTX2PlayerView
+      <WebAlphaVideoGpuView
         source={normalizedSource}
         autoPlay={autoPlay}
         loop={loop}
@@ -97,7 +97,7 @@ export const KTX2PlayerView = React.memo(({
   };
 
   return (
-    <NativeKTX2PlayerView
+    <NativeAlphaVideoGpuView
       {...nativeProps}
       style={[styles.container, style]}
       {...restOtherProps}
@@ -105,7 +105,7 @@ export const KTX2PlayerView = React.memo(({
   );
 });
 
-KTX2PlayerView.displayName = 'KTX2PlayerView';
+AlphaVideoGpuView.displayName = 'AlphaVideoGpuView';
 
 const styles = StyleSheet.create({
   container: {
@@ -113,5 +113,8 @@ const styles = StyleSheet.create({
   },
 });
 
+// Legacy alias for backwards compatibility
+export const KTX2PlayerView = AlphaVideoGpuView;
+
 // Default export
-export default KTX2PlayerView;
+export default AlphaVideoGpuView;

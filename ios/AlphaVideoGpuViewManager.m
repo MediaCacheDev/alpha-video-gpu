@@ -1,16 +1,16 @@
 //
-//  KTX2PlayerViewManager.m
-//  react-native-ktx2player
+//  AlphaVideoGpuViewManager.m
+//  alpha-video-gpu
 //
 
 #import <React/RCTViewManager.h>
 
-@interface KTX2PlayerViewManager : RCTViewManager
+@interface AlphaVideoGpuViewManager : RCTViewManager
 @end
 
-@implementation KTX2PlayerViewManager
+@implementation AlphaVideoGpuViewManager
 
-RCT_EXPORT_MODULE(KTX2PlayerView)
+RCT_EXPORT_MODULE(AlphaVideoGpuView)
 
 + (BOOL)requiresMainQueueSetup
 {
@@ -19,8 +19,8 @@ RCT_EXPORT_MODULE(KTX2PlayerView)
 
 - (UIView *)view
 {
-  // Import and instantiate the view from KTX2Player.mm
-  Class viewClass = NSClassFromString(@"KTX2PlayerView");
+  // Import and instantiate the view from AlphaVideoGpu.mm
+  Class viewClass = NSClassFromString(@"AlphaVideoGpuView");
   if (viewClass) {
     return [[viewClass alloc] init];
   }

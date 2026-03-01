@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18.1)
 
-project("ktx2player")
+project("alphavideogpu")
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 14)
@@ -24,21 +24,21 @@ target_compile_definitions(basis_transcoder PRIVATE
 )
 
 # Add native library
-add_library(ktx2player SHARED
-    ktx2player_jni.cpp
+add_library(alphavideogpu SHARED
+    alphavideogpu_jni.cpp
     astc_decomp.cpp
 )
 
-target_include_directories(ktx2player PRIVATE
+target_include_directories(alphavideogpu PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${BASIS_UNIVERSAL_DIR}/transcoder
 )
 
-target_compile_definitions(ktx2player PRIVATE
+target_compile_definitions(alphavideogpu PRIVATE
     BASISU_NO_ITERATOR_DEBUG_LEVEL=1
 )
 
-target_link_libraries(ktx2player
+target_link_libraries(alphavideogpu
     basis_transcoder
     EGL
     GLESv3

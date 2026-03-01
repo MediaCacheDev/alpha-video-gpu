@@ -1,4 +1,4 @@
-package com.ktx2player;
+package com.alphavideo.gpu;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -21,17 +21,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * React Native ViewManager for KTX2PlayerView.
+ * React Native ViewManager for AlphaVideoGpuView.
  */
-public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
+public class AlphaVideoGpuManager extends SimpleViewManager<AlphaVideoGpuTextureView> {
 
-    public static final String REACT_CLASS = "KTX2PlayerView";
-    private static final String TAG = "KTX2PlayerMgr";
+    public static final String REACT_CLASS = "AlphaVideoGpuView";
+    private static final String TAG = "AlphaVideoGpuMgr";
     
     private final ReactApplicationContext reactContext;
     private final ExecutorService assetExecutor = Executors.newFixedThreadPool(2);
     
-    public KTX2PlayerManager(ReactApplicationContext reactContext) {
+    public AlphaVideoGpuManager(ReactApplicationContext reactContext) {
         this.reactContext = reactContext;
     }
 
@@ -43,12 +43,12 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
 
     @Override
     @NonNull
-    protected KTX2TextureView createViewInstance(@NonNull ThemedReactContext reactContext) {
-        return new KTX2TextureView(reactContext);
+    protected AlphaVideoGpuTextureView createViewInstance(@NonNull ThemedReactContext reactContext) {
+        return new AlphaVideoGpuTextureView(reactContext);
     }
 
     @ReactProp(name = "source")
-    public void setSource(KTX2TextureView view, @Nullable ReadableMap source) {
+    public void setSource(AlphaVideoGpuTextureView view, @Nullable ReadableMap source) {
         String sourceUri = null;
         if (source != null && source.hasKey("uri") && !source.isNull("uri")) {
             sourceUri = source.getString("uri");
@@ -83,53 +83,53 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
 
     @ReactProp(name = "autoPlay", defaultBoolean = true)
-    public void setAutoPlay(KTX2TextureView view, boolean autoPlay) {
+    public void setAutoPlay(AlphaVideoGpuTextureView view, boolean autoPlay) {
         view.setAutoPlay(autoPlay);
     }
 
     @ReactProp(name = "loop", defaultBoolean = true)
-    public void setLoop(KTX2TextureView view, boolean loop) {
+    public void setLoop(AlphaVideoGpuTextureView view, boolean loop) {
         view.setLoop(loop);
     }
 
     @ReactProp(name = "playbackSpeed", defaultFloat = 1.0f)
-    public void setPlaybackSpeed(KTX2TextureView view, float speed) {
+    public void setPlaybackSpeed(AlphaVideoGpuTextureView view, float speed) {
         view.setPlaybackSpeed(speed);
     }
     
     @ReactProp(name = "cacheKey")
-    public void setCacheKey(KTX2TextureView view, @Nullable String cacheKey) {
+    public void setCacheKey(AlphaVideoGpuTextureView view, @Nullable String cacheKey) {
         // Pass cacheKey directly to the View so it can use it for downloads
         view.setCacheKey(cacheKey);
     }
     
     @ReactProp(name = "enableFrameEvents", defaultBoolean = false)
-    public void setEnableFrameEvents(KTX2TextureView view, boolean enable) {
+    public void setEnableFrameEvents(AlphaVideoGpuTextureView view, boolean enable) {
         view.setEnableFrameEvents(enable);
     }
     
     @ReactProp(name = "gpuPlayback", defaultBoolean = false)
-    public void setGpuPlayback(KTX2TextureView view, boolean gpuPlayback) {
+    public void setGpuPlayback(AlphaVideoGpuTextureView view, boolean gpuPlayback) {
         view.setGpuPlayback(gpuPlayback);
     }
     
     @ReactProp(name = "paused", defaultBoolean = false)
-    public void setPaused(KTX2TextureView view, boolean paused) {
+    public void setPaused(AlphaVideoGpuTextureView view, boolean paused) {
         view.setPaused(paused);
     }
     
     @ReactProp(name = "streamingRingSize", defaultInt = 16)
-    public void setStreamingRingSize(KTX2TextureView view, int size) {
+    public void setStreamingRingSize(AlphaVideoGpuTextureView view, int size) {
         view.setStreamingRingSize(size);
     }
     
     @ReactProp(name = "streamingCacheSize", defaultInt = 60)
-    public void setStreamingCacheSize(KTX2TextureView view, int size) {
+    public void setStreamingCacheSize(AlphaVideoGpuTextureView view, int size) {
         view.setStreamingCacheSize(size);
     }
     
     @ReactProp(name = "streamingPrefetchAhead", defaultInt = 30)
-    public void setStreamingPrefetchAhead(KTX2TextureView view, int frames) {
+    public void setStreamingPrefetchAhead(AlphaVideoGpuTextureView view, int frames) {
         view.setStreamingPrefetchAhead(frames);
     }
     
@@ -140,7 +140,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
      * - "ram": Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
      */
     @ReactProp(name = "memoryStrategy")
-    public void setMemoryStrategy(KTX2TextureView view, @Nullable String strategy) {
+    public void setMemoryStrategy(AlphaVideoGpuTextureView view, @Nullable String strategy) {
         view.setMemoryStrategy(strategy != null ? strategy : "auto");
     }
     
@@ -150,7 +150,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
      * When false (default): Load all frames at once.
      */
     @ReactProp(name = "stream", defaultBoolean = false)
-    public void setStream(KTX2TextureView view, boolean stream) {
+    public void setStream(AlphaVideoGpuTextureView view, boolean stream) {
         view.setStream(stream);
     }
     
@@ -159,7 +159,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
      * This is needed for bundled assets where sibling files can't be auto-discovered.
      */
     @ReactProp(name = "parts")
-    public void setParts(KTX2TextureView view, @Nullable ReadableArray parts) {
+    public void setParts(AlphaVideoGpuTextureView view, @Nullable ReadableArray parts) {
         if (parts == null || parts.size() == 0) {
             view.setPartUris(null);
             return;
@@ -178,7 +178,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
     
     /**
-     * Resolve a URI to a path that KTX2TextureView can load
+     * Resolve a URI to a path that AlphaVideoGpuTextureView can load
      */
     private String resolveUri(String uri) {
         if (uri == null || uri.isEmpty()) return null;
@@ -215,9 +215,9 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     /**
      * Load KTX2 from bundled assets (for release build)
      * React Native bundles custom assets into the APK's assets folder.
-     * We pass asset:// URI directly - KTX2TextureView reads via AssetManager.
+     * We pass asset:// URI directly - AlphaVideoGpuTextureView reads via AssetManager.
      */
-    private void loadFromBundledAsset(KTX2TextureView view, String resourceName) {
+    private void loadFromBundledAsset(AlphaVideoGpuTextureView view, String resourceName) {
         assetExecutor.execute(() -> {
             try {
                 Log.d(TAG, "loadFromBundledAsset: " + resourceName);
@@ -251,7 +251,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
      * Copy from res/raw to cache (only needed for raw resources, not assets)
      * Detects Zstd files by magic bytes and preserves .zst extension
      */
-    private void copyResourceToCache(KTX2TextureView view, String resourceName, int resourceId) {
+    private void copyResourceToCache(AlphaVideoGpuTextureView view, String resourceName, int resourceId) {
         try {
             // First, detect if file is Zstd compressed by reading magic bytes
             InputStream detectStream = reactContext.getResources().openRawResource(resourceId);
@@ -337,9 +337,9 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     
     /**
      * Load KTX2 from Android assets (asset:// URI scheme)
-     * No copy needed - KTX2TextureView reads directly via AssetManager
+     * No copy needed - AlphaVideoGpuTextureView reads directly via AssetManager
      */
-    private void loadFromAsset(KTX2TextureView view, String assetUri) {
+    private void loadFromAsset(AlphaVideoGpuTextureView view, String assetUri) {
         // Normalize to asset:// format and pass directly to view
         String normalizedUri = assetUri.startsWith("asset://") ? assetUri : 
             "asset://" + assetUri.replace("asset:/", "").replaceFirst("^/", "");
@@ -358,7 +358,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
 
     @Override
-    public void receiveCommand(@NonNull KTX2TextureView view, String commandId, @Nullable ReadableArray args) {
+    public void receiveCommand(@NonNull AlphaVideoGpuTextureView view, String commandId, @Nullable ReadableArray args) {
         switch (commandId) {
             case "play":
                 view.play();
@@ -378,7 +378,7 @@ public class KTX2PlayerManager extends SimpleViewManager<KTX2TextureView> {
     }
 
     @Override
-    public void onDropViewInstance(@NonNull KTX2TextureView view) {
+    public void onDropViewInstance(@NonNull AlphaVideoGpuTextureView view) {
         super.onDropViewInstance(view);
         view.destroy();
     }

@@ -1,4 +1,4 @@
-package com.ktx2player;
+package com.alphavideo.gpu;
 
 import android.content.Context;
 import android.graphics.SurfaceTexture;
@@ -44,13 +44,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * KTX2TextureView - TextureView-based KTX2 player with proper transparency support.
+ * AlphaVideoGpuTextureView - TextureView-based KTX2 player with proper transparency support.
  * 
  * Uses TextureView instead of GLSurfaceView to allow proper view stacking
  * with alpha transparency in React Native.
  */
-public class KTX2TextureView extends TextureView implements TextureView.SurfaceTextureListener {
-    private static final String TAG = "KTX2TextureView";
+public class AlphaVideoGpuTextureView extends TextureView implements TextureView.SurfaceTextureListener {
+    private static final String TAG = "AlphaVideoGpuTextureView";
     
     // GL constants - ASTC formats for all 14 block sizes
     private static final int GL_COMPRESSED_RGBA_ASTC_4x4_KHR   = 0x93B0;
@@ -164,6 +164,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private int textureArrayLayerCount = 0;
     private boolean streamingRingBufferMode = false; // True when using ring buffer for streaming
     private int streamingRingSize = 0; // Size of ring buffer (for layer index calculation)
+    private boolean pbosInitialized = false; // True when PBOs are initialized for async uploads
     
     // RAM-heavy mode storage (for memoryStrategy: 'ram' in non-stream mode)
     // Uses contiguous direct ByteBuffer for zero-copy GPU uploads
@@ -294,17 +295,17 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         1.0f, 0.0f
     };
     
-    public KTX2TextureView(Context context) {
+    public AlphaVideoGpuTextureView(Context context) {
         super(context);
         init(context);
     }
     
-    public KTX2TextureView(Context context, @Nullable AttributeSet attrs) {
+    public AlphaVideoGpuTextureView(Context context, @Nullable AttributeSet attrs) {
         super(context, attrs);
         init(context);
     }
     
-    public KTX2TextureView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
+    public AlphaVideoGpuTextureView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
         super(context, attrs, defStyleAttr);
         init(context);
     }
@@ -846,7 +847,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             
             if (file.exists() && file.canRead()) {
                 Log.i(TAG, "Using memory-mapped file init: " + filePath);
-                streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInitFromFile(filePath);
+                streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInitFromFile(filePath);
                 effectivePath[0] = filePath;
                 useMmap = true;
             }
@@ -870,7 +871,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     File cachedFile = new File(pathToRead);
                     if (cachedFile.exists() && cachedFile.canRead()) {
                         Log.i(TAG, "Using memory-mapped cached file: " + pathToRead);
-                        streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInitFromFile(pathToRead);
+                        streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInitFromFile(pathToRead);
                         useMmap = true;
                     }
                 }
@@ -879,7 +880,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 if (streamId[0] == 0) {
                     compressedData = readFileBytes(pathToRead);
                     Log.i(TAG, "Using byte array init (fallback): " + compressedData.length + " bytes");
-                    streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInit(compressedData);
+                    streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInit(compressedData);
                 }
             } catch (IOException e) {
                 mainHandler.post(() -> notifyError("Failed to read streaming file: " + e.getMessage()));
@@ -907,17 +908,17 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         boolean headerParsed = false;
         
         while (!headerParsed) {
-            byte[] chunk = KTX2PlayerModule.nativeStreamingDecompressContinue(streamId[0], bufferSize);
+            byte[] chunk = AlphaVideoGpuModule.nativeStreamingDecompressContinue(streamId[0], bufferSize);
             if (chunk == null || chunk.length == 0) {
                 mainHandler.post(() -> notifyError("Streaming decompression failed"));
-                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                 return;
             }
             
             byte status = chunk[0];
             if (status == 2) { // error
                 mainHandler.post(() -> notifyError("Streaming decompression error"));
-                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                 return;
             }
             
@@ -953,7 +954,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         if (!headerParsed || layerCount == 0) {
             mainHandler.post(() -> notifyError("Failed to parse KTX2 header from stream"));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         
@@ -962,7 +963,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         String metadataJson = extractKTX2Metadata(headerData);
         if (metadataJson == null) {
             mainHandler.post(() -> notifyError("No metadata found in streaming KTX2"));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         
@@ -971,7 +972,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             parseMetadata(metadataJson);
         } catch (Exception e) {
             mainHandler.post(() -> notifyError("Failed to parse metadata: " + e.getMessage()));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         
@@ -1004,10 +1005,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         // - VRAM mode: Larger GPU cache (e.g., 60 slots) - this IS the sliding window
         // - RAM mode: Small ring buffer (e.g., 16 slots) - CPU RAM is the sliding window
         int textureLayerCount = Math.min(GPU_CACHE_SIZE, layerCount);
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(width, height, textureLayerCount, useAstc, astcGlFormat);
+        textureArrayId = AlphaVideoGpuModule.nativeCreateTextureArray(width, height, textureLayerCount, useAstc, astcGlFormat);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array"));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         textureArrayLayerCount = textureLayerCount;
@@ -1026,10 +1027,18 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         streamingRingBufferMode = true;  // Both modes use ring buffer slot calculation
         streamingRingSize = textureLayerCount;
         
+        // Initialize PBOs for async uploads (only for ASTC compressed format)
+        if (useAstc) {
+            pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
+            if (pbosInitialized) {
+                Log.i(TAG, "PBOs initialized for async uploads: " + bytesPerLayer + " bytes per buffer");
+            }
+        }
+        
         // Initialize shaders
         if (!initShaders()) {
             mainHandler.post(() -> notifyError("Failed to initialize shaders"));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         
@@ -1066,31 +1075,28 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             frameCache = new java.util.concurrent.ConcurrentHashMap<>();  // Only for blocked frames
             Log.i(TAG, "VRAM mode: Pre-allocated direct frame buffer: " + (bytesPerLayer + bufferSize) + " bytes");
         } else {
-            // RAM mode: byte[] pool for CPU cache (existing behavior)
-            frameAccumulatorBuffer = null;
+            // RAM mode: DirectByteBuffer for accumulation (zero-copy decompression),
+            // byte[] pool for CPU cache storage
+            frameAccumulatorBuffer = ByteBuffer.allocateDirect(bytesPerLayer + bufferSize);
             final int POOL_SIZE = CPU_CACHE_SIZE + 5;
             bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
             for (int i = 0; i < POOL_SIZE; i++) {
                 bufferPool.offer(new byte[bytesPerLayer]);
             }
             frameCache = new java.util.concurrent.ConcurrentHashMap<>();
-            Log.i(TAG, "RAM mode: Pre-allocated buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
+            Log.i(TAG, "RAM mode: Pre-allocated direct accumulator + buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
                   (POOL_SIZE * bytesPerLayer / 1024) + " KB");
         }
         
-        // For RAM mode, keep ByteArrayOutputStream for accumulation
-        ByteArrayOutputStream frameAccumulator = useVramStrategy ? null : new ByteArrayOutputStream(bytesPerLayer + bufferSize);
+        // Both modes now use DirectByteBuffer for accumulation (frameAccumulatorBuffer)
         Log.i(TAG, "Pre-allocated direct decompression buffer: " + bufferSize + " bytes");
         
         // Skip header bytes from already-read data
         byte[] existingData = headerStream.toByteArray();
         if (existingData.length > bytesToSkip[0]) {
             int dataToWrite = existingData.length - bytesToSkip[0];
-            if (useVramStrategy) {
-                frameAccumulatorBuffer.put(existingData, bytesToSkip[0], dataToWrite);
-            } else {
-                frameAccumulator.write(existingData, bytesToSkip[0], dataToWrite);
-            }
+            // Both modes use DirectByteBuffer now
+            frameAccumulatorBuffer.put(existingData, bytesToSkip[0], dataToWrite);
             bytesToSkip[0] = 0;
         } else {
             bytesToSkip[0] -= existingData.length;
@@ -1123,8 +1129,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Helper: Decode frames into CPU cache (up to prefetch ahead, with wrap-around)
         // virtualPlaybackPos = bounded position that distinguishes current vs next loop
-        // VRAM mode: Uses direct ByteBuffer, uploads directly to GPU (zero-copy)
-        // RAM mode: Uses byte[] pool and ByteArrayOutputStream
+        // Both modes: Use DirectByteBuffer for zero-copy decompression
+        // VRAM mode: Uploads directly to GPU from ByteBuffer
+        // RAM mode: Copies from ByteBuffer to pooled byte[] for CPU cache
         java.util.function.IntConsumer decodeFrames = (virtualPlaybackPos) -> {
             // Calculate how many frames ahead we need to decode
             // Use relative distance to handle wraparound correctly
@@ -1141,30 +1148,26 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     decoderLoopIteration[0]++;
                     decodePos[0] = 0;
                     decompressEnded[0] = false;
-                    if (useVramStrategy) {
-                        frameAccumulatorBuffer.clear();
-                    } else {
-                        frameAccumulator.reset();
-                    }
+                    frameAccumulatorBuffer.clear();  // Both modes use DirectByteBuffer now
                     bytesToSkip[0] = (int) finalLevel0Offset;
-                    KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                    AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                     // Use mmap if available, otherwise fall back to byte array
                     if (finalUseMmap) {
-                        streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInitFromFile(finalPath);
+                        streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInitFromFile(finalPath);
                     } else {
-                        streamId[0] = KTX2PlayerModule.nativeStreamingDecompressInit(finalCompressedData);
+                        streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInit(finalCompressedData);
                     }
                     Log.i(TAG, "Prefetch wrap-around: restarting decompression for loop " + decoderLoopIteration[0]);
                     continue;
                 }
                 
-                // Get current accumulator size
-                int accumulatorSize = useVramStrategy ? frameAccumulatorBuffer.position() : frameAccumulator.size();
+                // Get current accumulator size (both modes use DirectByteBuffer now)
+                int accumulatorSize = frameAccumulatorBuffer.position();
                 
                 // Skip header bytes if needed (using zero-copy ByteBuffer)
                 while (bytesToSkip[0] > 0 && !decompressEnded[0]) {
                     decompressBuffer.clear();
-                    long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    long result = AlphaVideoGpuModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
                     if (result == -1) { decompressEnded[0] = true; break; }
                     int status = (int)(result >> 32);
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
@@ -1172,16 +1175,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                         decompressBuffer.position(bytesToSkip[0]);
                         decompressBuffer.limit(bytesWritten);
                         int dataToWrite = bytesWritten - bytesToSkip[0];
-                        if (useVramStrategy) {
-                            // Zero-copy: transfer directly between ByteBuffers
-                            ByteBuffer slice = decompressBuffer.slice();
-                            slice.limit(dataToWrite);
-                            frameAccumulatorBuffer.put(slice);
-                        } else {
-                            byte[] temp = new byte[dataToWrite];
-                            decompressBuffer.get(temp);
-                            frameAccumulator.write(temp, 0, temp.length);
-                        }
+                        // Zero-copy: transfer directly between ByteBuffers (both modes)
+                        ByteBuffer slice = decompressBuffer.slice();
+                        slice.limit(dataToWrite);
+                        frameAccumulatorBuffer.put(slice);
                         bytesToSkip[0] = 0;
                     } else {
                         bytesToSkip[0] -= bytesWritten;
@@ -1192,26 +1189,20 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 if (decompressEnded[0]) continue; // Will restart on next iteration if looping
                 
                 // Update accumulator size after header skip
-                accumulatorSize = useVramStrategy ? frameAccumulatorBuffer.position() : frameAccumulator.size();
+                accumulatorSize = frameAccumulatorBuffer.position();
                 
                 // Decompress until we have a full frame
                 while (accumulatorSize < finalBytesPerLayer && !decompressEnded[0]) {
                     decompressBuffer.clear();
-                    long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    long result = AlphaVideoGpuModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
                     if (result == -1) { decompressEnded[0] = true; break; }
                     int status = (int)(result >> 32);
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
                     if (bytesWritten > 0) {
                         decompressBuffer.limit(bytesWritten);
                         decompressBuffer.position(0);
-                        if (useVramStrategy) {
-                            // Zero-copy: transfer directly between ByteBuffers
-                            frameAccumulatorBuffer.put(decompressBuffer);
-                        } else {
-                            byte[] temp = new byte[bytesWritten];
-                            decompressBuffer.get(temp);
-                            frameAccumulator.write(temp, 0, temp.length);
-                        }
+                        // Zero-copy: transfer directly between ByteBuffers (both modes)
+                        frameAccumulatorBuffer.put(decompressBuffer);
                         accumulatorSize += bytesWritten;
                     }
                     if (status == 1) { decompressEnded[0] = true; break; }
@@ -1235,10 +1226,16 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                         if (canOverwrite && ringSlots[gpuSlot] != virtualPos) {
                             // Prepare buffer for reading
                             frameAccumulatorBuffer.flip();
-                            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
-                                textureArrayId, gpuSlot, finalWidth, finalHeight, 
-                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
-                                astcGlFormat, astcBlockWidth, astcBlockHeight);
+                            // Use PBO for async upload when available, otherwise fall back to regular upload
+                            boolean uploaded = pbosInitialized ?
+                                AlphaVideoGpuModule.nativeUploadTextureArrayLayerPBO(
+                                    textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                                    frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
+                                    astcGlFormat, astcBlockWidth, astcBlockHeight) :
+                                AlphaVideoGpuModule.nativeUploadTextureArrayLayerFromBuffer(
+                                    textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                                    frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
+                                    astcGlFormat, astcBlockWidth, astcBlockHeight);
                             if (uploaded) {
                                 ringSlots[gpuSlot] = virtualPos;
                             }
@@ -1263,21 +1260,23 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                             }
                         }
                     } else {
-                        // RAM mode: Use byte[] pool (existing behavior)
+                        // RAM mode: Copy from DirectByteBuffer to pooled byte[] for CPU cache
                         byte[] frameData = bufferPool.poll();
                         if (frameData == null) {
                             frameData = new byte[finalBytesPerLayer];
                             Log.w(TAG, "Buffer pool exhausted, allocating new buffer");
                         }
                         
-                        byte[] accData = frameAccumulator.toByteArray();
-                        System.arraycopy(accData, 0, frameData, 0, finalBytesPerLayer);
+                        // Single copy: DirectByteBuffer -> pooled byte[]
+                        frameAccumulatorBuffer.flip();
+                        frameAccumulatorBuffer.get(frameData, 0, finalBytesPerLayer);
                         frameCache.put(virtualPos, frameData);
                         
-                        // Keep remaining data
-                        frameAccumulator.reset();
-                        if (accData.length > finalBytesPerLayer) {
-                            frameAccumulator.write(accData, finalBytesPerLayer, accData.length - finalBytesPerLayer);
+                        // Keep remaining data in accumulator
+                        if (frameAccumulatorBuffer.remaining() > 0) {
+                            frameAccumulatorBuffer.compact();
+                        } else {
+                            frameAccumulatorBuffer.clear();
                         }
                     }
                     
@@ -1347,7 +1346,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             byte[] frameData = frameCache.get(virtualPos);
             if (frameData == null) return; // Not decoded yet (or already in GPU for VRAM mode)
             
-            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
+            boolean uploaded = AlphaVideoGpuModule.nativeUploadTextureArrayLayer(
                 textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc,
                 astcGlFormat, astcBlockWidth, astcBlockHeight);
             if (uploaded) {
@@ -1384,7 +1383,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                         Thread.sleep(50);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                         return;
                     }
                     continue;
@@ -1435,7 +1434,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                                     notifyFinished();
                                     notifyStateChange("stopped");
                                 });
-                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                                 return;
                             }
                         }
@@ -1448,7 +1447,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                                 Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
-                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                                 return;
                             }
                         }
@@ -1463,7 +1462,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                         Thread.sleep(8);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                         return;
                     }
                 }
@@ -1477,7 +1476,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                   ", cacheSize=" + frameCache.size() + ", ringSlots[0]=" + ringSlots[0]);
         }
         
-        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+        AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
         Log.i(TAG, "Streaming animation ended");
     }
     
@@ -1698,7 +1697,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
               ", gpuCache=" + gpuCacheSize + ", vramMode=" + useVramStrategy);
         
         // Create GPU texture array
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, gpuCacheSize, useAstc, astcGlFormat);
+        textureArrayId = AlphaVideoGpuModule.nativeCreateTextureArray(pixelWidth, pixelHeight, gpuCacheSize, useAstc, astcGlFormat);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array for uncompressed streaming"));
             return;
@@ -1712,6 +1711,14 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         streamingRingSize = gpuCacheSize;
         int[] ringSlots = new int[gpuCacheSize];
         Arrays.fill(ringSlots, -1);
+        
+        // Initialize PBOs for async uploads (only for ASTC compressed format)
+        if (useAstc) {
+            pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
+            if (pbosInitialized) {
+                Log.i(TAG, "PBOs initialized for uncompressed streaming: " + bytesPerLayer + " bytes per buffer");
+            }
+        }
         
         // Initialize shaders
         if (!initShaders()) {
@@ -1776,10 +1783,16 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     ByteBuffer frameSlice = mmapBuffer.slice();
                     frameSlice.order(ByteOrder.nativeOrder());
                     
-                    boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
-                        textureArrayId, gpuSlot, finalWidth, finalHeight, 
-                        frameSlice, finalBytesPerLayer, finalUseAstc,
-                        astcGlFormat, astcBlockWidth, astcBlockHeight);
+                    // Use PBO for async upload when available
+                    boolean uploaded = pbosInitialized ?
+                        AlphaVideoGpuModule.nativeUploadTextureArrayLayerPBO(
+                            textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                            frameSlice, finalBytesPerLayer, finalUseAstc,
+                            astcGlFormat, astcBlockWidth, astcBlockHeight) :
+                        AlphaVideoGpuModule.nativeUploadTextureArrayLayerFromBuffer(
+                            textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                            frameSlice, finalBytesPerLayer, finalUseAstc,
+                            astcGlFormat, astcBlockWidth, astcBlockHeight);
                     
                     if (uploaded) {
                         ringSlots[gpuSlot] = currentFrame;
@@ -1867,7 +1880,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
         
         // Initialize internal zstd streaming decompression
-        final long[] streamId = {KTX2PlayerModule.nativeInternalZstdStreamingInit(filePath, level0Offset, level0Length)};
+        final long[] streamId = {AlphaVideoGpuModule.nativeInternalZstdStreamingInit(filePath, level0Offset, level0Length)};
         if (streamId[0] == 0) {
             mainHandler.post(() -> notifyError("Failed to initialize internal zstd streaming"));
             return;
@@ -1894,10 +1907,10 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         
         // Create texture array
         int textureLayerCount = Math.min(GPU_CACHE_SIZE, layerCount);
-        textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(pixelWidth, pixelHeight, textureLayerCount, useAstc, astcGlFormat);
+        textureArrayId = AlphaVideoGpuModule.nativeCreateTextureArray(pixelWidth, pixelHeight, textureLayerCount, useAstc, astcGlFormat);
         if (textureArrayId == 0) {
             mainHandler.post(() -> notifyError("Failed to create texture array for internal zstd streaming"));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         textureArrayLayerCount = textureLayerCount;
@@ -1908,10 +1921,18 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         streamingRingBufferMode = true;
         streamingRingSize = textureLayerCount;
         
+        // Initialize PBOs for async uploads (only for ASTC compressed format)
+        if (useAstc) {
+            pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
+            if (pbosInitialized) {
+                Log.i(TAG, "PBOs initialized for internal zstd streaming: " + bytesPerLayer + " bytes per buffer");
+            }
+        }
+        
         // Initialize shaders
         if (!initShaders()) {
             mainHandler.post(() -> notifyError("Failed to initialize shaders"));
-            KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+            AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
         
@@ -1937,7 +1958,9 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             bufferPool = null;
             frameCache = new java.util.concurrent.ConcurrentHashMap<>();
         } else {
-            frameAccumulatorBuffer = null;
+            // RAM mode: DirectByteBuffer for accumulation (zero-copy decompression),
+            // byte[] pool for CPU cache storage
+            frameAccumulatorBuffer = ByteBuffer.allocateDirect(bytesPerLayer + bufferSize);
             final int POOL_SIZE = CPU_CACHE_SIZE + 5;
             bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
             for (int i = 0; i < POOL_SIZE; i++) {
@@ -1945,8 +1968,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             }
             frameCache = new java.util.concurrent.ConcurrentHashMap<>();
         }
-        
-        ByteArrayOutputStream frameAccumulator = useVramStrategy ? null : new ByteArrayOutputStream(bytesPerLayer + bufferSize);
+        // Both modes now use DirectByteBuffer for accumulation
         
         final int finalWidth = pixelWidth;
         final int finalHeight = pixelHeight;
@@ -1986,36 +2008,27 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     decoderLoopIteration[0]++;
                     decodePos[0] = 0;
                     decompressEnded[0] = false;
-                    if (useVramStrategy) {
-                        frameAccumulatorBuffer.clear();
-                    } else {
-                        frameAccumulator.reset();
-                    }
-                    KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
-                    streamId[0] = KTX2PlayerModule.nativeInternalZstdStreamingInit(finalFilePath, finalLevel0Offset, finalLevel0Length);
+                    frameAccumulatorBuffer.clear();  // Both modes use DirectByteBuffer now
+                    AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
+                    streamId[0] = AlphaVideoGpuModule.nativeInternalZstdStreamingInit(finalFilePath, finalLevel0Offset, finalLevel0Length);
                     Log.i(TAG, "Internal zstd prefetch wrap-around: restarting for loop " + decoderLoopIteration[0]);
                     continue;
                 }
                 
-                int accumulatorSize = useVramStrategy ? frameAccumulatorBuffer.position() : frameAccumulator.size();
+                int accumulatorSize = frameAccumulatorBuffer.position();
                 
                 // Decompress until we have a full frame
                 while (accumulatorSize < finalBytesPerLayer && !decompressEnded[0]) {
                     decompressBuffer.clear();
-                    long result = KTX2PlayerModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    long result = AlphaVideoGpuModule.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
                     if (result == -1) { decompressEnded[0] = true; break; }
                     int status = (int)(result >> 32);
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
                     if (bytesWritten > 0) {
                         decompressBuffer.limit(bytesWritten);
                         decompressBuffer.position(0);
-                        if (useVramStrategy) {
-                            frameAccumulatorBuffer.put(decompressBuffer);
-                        } else {
-                            byte[] temp = new byte[bytesWritten];
-                            decompressBuffer.get(temp);
-                            frameAccumulator.write(temp, 0, temp.length);
-                        }
+                        // Zero-copy: transfer directly between ByteBuffers (both modes)
+                        frameAccumulatorBuffer.put(decompressBuffer);
                         accumulatorSize += bytesWritten;
                     }
                     if (status == 1) { decompressEnded[0] = true; break; }
@@ -2035,10 +2048,16 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                         
                         if (canOverwrite && ringSlots[gpuSlot] != virtualPos) {
                             frameAccumulatorBuffer.flip();
-                            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBuffer(
-                                textureArrayId, gpuSlot, finalWidth, finalHeight, 
-                                frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
-                                astcGlFormat, astcBlockWidth, astcBlockHeight);
+                            // Use PBO for async upload when available
+                            boolean uploaded = pbosInitialized ?
+                                AlphaVideoGpuModule.nativeUploadTextureArrayLayerPBO(
+                                    textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                                    frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
+                                    astcGlFormat, astcBlockWidth, astcBlockHeight) :
+                                AlphaVideoGpuModule.nativeUploadTextureArrayLayerFromBuffer(
+                                    textureArrayId, gpuSlot, finalWidth, finalHeight, 
+                                    frameAccumulatorBuffer, finalBytesPerLayer, finalUseAstc,
+                                    astcGlFormat, astcBlockWidth, astcBlockHeight);
                             if (uploaded) {
                                 ringSlots[gpuSlot] = virtualPos;
                             }
@@ -2060,16 +2079,20 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                             }
                         }
                     } else {
+                        // RAM mode: Copy from DirectByteBuffer to pooled byte[] for CPU cache
                         byte[] frameData = bufferPool.poll();
                         if (frameData == null) {
                             frameData = new byte[finalBytesPerLayer];
                         }
-                        byte[] accData = frameAccumulator.toByteArray();
-                        System.arraycopy(accData, 0, frameData, 0, finalBytesPerLayer);
+                        // Single copy: DirectByteBuffer -> pooled byte[]
+                        frameAccumulatorBuffer.flip();
+                        frameAccumulatorBuffer.get(frameData, 0, finalBytesPerLayer);
                         frameCache.put(virtualPos, frameData);
-                        frameAccumulator.reset();
-                        if (accData.length > finalBytesPerLayer) {
-                            frameAccumulator.write(accData, finalBytesPerLayer, accData.length - finalBytesPerLayer);
+                        // Keep remaining data in accumulator
+                        if (frameAccumulatorBuffer.remaining() > 0) {
+                            frameAccumulatorBuffer.compact();
+                        } else {
+                            frameAccumulatorBuffer.clear();
                         }
                     }
                     
@@ -2116,7 +2139,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             if (ringSlots[gpuSlot] == virtualPos) return;
             byte[] frameData = frameCache.get(virtualPos);
             if (frameData == null) return;
-            boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayer(
+            boolean uploaded = AlphaVideoGpuModule.nativeUploadTextureArrayLayer(
                 textureArrayId, gpuSlot, finalWidth, finalHeight, frameData, finalUseAstc,
                 astcGlFormat, astcBlockWidth, astcBlockHeight);
             if (uploaded) {
@@ -2142,7 +2165,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 if (isPaused.get()) {
                     try { Thread.sleep(50); } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                         return;
                     }
                     continue;
@@ -2182,7 +2205,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                                     notifyFinished();
                                     notifyStateChange("stopped");
                                 });
-                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                                 return;
                             }
                         }
@@ -2194,7 +2217,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                                 Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
-                                KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                                AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                                 return;
                             }
                         }
@@ -2203,7 +2226,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
                     try { Thread.sleep(8); } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+                        AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                         return;
                     }
                 }
@@ -2214,7 +2237,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             Log.i(TAG, "Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
         }
         
-        KTX2PlayerModule.nativeStreamingDecompressEnd(streamId[0]);
+        AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
         Log.i(TAG, "Internal zstd streaming animation ended");
     }
     
@@ -2698,7 +2721,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             byte[] textureData;
             
             if (supercompressionScheme == 2) {
-                textureData = KTX2PlayerModule.nativeDecompressZstd(
+                textureData = AlphaVideoGpuModule.nativeDecompressZstd(
                     ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, (int)level0UncompressedLength);
                 if (textureData == null) {
                     return null;
@@ -2723,7 +2746,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
     private int[] uploadASTCToGPU(byte[] textureData, int pixelWidth, int pixelHeight) {
         try {
             if (!isASTCSupported()) {
-                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight, astcBlockWidth, astcBlockHeight);
+                return AlphaVideoGpuModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight, astcBlockWidth, astcBlockHeight);
             }
             
             int[] textureIds = new int[1];
@@ -2831,7 +2854,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             if (supercompressionScheme == 2) {
                 // Zstandard compression - use native decompression
                 Log.d(TAG, "Decompressing Zstandard data...");
-                textureData = KTX2PlayerModule.nativeDecompressZstd(
+                textureData = AlphaVideoGpuModule.nativeDecompressZstd(
                     ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, (int)level0UncompressedLength);
                 if (textureData == null) {
                     Log.e(TAG, "Zstd decompression failed");
@@ -2852,7 +2875,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 // Fallback: decode ASTC to RGBA in software (for emulator)
                 Log.w(TAG, "ASTC not supported - using software decode fallback (emulator mode)");
                 Log.w(TAG, "Note: ASTC textures require a real device for optimal performance");
-                return KTX2PlayerModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight, astcBlockWidth, astcBlockHeight);
+                return AlphaVideoGpuModule.nativeDecodeASTCToRGBA(textureData, pixelWidth, pixelHeight, astcBlockWidth, astcBlockHeight);
             }
             
             // Upload to GPU as compressed texture
@@ -2938,7 +2961,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             
             if (supercompressionScheme == 2) { // Zstd
                 // Decompress directly into the direct ByteBuffer
-                boolean success = KTX2PlayerModule.nativeDecompressZstdToBuffer(
+                boolean success = AlphaVideoGpuModule.nativeDecompressZstdToBuffer(
                     ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, frameBuffer, totalSize);
                 if (!success) {
                     Log.e(TAG, "Zstd decompression to buffer failed");
@@ -2982,7 +3005,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     Log.d(TAG, "Using native ASTC loader for GLB part " + i);
                     result = loadNativeASTCFromKTX2(ktx2Data);
                 } else {
-                    result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+                    result = AlphaVideoGpuModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
                 }
                 
                 if (result != null && result.length >= 3) {
@@ -3046,7 +3069,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     
                     // Create small ring buffer on GPU (2 frames for double buffering)
                     int gpuRingSize = 2;
-                    textureArrayId = KTX2PlayerModule.nativeCreateTextureArray(texWidth, texHeight, gpuRingSize, useAstc, astcGlFormat);
+                    textureArrayId = AlphaVideoGpuModule.nativeCreateTextureArray(texWidth, texHeight, gpuRingSize, useAstc, astcGlFormat);
                     if (textureArrayId == 0) {
                         throw new Exception("Failed to create GPU ring buffer for RAM mode");
                     }
@@ -3064,7 +3087,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 } else {
                     Log.d(TAG, "VRAM mode: Loading texture array with ASTC=" + useAstc);
                     
-                    int[] result = KTX2PlayerModule.nativeLoadTextureArray(ktx2Data, useAstc);
+                    int[] result = AlphaVideoGpuModule.nativeLoadTextureArray(ktx2Data, useAstc);
                     if (result == null || result.length < 4) {
                         throw new Exception("Failed to load texture array");
                     }
@@ -3097,7 +3120,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                     Log.d(TAG, "Using native ASTC loader");
                     result = loadNativeASTCFromKTX2(ktx2Data);
                 } else {
-                    result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+                    result = AlphaVideoGpuModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
                 }
                 
                 if (result == null || result.length < 3) {
@@ -3165,7 +3188,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
             Log.d(TAG, "Using native ASTC loader for part " + partIndex);
             result = loadNativeASTCFromKTX2(ktx2Data);
         } else {
-            result = KTX2PlayerModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
+            result = AlphaVideoGpuModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
         }
         
         if (result == null || result.length < 3) {
@@ -3269,7 +3292,7 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
                 int slot = 0;
                 int offset = currentFrame * ramBytesPerFrame;
                 boolean useAstc = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
-                boolean uploaded = KTX2PlayerModule.nativeUploadTextureArrayLayerFromBufferWithOffset(
+                boolean uploaded = AlphaVideoGpuModule.nativeUploadTextureArrayLayerFromBufferWithOffset(
                     textureArrayId, slot, frameWidth, frameHeight, ramFrameBuffer, offset, ramBytesPerFrame, useAstc,
                     astcGlFormat, astcBlockWidth, astcBlockHeight);
                 if (uploaded) {
@@ -3373,11 +3396,17 @@ public class KTX2TextureView extends TextureView implements TextureView.SurfaceT
         if (eglDisplay != null && eglDisplay != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
             
+            // Cleanup PBOs before deleting textures
+            if (pbosInitialized && textureArrayId != 0) {
+                AlphaVideoGpuModule.nativeCleanupPBOs(textureArrayId);
+                pbosInitialized = false;
+            }
+            
             // Delete textures
             if (textureIds != null) {
                 for (int texId : textureIds) {
                     if (texId != 0) {
-                        KTX2PlayerModule.nativeDeleteTexture(texId);
+                        AlphaVideoGpuModule.nativeDeleteTexture(texId);
                     }
                 }
                 textureIds = new int[0];

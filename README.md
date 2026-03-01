@@ -1,6 +1,8 @@
-# React Native KTX2 Player
+# alpha-video-gpu
 
-A GPU-accelerated texture animation player for React Native (iOS, Android, Web). Plays pre-encoded KTX2 sprite sheet animations with hardware texture compression support.
+GPU-accelerated transparent alpha video player for React Native (iOS, Android, Web). Uses texture compression (ASTC) for efficient playback with low CPU/battery usage.
+
+> **Looking for codec-based playback?** See [alpha-video](https://github.com/danielkpl2/alpha-video) for WebM VP9/AV1 with smaller file sizes.
 
 ## Overview
 
@@ -13,6 +15,112 @@ This library renders animations from KTX2 texture files containing sprite sheets
 - Metadata embedded in KTX2 files or provided separately
 - **Streaming playback** for long animations with minimal memory footprint
 - **Uncompressed ASTC streaming** for many concurrent players
+
+---
+
+## Video Codecs vs GPU Texture Streaming
+
+This section explains why GPU texture streaming exists and when to use it instead of traditional video codecs.
+
+### The Traditional Video Pipeline
+
+Video codecs (H.264, VP9, AV1) are designed for maximum compression:
+
+```
+Encoded File → CPU Decode → YUV/YUVA → Convert to RGBA → Upload to GPU → Render
+     │              │            │              │              │
+   Small        Heavy CPU     Planar        Per-frame      Bandwidth
+   files        per frame     format        conversion     limited
+```
+
+**Per-frame work:**
+1. **Decode** - CPU decompresses each frame using complex algorithms (motion compensation, DCT, entropy coding)
+2. **Color convert** - YUV→RGBA conversion (or YUVA for alpha)
+3. **GPU upload** - Transfer decoded pixels to GPU memory every frame
+
+**Characteristics:**
+- Excellent compression (10-50x smaller than raw)
+- High CPU usage during playback
+- Battery drain on mobile
+- Latency from decode pipeline
+- Alpha support varies (VP9/AV1 support YUVA, H.264 does not)
+
+### The GPU Texture Pipeline
+
+GPU texture streaming pre-compresses frames into GPU-native formats:
+
+```
+KTX2 File → Zstd Decompress → ASTC Data → Direct GPU Upload → Render
+    │             │               │               │
+  Larger      ~1GB/s CPU      Already GPU      Zero CPU
+  files       (trivial)        format         per frame
+```
+
+**Per-frame work:**
+1. **Decompress** - Zstd runs at ~1GB/s, trivial CPU load
+2. **Upload** - ASTC data goes directly to GPU (no conversion)
+3. **Render** - GPU decompresses ASTC in hardware during sampling
+
+**Characteristics:**
+- Moderate compression (3-10x smaller than raw, larger than video codecs)
+- Near-zero CPU usage during playback
+- Minimal battery drain
+- No decode latency
+- Native alpha support (ASTC includes alpha channel)
+
+### Side-by-Side Comparison
+
+| Aspect | Video Codec (VP9/AV1) | GPU Texture (ASTC) |
+|--------|----------------------|-------------------|
+| **File size** | Smallest (10-50x compression) | Larger (3-10x compression) |
+| **CPU per frame** | High (decode + convert) | Near-zero (GPU does decompression) |
+| **Battery impact** | Significant | Minimal |
+| **Memory bandwidth** | RGBA upload every frame | Compressed upload, GPU expands |
+| **Alpha support** | VP9/AV1 only (YUVA) | Native (ASTC 4-channel) |
+| **Startup latency** | Codec init + first decode | Immediate |
+| **Concurrent players** | CPU-limited (2-4 typical) | GPU-limited (10-50+ typical) |
+| **Hardware decode** | Requires video decoder chip | Uses texture sampling hardware |
+
+### When to Use Each
+
+**Use video codecs (alpha-video) when:**
+- File size is critical (bandwidth-constrained)
+- Playing 1-2 videos at a time
+- Content is long-form (minutes+)
+- Device has hardware video decoder
+
+**Use GPU textures (alpha-video-gpu) when:**
+- Many simultaneous animations (UI effects, particles, stickers)
+- Battery/CPU usage is critical
+- Low latency is required
+- Content is short-to-medium (seconds to ~1 minute)
+- Consistent cross-platform behavior needed
+
+### The Math
+
+For a 30fps, 400×400 animation with alpha:
+
+**Video codec (VP9 YUVA):**
+- File: ~50KB/sec of video
+- CPU: Decode + YUV→RGBA = ~5-15ms per frame
+- Memory: 400×400×4 = 640KB RGBA uploaded per frame
+- 10 concurrent = 50-150ms CPU per frame (drops frames)
+
+**GPU texture (ASTC 6×6):**
+- File: ~200KB/sec of video (4x larger)
+- CPU: Zstd decompress = ~0.2ms per frame
+- Memory: 400×400×0.44 = 71KB ASTC uploaded per frame (GPU expands)
+- 10 concurrent = 2ms CPU per frame (smooth 60fps)
+
+### Streaming Modes
+
+Both approaches support streaming for long content:
+
+| Mode | Video Codec | GPU Texture |
+|------|-------------|-------------|
+| **Buffering** | Decode ahead into frame buffer | Decompress ahead into ring buffer |
+| **Memory** | Decoded RGBA frames in RAM | Compressed ASTC in ring buffer |
+| **Seeking** | Keyframe-based | Frame-accurate (every frame is a keyframe) |
 
 ---
 
@@ -94,7 +202,7 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator, some 
 ## Installation
 
 ```bash
-npm install react-native-ktx2player
+npm install alpha-video-gpu
 
 # iOS
 cd ios && pod install
@@ -109,9 +217,9 @@ Basis Universal transcoder is bundled. No additional native dependencies require
 ### Remote URL
 
 ```jsx
-import { KTX2PlayerView } from 'react-native-ktx2player';
+import { AlphaVideoGpuView } from 'alpha-video-gpu';
 
-<KTX2PlayerView
+<AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: 'https://example.com/animation.ktx2' }}
   autoPlay
@@ -122,7 +230,7 @@ import { KTX2PlayerView } from 'react-native-ktx2player';
 Remote files are automatically cached. Use `cacheKey` for explicit cache control:
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: 'https://example.com/animation.ktx2' }}
   cacheKey="animations/glow.ktx2"
@@ -140,7 +248,7 @@ Include a `.ktx2` or `.glb` file in your React Native project and resolve it cor
 #### Cross-Platform Asset Resolution
 
 ```jsx
-import { KTX2PlayerView } from 'react-native-ktx2player';
+import { AlphaVideoGpuView } from 'alpha-video-gpu';
 import { Image, Platform } from 'react-native';
 
 // Import the asset
@@ -177,7 +285,7 @@ function resolveAsset(asset) {
 // Usage
 const animationUri = resolveAsset(glbAsset);
 
-<KTX2PlayerView
+<AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: animationUri }}
   autoPlay
@@ -199,13 +307,13 @@ const animationUri = resolveAsset(glbAsset);
 If you don't need web support, the simpler approach works:
 
 ```jsx
-import { KTX2PlayerView } from 'react-native-ktx2player';
+import { AlphaVideoGpuView } from 'alpha-video-gpu';
 import { Image } from 'react-native';
 
 const ktx2Asset = require('./assets/animation.ktx2');
 const resolvedAsset = Image.resolveAssetSource(ktx2Asset);
 
-<KTX2PlayerView
+<AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: resolvedAsset.uri }}
   autoPlay
@@ -241,7 +349,7 @@ android/app/src/main/assets/animations/glow.ktx2
 Then use the `asset://` URI scheme:
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: 'asset://animations/glow.ktx2' }}
   autoPlay
@@ -256,7 +364,7 @@ Then use the `asset://` URI scheme:
 For files on the device filesystem:
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: 'file:///path/to/animation.ktx2' }}
   autoPlay
@@ -271,7 +379,7 @@ For files on the device filesystem:
 For large animations that exceed GPU texture size limits, the encoder splits frames across multiple KTX2 files. All parts are loaded into GPU memory at startup.
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation.ktx2' }}
   parts={[
     { uri: 'https://example.com/anim_0.ktx2' },
@@ -373,8 +481,8 @@ Works with React Native Web. Requires external scripts loaded before your app bu
 Copy the Basis transcoder to your public directory:
 
 ```bash
-cp node_modules/react-native-ktx2player/web/libs/basis_transcoder.js public/
-cp node_modules/react-native-ktx2player/web/libs/basis_transcoder.wasm public/
+cp node_modules/alpha-video-gpu/web/libs/basis_transcoder.js public/
+cp node_modules/alpha-video-gpu/web/libs/basis_transcoder.wasm public/
 ```
 
 ### Web Texture Format Support
@@ -420,7 +528,7 @@ The `streamingStrategy` prop controls where the main frame buffer is located. Th
 All frames are loaded into memory before playback begins. Best for short-to-medium animations. Works with both **texture arrays** and **atlas** packing modes, and supports both **Native ASTC** and **UASTC** encoding.
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation.ktx2' }}
   autoPlay
   loop
@@ -435,7 +543,7 @@ All frames are loaded into memory before playback begins. Best for short-to-medi
 | `ram` | All frames held in CPU RAM, streamed to a small VRAM buffer on demand. Minimizes VRAM while RAM holds all data. |
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation.ktx2' }}
   streamingStrategy="ram"
   autoPlay
@@ -456,7 +564,7 @@ For very long animations or memory-constrained scenarios, streaming mode decodes
 **Enable streaming by using `.ktx2.zst` file extension:**
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation.ktx2.zst' }}
   streamingStrategy="vram"
   streamingRingBufferSize={20}
@@ -577,7 +685,7 @@ The only difference from compressed streaming is `--zstd 0` instead of `--zstd 2
 ```jsx
 // Uncompressed streaming uses .ktx2 extension (not .ktx2.zst)
 // The player auto-detects uncompressed format from file header
-<KTX2PlayerView
+<AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation_uncompressed.ktx2' }}
   streamingStrategy="vram"
   streamingRingBufferSize={20}
@@ -662,7 +770,7 @@ Not ideal for:
 ### State Change Events
 
 ```jsx
-<KTX2PlayerView
+<AlphaVideoGpuView
   onStateChange={({ nativeEvent }) => {
     // nativeEvent.state: "loading" | "ready" | "playing" | "paused" | "stopped"
     console.log('State:', nativeEvent.state);
@@ -675,7 +783,7 @@ Not ideal for:
 ```jsx
 const playerRef = useRef(null);
 
-<KTX2PlayerView ref={playerRef} ... />
+<AlphaVideoGpuView ref={playerRef} ... />
 
 // Control playback
 playerRef.current?.play();

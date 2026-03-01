@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.ktx2player">
+    package="com.alphavideo.gpu">
     
     <!-- Require OpenGL ES 3.0 for ETC2/ASTC texture compression support -->
     <uses-feature
