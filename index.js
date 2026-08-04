@@ -87,12 +87,18 @@ export const AlphaVideoGpuView = React.memo(({
   // Native implementation (iOS/Android)
   // Map 'paused' prop to 'reactPaused' on iOS (to avoid conflict with MTKView's paused property)
   const { paused, ...restOtherProps } = otherProps;
+  // `AlphaVideoGpuSource` documents a `cacheKey` field, but the native side only reads
+  // the top-level prop, so a key passed inside `source` used to be dropped silently.
+  // The download then falls back to hashing the URL — and for a presigned URL that
+  // hash changes on every refetch, so the same file is re-downloaded under a new name
+  // instead of hitting the cache. Prefer the explicit prop, fall back to the source.
+  const effectiveCacheKey = cacheKey != null ? cacheKey : normalizedSource?.cacheKey;
   const nativeProps = {
     source: normalizedSource,
     autoPlay,
     loop,
     playbackSpeed,
-    cacheKey,
+    cacheKey: effectiveCacheKey,
     ...(Platform.OS === 'ios' && paused !== undefined ? { reactPaused: paused } : { paused }),
   };
 

@@ -138,13 +138,19 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
     });
   }, [onStateChange, onLoad, onFrameUpdate, onFinished, onError]);
 
+  // What identifies "the same video". A presigned URL is re-signed every time the app
+  // lists its media, so the URL changes while still addressing the same object; keying
+  // the load on it would resetSource() and refetch on each refresh, visibly restarting
+  // a loop that should run until unmount. The cache key is the stable identity.
+  const sourceIdentity = normalizedSource?.cacheKey || normalizedSource?.uri || null;
+
   // Load source when it changes
   useEffect(() => {
     const core = coreRef.current;
     const uri = normalizedSource?.uri;
-    if (!core || !uri || loadedSourceRef.current === uri) return;
+    if (!core || !uri || !sourceIdentity || loadedSourceRef.current === sourceIdentity) return;
 
-    loadedSourceRef.current = uri;
+    loadedSourceRef.current = sourceIdentity;
     const partUris = parts?.map(p => p.uri).filter(Boolean) as string[] | undefined;
     core.setSource(uri, partUris);
 
@@ -153,7 +159,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
       core.resetSource();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [normalizedSource?.uri]);
+  }, [sourceIdentity]);
 
   // Handle playback speed changes
   useEffect(() => {

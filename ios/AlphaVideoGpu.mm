@@ -31,6 +31,9 @@
   BOOL _basisInitialized;
   NSString *_basePath;
   NSString *_sourceUri;
+  // The cache key the loaded/loading source belongs to. Compared against self.cacheKey
+  // to tell a re-signed URL for the same object apart from a new asset.
+  NSString *_loadedCacheKey;
   NSArray *_partsMetadata;
   NSArray<NSNumber *> *_partWidths;
   NSArray<NSNumber *> *_partHeights;
@@ -305,14 +308,37 @@
     return;
   }
   
+  // Adopt a cacheKey carried inside the source dictionary before loading. The load
+  // reads self.cacheKey to decide where the download lands, and React gives no
+  // ordering guarantee against the separate `cacheKey` prop setter — losing that race
+  // means falling back to hashing the URL, which for a presigned URL differs on every
+  // refetch and so never hits the cache.
+  NSString *sourceCacheKey = source[@"cacheKey"];
+  if ([sourceCacheKey isKindOfClass:[NSString class]] && sourceCacheKey.length > 0) {
+    self.cacheKey = sourceCacheKey;
+  }
+  
   // Check if source changed
   if ([_sourceUri isEqualToString:uri] && (_isSourceLoaded || _isSourceLoading)) {
     NSLog(@"AlphaVideoGpuView: Source unchanged and already loaded/loading, skipping");
     return;
   }
   
+  // A presigned URL is re-signed every time the app lists its media, so the URL changes
+  // while still addressing the same object. When the cache key matches what is already
+  // on screen this is a credential refresh, not a new asset, and reloading would
+  // interrupt a loop that is supposed to run until unmount.
+  if (self.cacheKey.length > 0 && [self.cacheKey isEqualToString:_loadedCacheKey]
+      && (_isSourceLoaded || _isSourceLoading)) {
+    NSLog(@"AlphaVideoGpuView: Same cacheKey (%@), ignoring URL change", self.cacheKey);
+    _source = [source copy];
+    _sourceUri = [uri copy];
+    return;
+  }
+  
   _source = [source copy];
   _sourceUri = [uri copy];
+  _loadedCacheKey = [self.cacheKey copy];
   _isSourceLoaded = NO;
   _isSourceLoading = YES;
   _isDestroyed = NO;

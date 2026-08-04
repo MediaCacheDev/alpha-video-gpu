@@ -75,6 +75,9 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     // Source
     private String mSource;
     private String mCacheKey;
+    // The cache key the currently running playback was started for. Compared against
+    // mCacheKey to tell a re-signed URL for the same object apart from a new asset.
+    private String mPlayingCacheKey;
     private boolean mSourceLoaded = false;
     
     // Playback settings
@@ -195,6 +198,11 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     private final AtomicBoolean shouldStop = new AtomicBoolean(false);
     private final AtomicBoolean isDestroyed = new AtomicBoolean(false);
     private final AtomicBoolean isPlaybackRunning = new AtomicBoolean(false);  // Guards against concurrent startPlayback calls
+    // Set when startPlayback() is called while a previous worker is still unwinding.
+    // stopPlayback() only raises a flag, so the worker exits asynchronously; without
+    // recording the owed restart the view would stay stopped until the surface was
+    // destroyed and recreated (i.e. until the user navigated away and back).
+    private final AtomicBoolean pendingRestart = new AtomicBoolean(false);
     
     // Shaders
     private static final String VERTEX_SHADER =
@@ -424,6 +432,30 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     
     // Public API
     public void setSource(String source) {
+        // React resends props on re-render, and for an unchanged source the
+        // stop-then-start below is pure churn: it discards the decoded ring buffer
+        // and briefly leaves the view with no running worker. Only act when the value
+        // actually changed, or when nothing is currently playing (so a stalled or
+        // finished player can still be revived by setting the same source again).
+        boolean playing = isPlaybackRunning.get() && !shouldStop.get();
+        if (source != null && source.equals(mSource) && playing) {
+            Log.d(TAG, "setSource: unchanged and still playing, ignoring");
+            return;
+        }
+
+        // A presigned URL is re-signed every time the app lists its media, so the URL
+        // changes while still addressing the same object. The cache key is the stable
+        // identity, so when it matches what is already on screen this is a credential
+        // refresh rather than a new asset, and restarting would visibly interrupt a
+        // loop that is supposed to run until unmount.
+        if (source != null && playing
+                && mCacheKey != null && !mCacheKey.isEmpty()
+                && mCacheKey.equals(mPlayingCacheKey)) {
+            Log.d(TAG, "setSource: same cacheKey (" + mCacheKey + ") still playing, ignoring URL change");
+            mSource = source;
+            return;
+        }
+
         Log.d(TAG, "setSource: " + (source != null ? source.substring(0, Math.min(80, source.length())) : "null"));
         
         stopPlayback();
@@ -569,13 +601,19 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             return;
         }
         
-        // Prevent concurrent playback attempts
+        // Prevent concurrent playback attempts. A previous worker may still be
+        // unwinding after stopPlayback() raised shouldStop; in that case the restart
+        // is owed rather than redundant, so record it and let the exiting worker
+        // relaunch. Returning without doing this leaves shouldStop raised with no
+        // worker running, which strands the view until the surface is recreated.
         if (!isPlaybackRunning.compareAndSet(false, true)) {
-            Log.d(TAG, "startPlayback: already running, skipping");
+            Log.d(TAG, "startPlayback: worker still running, queueing restart");
+            pendingRestart.set(true);
             return;
         }
         
         shouldStop.set(false);
+        mPlayingCacheKey = mCacheKey;
         
         try {
             getOrCreateExecutor().execute(() -> {
@@ -586,7 +624,14 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     mainHandler.post(() -> notifyError(e.getMessage()));
                 } finally {
                     cleanupGL();
+                    mPlayingCacheKey = null;
                     isPlaybackRunning.set(false);
+                    // Clear the guard first, then service any restart requested while
+                    // this worker was shutting down. Hopping to the main thread keeps
+                    // the view/surface reads in startPlayback() on the UI thread.
+                    if (pendingRestart.getAndSet(false) && !isDestroyed.get()) {
+                        mainHandler.post(this::startPlayback);
+                    }
                 }
             });
         } catch (Exception e) {

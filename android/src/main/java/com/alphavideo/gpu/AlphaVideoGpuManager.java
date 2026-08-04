@@ -53,6 +53,17 @@ public class AlphaVideoGpuManager extends SimpleViewManager<AlphaVideoGpuTexture
         if (source != null && source.hasKey("uri") && !source.isNull("uri")) {
             sourceUri = source.getString("uri");
         }
+
+        // Adopt a cacheKey carried inside the source map before touching the source:
+        // setSource() starts the download that reads the key, and React gives no
+        // ordering guarantee between this setter and the standalone `cacheKey` one, so
+        // relying on that prop alone can download under a URL-derived name instead.
+        if (source != null && source.hasKey("cacheKey") && !source.isNull("cacheKey")) {
+            String sourceCacheKey = source.getString("cacheKey");
+            if (sourceCacheKey != null && !sourceCacheKey.isEmpty()) {
+                view.setCacheKey(sourceCacheKey);
+            }
+        }
         
         if (sourceUri == null || sourceUri.isEmpty()) {
             Log.d(TAG, "setSource: null or empty");
