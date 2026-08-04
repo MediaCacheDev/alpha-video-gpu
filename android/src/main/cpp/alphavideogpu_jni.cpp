@@ -1770,4 +1770,120 @@ Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeInternalZstdStreamingInit(JNIE
     return streamId;
 }
 
+// ===================================================================
+// ASTV (ASTC Texture Video) decoder — interframe compressed ASTC
+// ===================================================================
+
+#include "astv_decoder.h"
+
+static std::mutex g_astv_mutex;
+static std::map<jlong, std::unique_ptr<astv::Decoder>> g_astv_decoders;
+static std::atomic<jlong> g_next_astv_id{1};
+
+// Load ASTV file from byte array.
+// Returns: [handle, width, height, frameCount, fps, blockW, blockH, codebookEntries, hasAlpha]
+JNIEXPORT jlongArray JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeLoadAstv(JNIEnv *env, jclass clazz,
+                                                           jbyteArray astv_data) {
+    jsize data_length = env->GetArrayLength(astv_data);
+    jbyte* data = env->GetByteArrayElements(astv_data, nullptr);
+    if (!data) {
+        LOGE("ASTV: Failed to get data");
+        return nullptr;
+    }
+
+    auto decoder = std::make_unique<astv::Decoder>();
+    if (!decoder->load_from_memory((const uint8_t*)data, data_length)) {
+        LOGE("ASTV: Failed to load (%d bytes)", data_length);
+        env->ReleaseByteArrayElements(astv_data, data, JNI_ABORT);
+        return nullptr;
+    }
+    env->ReleaseByteArrayElements(astv_data, data, JNI_ABORT);
+
+    const auto& hdr = decoder->header();
+    jlong handle = g_next_astv_id.fetch_add(1);
+
+    jlongArray result = env->NewLongArray(9);
+    jlong vals[9] = {
+        handle,
+        (jlong)hdr.width, (jlong)hdr.height,
+        (jlong)hdr.frame_count,
+        (jlong)hdr.fps_num,
+        (jlong)hdr.astc_block_w, (jlong)hdr.astc_block_h,
+        (jlong)hdr.codebook_entries,
+        (jlong)hdr.has_alpha
+    };
+    env->SetLongArrayRegion(result, 0, 9, vals);
+
+    {
+        std::lock_guard<std::mutex> lock(g_astv_mutex);
+        g_astv_decoders[handle] = std::move(decoder);
+    }
+
+    LOGI("ASTV: Loaded %dx%d, %u frames, %u codebook entries, handle=%lld",
+         hdr.width, hdr.height, hdr.frame_count, hdr.codebook_entries, (long long)handle);
+
+    return result;
+}
+
+// Decode next frame and return ASTC texture data as byte array
+JNIEXPORT jbyteArray JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeDecodeAstvFrame(JNIEnv *env, jclass clazz,
+                                                                   jlong handle) {
+    astv::Decoder* decoder = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_astv_mutex);
+        auto it = g_astv_decoders.find(handle);
+        if (it == g_astv_decoders.end()) return nullptr;
+        decoder = it->second.get();
+    }
+
+    if (!decoder->decode_frame()) {
+        return nullptr; // No more frames
+    }
+
+    const auto& hdr = decoder->header();
+    uint32_t tex_size = (uint32_t)hdr.blocks_x * hdr.blocks_y * 16;
+
+    jbyteArray result = env->NewByteArray(tex_size);
+    if (!result) return nullptr;
+
+    // Gather ASTC bytes from codebook
+    std::vector<uint8_t> buf(tex_size);
+    decoder->gather_astc_texture(buf.data());
+    env->SetByteArrayRegion(result, 0, tex_size, (const jbyte*)buf.data());
+
+    return result;
+}
+
+// Seek to frame
+JNIEXPORT jboolean JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeSeekAstv(JNIEnv *env, jclass clazz,
+                                                           jlong handle, jint frame) {
+    std::lock_guard<std::mutex> lock(g_astv_mutex);
+    auto it = g_astv_decoders.find(handle);
+    if (it == g_astv_decoders.end()) return JNI_FALSE;
+    return it->second->seek_to_frame((uint32_t)frame) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Reset decoder
+JNIEXPORT void JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeResetAstv(JNIEnv *env, jclass clazz,
+                                                            jlong handle) {
+    std::lock_guard<std::mutex> lock(g_astv_mutex);
+    auto it = g_astv_decoders.find(handle);
+    if (it != g_astv_decoders.end()) {
+        it->second->reset();
+    }
+}
+
+// Free decoder
+JNIEXPORT void JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeFreeAstv(JNIEnv *env, jclass clazz,
+                                                           jlong handle) {
+    std::lock_guard<std::mutex> lock(g_astv_mutex);
+    g_astv_decoders.erase(handle);
+    LOGI("ASTV: Freed handle %lld", (long long)handle);
+}
+
 } // extern "C"

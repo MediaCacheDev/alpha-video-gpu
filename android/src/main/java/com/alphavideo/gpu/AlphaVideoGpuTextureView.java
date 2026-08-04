@@ -678,6 +678,14 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             return;
         }
         
+        // Check for ASTV (ASTC Texture Video) interframe codec
+        boolean isAstv = localPath.endsWith(".astv") || localPath.contains(".astv?");
+        if (isAstv) {
+            Log.i(TAG, "Detected ASTV format: " + localPath);
+            playAstvAnimation(localPath);
+            return;
+        }
+        
         // Check for uncompressed streaming mode BEFORE loading file into RAM
         // This avoids allocating ~29MB per player instance for streaming files
         if (checkAndPlayUncompressedStreaming(localPath)) {
@@ -867,6 +875,200 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 }
             }
         } while (loop && !shouldStop.get() && !isDestroyed.get() && !gpuPlayback);
+    }
+    
+    /**
+     * Play ASTV (ASTC Texture Video) animation with interframe compression.
+     * Uses codebook-based decoder: O(1) per-block, ~160KB per player instance.
+     */
+    private void playAstvAnimation(String localPath) {
+        byte[] fileData;
+        try {
+            fileData = readFileBytes(localPath);
+        } catch (IOException e) {
+            mainHandler.post(() -> notifyError("Failed to read ASTV file: " + e.getMessage()));
+            return;
+        }
+        
+        // Load ASTV via JNI
+        long[] info = AlphaVideoGpuModule.nativeLoadAstv(fileData);
+        if (info == null || info.length < 9) {
+            mainHandler.post(() -> notifyError("Failed to load ASTV file"));
+            return;
+        }
+        
+        long astvHandle = info[0];
+        frameWidth = (int) info[1];
+        frameHeight = (int) info[2];
+        totalFrames = (int) info[3];
+        frameRate = (float) info[4];
+        astcBlockWidth = (int) info[5];
+        astcBlockHeight = (int) info[6];
+        boolean hasAlpha = info[8] != 0;
+        
+        // Set ASTC GL format from block size
+        astcGlFormat = getAstcGlFormat(astcBlockWidth, astcBlockHeight);
+        isNativeASTC = true;
+        
+        Log.i(TAG, "ASTV loaded: " + frameWidth + "x" + frameHeight + 
+              ", " + totalFrames + " frames @ " + frameRate + " fps" +
+              ", block=" + astcBlockWidth + "x" + astcBlockHeight +
+              ", codebook=" + info[7] + " entries");
+        
+        // Detect texture format
+        detectAndCacheTextureFormat();
+        boolean hwAstcSupport = (cachedTextureFormat == GL_COMPRESSED_RGBA_ASTC_4x4_KHR);
+        
+        // Create a single GL texture for frame uploads
+        int[] texIds = new int[1];
+        GLES30.glGenTextures(1, texIds, 0);
+        int texId = texIds[0];
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId);
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
+        
+        // Use the atlas-style 2D texture rendering (single full-frame texture)
+        textureIds = new int[] { texId };
+        textureWidths = new int[] { frameWidth };
+        textureHeights = new int[] { frameHeight };
+        useTextureArray = false;
+        framesPerRow = 1;
+        framesPerPart = totalFrames;
+        partCount = 1;
+        
+        // Init shaders
+        if (!initShaders()) {
+            AlphaVideoGpuModule.nativeFreeAstv(astvHandle);
+            mainHandler.post(() -> notifyError("Failed to initialize shaders"));
+            return;
+        }
+        
+        mSourceLoaded = true;
+        mainHandler.post(() -> {
+            notifyLoad();
+            notifyStateChange("ready");
+        });
+        
+        if (autoPlay) {
+            isPlaying.set(true);
+            mainHandler.post(() -> notifyStateChange("playing"));
+        }
+        
+        // Render loop
+        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
+        ByteBuffer uploadBuffer = null;
+        
+        try {
+            do {
+                currentFrame = 0;
+                AlphaVideoGpuModule.nativeResetAstv(astvHandle);
+                
+                while (currentFrame < totalFrames && !shouldStop.get() && !isDestroyed.get()) {
+                    long frameStart = System.nanoTime();
+                    
+                    if (!isPlaying.get()) {
+                        try { Thread.sleep(16); } catch (InterruptedException e) { return; }
+                        continue;
+                    }
+                    
+                    // Decode next ASTV frame (codebook gather -> ASTC bytes)
+                    byte[] astcData = AlphaVideoGpuModule.nativeDecodeAstvFrame(astvHandle);
+                    if (astcData == null) break;
+                    
+                    // Upload to GPU as compressed ASTC texture
+                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId);
+                    
+                    if (hwAstcSupport) {
+                        ByteBuffer buf = ByteBuffer.allocateDirect(astcData.length)
+                            .order(ByteOrder.nativeOrder());
+                        buf.put(astcData);
+                        buf.position(0);
+                        GLES30.glCompressedTexImage2D(
+                            GLES30.GL_TEXTURE_2D, 0, astcGlFormat,
+                            frameWidth, frameHeight, 0, astcData.length, buf);
+                    } else {
+                        // Software ASTC decode fallback (emulator)
+                        int[] decoded = AlphaVideoGpuModule.nativeDecodeASTCToRGBA(
+                            astcData, frameWidth, frameHeight, astcBlockWidth, astcBlockHeight);
+                        if (decoded != null && decoded.length >= 3) {
+                            int rgbaTexId = decoded[0];
+                            // Use the decoded RGBA texture
+                            texIds[0] = rgbaTexId;
+                            textureIds[0] = rgbaTexId;
+                        }
+                    }
+                    
+                    // Render
+                    float[] uv = { 0.0f, 0.0f, 1.0f, 1.0f };
+                    GLES30.glClearColor(0, 0, 0, 0);
+                    GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT);
+                    GLES30.glViewport(0, 0, getWidth(), getHeight());
+                    GLES30.glUseProgram(program);
+                    GLES30.glUniform1i(uniformGpuPlaybackLocation, 0);
+                    GLES30.glUniform4f(uniformFrameUVLocation, uv[0], uv[1], uv[2], uv[3]);
+                    
+                    GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureIds[0]);
+                    GLES30.glUniform1i(uniformTextureLocation, 0);
+                    
+                    int posHandle = GLES30.glGetAttribLocation(program, "aPosition");
+                    GLES30.glEnableVertexAttribArray(posHandle);
+                    GLES30.glVertexAttribPointer(posHandle, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer);
+                    int texHandle = GLES30.glGetAttribLocation(program, "aTexCoord");
+                    GLES30.glEnableVertexAttribArray(texHandle);
+                    GLES30.glVertexAttribPointer(texHandle, 2, GLES30.GL_FLOAT, false, 0, texCoordBuffer);
+                    
+                    GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+                    GLES30.glDisableVertexAttribArray(posHandle);
+                    GLES30.glDisableVertexAttribArray(texHandle);
+                    
+                    EGL14.eglSwapBuffers(eglDisplay, eglSurface);
+                    
+                    if (enableFrameEvents) {
+                        mainHandler.post(() -> notifyFrameUpdate());
+                    }
+                    
+                    currentFrame++;
+                    
+                    // Frame timing
+                    long elapsed = System.nanoTime() - frameStart;
+                    long sleepNs = frameIntervalNs - elapsed;
+                    if (sleepNs > 0) {
+                        try { Thread.sleep(sleepNs / 1_000_000, (int)(sleepNs % 1_000_000)); }
+                        catch (InterruptedException e) { return; }
+                    }
+                }
+                
+                if (!loop) {
+                    mainHandler.post(() -> {
+                        notifyFinished();
+                        notifyStateChange("stopped");
+                    });
+                }
+            } while (loop && !shouldStop.get() && !isDestroyed.get());
+        } finally {
+            AlphaVideoGpuModule.nativeFreeAstv(astvHandle);
+        }
+    }
+    
+    private static int getAstcGlFormat(int blockW, int blockH) {
+        if (blockW == 4 && blockH == 4) return GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+        if (blockW == 5 && blockH == 4) return GL_COMPRESSED_RGBA_ASTC_5x4_KHR;
+        if (blockW == 5 && blockH == 5) return GL_COMPRESSED_RGBA_ASTC_5x5_KHR;
+        if (blockW == 6 && blockH == 5) return GL_COMPRESSED_RGBA_ASTC_6x5_KHR;
+        if (blockW == 6 && blockH == 6) return GL_COMPRESSED_RGBA_ASTC_6x6_KHR;
+        if (blockW == 8 && blockH == 5) return GL_COMPRESSED_RGBA_ASTC_8x5_KHR;
+        if (blockW == 8 && blockH == 6) return GL_COMPRESSED_RGBA_ASTC_8x6_KHR;
+        if (blockW == 8 && blockH == 8) return GL_COMPRESSED_RGBA_ASTC_8x8_KHR;
+        if (blockW == 10 && blockH == 5) return GL_COMPRESSED_RGBA_ASTC_10x5_KHR;
+        if (blockW == 10 && blockH == 6) return GL_COMPRESSED_RGBA_ASTC_10x6_KHR;
+        if (blockW == 10 && blockH == 8) return GL_COMPRESSED_RGBA_ASTC_10x8_KHR;
+        if (blockW == 10 && blockH == 10) return GL_COMPRESSED_RGBA_ASTC_10x10_KHR;
+        if (blockW == 12 && blockH == 10) return GL_COMPRESSED_RGBA_ASTC_12x10_KHR;
+        if (blockW == 12 && blockH == 12) return GL_COMPRESSED_RGBA_ASTC_12x12_KHR;
+        return GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
     }
     
     /**
@@ -1072,6 +1274,12 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         streamingRingBufferMode = true;  // Both modes use ring buffer slot calculation
         streamingRingSize = textureLayerCount;
         
+        // Calculate bytes per layer for streaming decode
+        // IMPORTANT: The KTX2 file always contains ASTC data (zstd compressed).
+        // Transcoding to RGBA32 happens at GPU upload time in nativeUploadTextureArrayLayer.
+        // So for streaming decode, we always use ASTC size regardless of useAstc flag.
+        int bytesPerLayer = astcBytesPerLayer(width, height);  // Dynamic ASTC block size
+        
         // Initialize PBOs for async uploads (only for ASTC compressed format)
         if (useAstc) {
             pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
@@ -1086,12 +1294,6 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
-        
-        // Calculate bytes per layer for streaming decode
-        // IMPORTANT: The KTX2 file always contains ASTC data (zstd compressed).
-        // Transcoding to RGBA32 happens at GPU upload time in nativeUploadTextureArrayLayer.
-        // So for streaming decode, we always use ASTC size regardless of useAstc flag.
-        int bytesPerLayer = astcBytesPerLayer(width, height);  // Dynamic ASTC block size
         
         // Track which virtual position is in each GPU slot (for both RAM and VRAM modes)
         // ringSlots[slot] = virtualPos of frame currently in that GPU slot (-1 if empty)
@@ -3673,9 +3875,11 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     cacheDir.mkdirs();
                 }
                 
-                // Preserve .zst extension for streaming files
+                // Preserve file extension for proper format detection after caching
                 String extension = ".ktx2";
-                if (urlString.contains(".zst")) {
+                if (urlString.contains(".astv")) {
+                    extension = ".astv";
+                } else if (urlString.contains(".zst")) {
                     extension = ".ktx2.zst";
                 }
                 cacheFile = new File(cacheDir, hash + extension);
@@ -3700,7 +3904,8 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             }
             
             // Preserve extension for temp file (matches cacheFile extension)
-            String tempExtension = urlString.contains(".zst") ? ".ktx2.zst" : ".ktx2";
+            String tempExtension = urlString.contains(".astv") ? ".astv" : 
+                                   urlString.contains(".zst") ? ".ktx2.zst" : ".ktx2";
             File tempFile = new File(getContext().getCacheDir(), "ktx2_tmp_" + tempSuffix + tempExtension);
             
             try (InputStream in = conn.getInputStream();

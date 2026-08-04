@@ -27,6 +27,7 @@ target_compile_definitions(basis_transcoder PRIVATE
 add_library(alphavideogpu SHARED
     alphavideogpu_jni.cpp
     astc_decomp.cpp
+    astv_decoder.cpp
 )
 
 target_include_directories(alphavideogpu PRIVATE
@@ -36,6 +37,7 @@ target_include_directories(alphavideogpu PRIVATE
 
 target_compile_definitions(alphavideogpu PRIVATE
     BASISU_NO_ITERATOR_DEBUG_LEVEL=1
+    ASTV_USE_BUNDLED_ZSTD=1
 )
 
 target_link_libraries(alphavideogpu

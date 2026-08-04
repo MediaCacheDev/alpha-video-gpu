@@ -70,4 +70,12 @@ public class AlphaVideoGpuModule extends ReactContextBaseJavaModule {
     public static native boolean nativeInitPBOs(int textureId, int bufferSize);  // Initialize double-buffered PBOs for a texture array
     public static native void nativeCleanupPBOs(int textureId);  // Cleanup PBOs when texture array is destroyed
     public static native boolean nativeUploadTextureArrayLayerPBO(int textureId, int layer, int width, int height, java.nio.ByteBuffer buffer, int dataLength, boolean useAstc, int glFormat, int blockW, int blockH);  // Async upload via PBO
+    
+    // ASTV (ASTC Texture Video) interframe codec
+    // Returns: [handle, width, height, frameCount, fps, blockW, blockH, codebookEntries, hasAlpha]
+    public static native long[] nativeLoadAstv(byte[] astvData);
+    public static native byte[] nativeDecodeAstvFrame(long handle);  // Decode next frame, returns ASTC bytes
+    public static native boolean nativeSeekAstv(long handle, int frame);
+    public static native void nativeResetAstv(long handle);
+    public static native void nativeFreeAstv(long handle);
 }
