@@ -1072,6 +1072,12 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         streamingRingBufferMode = true;  // Both modes use ring buffer slot calculation
         streamingRingSize = textureLayerCount;
         
+        // Calculate bytes per layer for streaming decode
+        // IMPORTANT: The KTX2 file always contains ASTC data (zstd compressed).
+        // Transcoding to RGBA32 happens at GPU upload time in nativeUploadTextureArrayLayer.
+        // So for streaming decode, we always use ASTC size regardless of useAstc flag.
+        int bytesPerLayer = astcBytesPerLayer(width, height);  // Dynamic ASTC block size
+        
         // Initialize PBOs for async uploads (only for ASTC compressed format)
         if (useAstc) {
             pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
@@ -1086,12 +1092,6 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
             return;
         }
-        
-        // Calculate bytes per layer for streaming decode
-        // IMPORTANT: The KTX2 file always contains ASTC data (zstd compressed).
-        // Transcoding to RGBA32 happens at GPU upload time in nativeUploadTextureArrayLayer.
-        // So for streaming decode, we always use ASTC size regardless of useAstc flag.
-        int bytesPerLayer = astcBytesPerLayer(width, height);  // Dynamic ASTC block size
         
         // Track which virtual position is in each GPU slot (for both RAM and VRAM modes)
         // ringSlots[slot] = virtualPos of frame currently in that GPU slot (-1 if empty)
