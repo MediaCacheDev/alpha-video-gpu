@@ -126,7 +126,7 @@ Both approaches support streaming for long content:
 
 ## Encoding Modes
 
-This player supports two encoding formats. Both require a separate encoder tool (not included in this package).
+This player supports two encoding formats. Files are made with the separate [`alpha-video-gpu-encoder`](https://github.com/danielkpl2/alpha-video-gpu-encoder) package (CLI `texenc`).
 
 ### Native ASTC
 
@@ -146,40 +146,23 @@ Universal texture format that transcodes at runtime to the device's native GPU f
 
 ## Encoding Examples
 
-The encoder is a separate tool (`encode-basis.js`). Example commands:
-
-### Maximum Quality (Native ASTC)
-
 ```bash
-node encode-basis.js \
-  --input ./frames \
-  --output ./animation.ktx2 \
-  --width 400 \
-  --height 400 \
-  --fps 30 \
-  --no-mipmap \
-  --astc \
-  --astc-quality exhaustive \
-  --astc-block 4x4 \
-  --zstd 22 \
-  --astc-perceptual
+npm install -g alpha-video-gpu-encoder
+
+# Native ASTC texture array, KTX2-internal zstd (the default; streams with `stream`)
+texenc --input ./frames --output animation.ktx2 --fps 30 --astc-quality exhaustive --astc-perceptual
+
+# UASTC (transcodes at runtime; plays on any GPU, including desktop browsers)
+texenc --input ./frames --output animation.ktx2 --fps 30 --uastc --uastc-rdo 0
+
+# Uncompressed ASTC (largest file, no decompression; mmap streaming)
+texenc --input ./frames --output animation.ktx2 --fps 30 --zstd 0
+
+# Whole-file zstd wrapper (always streams)
+texenc --input ./frames --output animation.ktx2 --fps 30 --outer-compression
 ```
 
-### Maximum Quality (UASTC)
-
-```bash
-node encode-basis.js \
-  --input ./frames \
-  --output ./animation.ktx2 \
-  --width 400 \
-  --height 400 \
-  --fps 30 \
-  --no-mipmap \
-  --uastc \
-  --uastc-rdo 0
-```
-
-> **Note:** `--uastc-rdo 0` disables rate-distortion optimization for maximum quality. Use `--uastc-rdo 0.5` to `--uastc-rdo 3.0` for smaller files with some quality tradeoff.
+See the encoder's README for every option, video input and the memory-efficient stream encoder.
 
 ---
 
@@ -214,184 +197,102 @@ Basis Universal transcoder is bundled. No additional native dependencies require
 
 ## Usage
 
-### Remote URL
-
 ```jsx
 import { AlphaVideoGpuView } from 'alpha-video-gpu';
 
 <AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
   source={{ uri: 'https://example.com/animation.ktx2' }}
-  autoPlay
-  loop
-/>
-```
-
-Remote files are automatically cached. Use `cacheKey` for explicit cache control:
-
-```jsx
-<AlphaVideoGpuView
-  style={{ width: 400, height: 400 }}
-  source={{ uri: 'https://example.com/animation.ktx2' }}
-  cacheKey="animations/glow.ktx2"
-  autoPlay
-  loop
   onStateChange={({ nativeEvent }) => console.log(nativeEvent.state)}
   onError={({ nativeEvent }) => console.error(nativeEvent.error)}
 />
 ```
 
-### Local Bundled Asset (Recommended)
+### Sources
 
-Include a `.ktx2` or `.glb` file in your React Native project and resolve it correctly for each platform.
+`source.uri` takes one of these forms. Anything else is reported through `onError`.
 
-#### Cross-Platform Asset Resolution
+| Form | iOS | Android | Web | Notes |
+|------|-----|---------|-----|-------|
+| `https://…`, `http://…` | ✓ | ✓ | ✓ | Downloaded once into the app cache, then read from disk. Web caches in IndexedDB. |
+| `file:///abs/path`, `/abs/path` | ✓ | ✓ | — | Read in place. |
+| `asset://path/in/bundle` | ✓ | ✓ | ✓ | Android: APK `assets/`. iOS: the app bundle's resource folder. Web: the site root (`/path/in/bundle`). |
+| `content://…` | — | ✓ | — | Read through the `ContentResolver`. |
+| bare resource name | — | ✓ | — | A `res/raw` resource, which is what `require()` resolves to in an Android release build. |
 
-```jsx
-import { AlphaVideoGpuView } from 'alpha-video-gpu';
-import { Image, Platform } from 'react-native';
+Nothing is copied: bundled assets, raw resources and local files are read where they are.
 
-// Import the asset
-const glbAsset = require('./assets/animation.glb');
+#### Cache keys
 
-// Cross-platform asset resolver
-function resolveAsset(asset) {
-  // Native platforms: use Image.resolveAssetSource
-  if (Platform.OS !== 'web') {
-    const resolved = Image.resolveAssetSource(asset);
-    return resolved?.uri || null;
-  }
-  
-  // Web: Metro may return a string path directly or a number ID
-  if (typeof asset === 'string') {
-    return asset; // Already a URL path
-  }
-  
-  // Web with number ID: use expo-asset to resolve
-  if (typeof asset === 'number') {
-    const { Asset } = require('expo-asset');
-    const resolved = Asset.fromModule(asset);
-    return resolved.uri;
-  }
-  
-  // Object with uri property
-  if (asset?.uri) {
-    return asset.uri;
-  }
-  
-  return null;
-}
-
-// Usage
-const animationUri = resolveAsset(glbAsset);
-
-<AlphaVideoGpuView
-  style={{ width: 400, height: 400 }}
-  source={{ uri: animationUri }}
-  autoPlay
-  loop
-/>
-```
-
-#### Platform-Specific Behavior
-
-| Platform | `require()` returns | Resolution method |
-|----------|---------------------|-------------------|
-| **iOS/Android (Debug)** | Number (asset ID) | `Image.resolveAssetSource()` → Metro URL |
-| **iOS/Android (Release)** | Number (asset ID) | `Image.resolveAssetSource()` → File path |
-| **Web (Expo)** | String (URL path) | Use directly |
-| **Web (Metro)** | Number (asset ID) | `expo-asset` → URL path |
-
-#### Simple Native-Only Usage
-
-If you don't need web support, the simpler approach works:
+Downloads are named by `cacheKey` if you give one, otherwise by a hash of the URL. Set `cacheKey` when the URL changes while the file doesn't (presigned URLs), so a new URL still hits the cache and doesn't reload the view:
 
 ```jsx
-import { AlphaVideoGpuView } from 'alpha-video-gpu';
-import { Image } from 'react-native';
-
-const ktx2Asset = require('./assets/animation.ktx2');
-const resolvedAsset = Image.resolveAssetSource(ktx2Asset);
-
-<AlphaVideoGpuView
-  style={{ width: 400, height: 400 }}
-  source={{ uri: resolvedAsset.uri }}
-  autoPlay
-  loop
-/>
+<AlphaVideoGpuView source={{ uri: presignedUrl, cacheKey: 'animations/glow.ktx2' }} />
 ```
 
-#### Metro Configuration
+`cacheKey` can also be passed as a top-level prop; it wins over `source.cacheKey`. Native downloads go to the app's cache directory (`<cache>/<cacheKey>`, or `<cache>/alpha-video-gpu/<sha256>`), so the OS may clear them.
 
-Ensure your asset extensions are registered in `metro.config.js`:
+#### Bundled with `require()`
+
+Register the extensions with Metro:
 
 ```js
 // metro.config.js
 const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 
-const config = {
+const defaultConfig = getDefaultConfig(__dirname);
+module.exports = mergeConfig(defaultConfig, {
   resolver: {
-    assetExts: [...getDefaultConfig(__dirname).resolver.assetExts, 'ktx2', 'glb', 'zst'],
+    assetExts: [...defaultConfig.resolver.assetExts, 'ktx2', 'glb', 'zst'],
   },
-};
-
-module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+});
 ```
 
-### Android Assets Folder (Alternative)
-
-Place the file directly in Android's assets folder:
-
-```
-android/app/src/main/assets/animations/glow.ktx2
-```
-
-Then use the `asset://` URI scheme:
+Then resolve the module to a URI:
 
 ```jsx
-<AlphaVideoGpuView
-  style={{ width: 400, height: 400 }}
-  source={{ uri: 'asset://animations/glow.ktx2' }}
-  autoPlay
-  loop
-/>
+import { Image } from 'react-native';
+
+const animation = Image.resolveAssetSource(require('./assets/animation.ktx2'));
+
+<AlphaVideoGpuView source={{ uri: animation.uri }} />
 ```
 
-> **Note:** This approach is Android-only. For cross-platform, use the bundled asset method above.
+In debug builds that URI is the Metro dev server (`http://…`, downloaded and cached like any URL). In release builds it's a `file://` path in the iOS bundle, or a `res/raw` name on Android. On web, `Image.resolveAssetSource` doesn't exist; use the module value directly when it's a string, or `expo-asset`'s `Asset.fromModule(module).uri`.
 
-### Local File Path
+#### Streaming from Android assets and resources
 
-For files on the device filesystem:
+Android compresses APK entries it doesn't recognise, and a compressed entry can't be memory-mapped. Non-streaming playback reads it anyway, but `stream` needs the file stored uncompressed:
 
-```jsx
-<AlphaVideoGpuView
-  style={{ width: 400, height: 400 }}
-  source={{ uri: 'file:///path/to/animation.ktx2' }}
-  autoPlay
-  loop
-/>
+```groovy
+// android/app/build.gradle
+android {
+  androidResources {
+    noCompress += ['ktx2', 'zst', 'glb']
+  }
+}
 ```
+
+Without it, `stream` on an `asset://` or `res/raw` file fails with an error naming this setting. A whole-file zstd wrapper still plays, but is read into memory first instead of being mapped.
 
 ---
 
 ## Multi-Part Animations
 
-For large animations that exceed GPU texture size limits, the encoder splits frames across multiple KTX2 files. All parts are loaded into GPU memory at startup.
+Large atlas animations are split across several textures. By default the encoder packs them into one **GLB** file, which loads like any other source.
+
+With `--no-glb`, the parts are separate `.ktx2` files and the first one's metadata lists the others by file name. The player looks for them next to `source`: in the same folder for `file://`, `/` and `asset://` sources, and at the same URL path for `http(s)://` sources (a part of a source with `cacheKey: 'glow.ktx2'` is cached as `glow_1.ktx2`, and so on).
+
+When they can't be found that way (res/raw names, `content://`, presigned URLs), list every part with `parts`, the first one being the file with the metadata:
 
 ```jsx
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/animation.ktx2' }}
-  parts={[
-    { uri: 'https://example.com/anim_0.ktx2' },
-    { uri: 'https://example.com/anim_1.ktx2' },
-    { uri: 'https://example.com/anim_2.ktx2' },
-  ]}
-  autoPlay
-  loop
+  source={{ uri: urls[0], cacheKey: 'anim_0.ktx2' }}
+  parts={urls.map((uri, i) => ({ uri, cacheKey: `anim_${i}.ktx2` }))}
 />
 ```
 
-The first part (`source`) contains the animation metadata. The `parts` array provides explicit URIs for all parts. The player loads and decodes all parts before playback begins, then switches between textures as frames advance.
+All parts are loaded before playback starts.
 
 ---
 
@@ -425,22 +326,6 @@ The GLB container includes:
 }
 ```
 
-### Metro Configuration for GLB
-
-To use GLB files as bundled assets in React Native, add the extension to your `metro.config.js`:
-
-```javascript
-const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
-
-const config = {
-  resolver: {
-    assetExts: [...getDefaultConfig(__dirname).resolver.assetExts, 'ktx2', 'glb'],
-  },
-};
-
-module.exports = mergeConfig(getDefaultConfig(__dirname), config);
-```
-
 ### Legacy Multi-Part Format
 
 For separate KTX2 files (using `--no-glb` encoder flag), metadata is embedded in the first part:
@@ -466,24 +351,7 @@ For separate KTX2 files (using `--no-glb` encoder flag), metadata is embedded in
 
 ## Web Support
 
-Works with React Native Web. Requires external scripts loaded before your app bundle.
-
-### Required Scripts
-
-```html
-<!-- Zstandard decompression (for zstd-compressed KTX2/GLB files) -->
-<script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
-
-<!-- Basis Universal transcoder (for UASTC files) -->
-<script src="/basis_transcoder.js"></script>
-```
-
-Copy the Basis transcoder to your public directory:
-
-```bash
-cp node_modules/alpha-video-gpu/web/libs/basis_transcoder.js public/
-cp node_modules/alpha-video-gpu/web/libs/basis_transcoder.wasm public/
-```
+Works with React Native Web, and without React Native through `alpha-video-gpu/standalone` (a framework-free `KTX2PlayerCore`) and `alpha-video-gpu/standalone/react`. The zstd decoder and the Basis transcoder are bundled; no extra scripts or files need to be served.
 
 ### Web Texture Format Support
 
@@ -491,20 +359,9 @@ cp node_modules/alpha-video-gpu/web/libs/basis_transcoder.wasm public/
 |--------|-----------------|-------|
 | **Native ASTC** | Mobile browsers, some desktop | Requires `WEBGL_compressed_texture_astc` |
 | **UASTC** | All (transcoded) | Transcodes to BC7/ETC2/RGBA at runtime |
-| **Zstd compression** | All (with fzstd) | Requires fzstd library loaded |
+| **Zstd compression** | All | Bundled WASM decoder |
 
-### Expo Web Build
-
-For Expo web builds, inject the scripts in your build process. Example post-build script:
-
-```javascript
-// Add to your build pipeline
-const scripts = `
-  <script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
-  <script src="/basis_transcoder.js"></script>
-`;
-// Inject into <head> of dist/index.html
-```
+Native ASTC files need `WEBGL_compressed_texture_astc`, which most desktop browsers on Windows and Linux lack; there is no software fallback on the web, so the player reports an error. Encode with `--uastc` if desktop browsers matter.
 
 ---
 
@@ -514,12 +371,14 @@ The player supports multiple playback strategies optimized for different use cas
 
 ### Memory Strategy: VRAM vs RAM
 
-The `streamingStrategy` prop controls where the main frame buffer is located. The goal is to **maximize** usage of one memory type while **minimizing** the other:
+The `memoryStrategy` prop controls where the main frame buffer is located. The goal is to **maximize** usage of one memory type while **minimizing** the other:
 
 | Strategy | Main Buffer | Behavior | Performance |
 |----------|-------------|----------|-------------|
-| `vram` (default) | GPU VRAM | Maximizes VRAM, minimizes RAM | **Generally preferred** - VRAM is separate from app memory, can use 2GB+ without affecting app performance |
+| `vram` | GPU VRAM | Maximizes VRAM, minimizes RAM | **Generally preferred** - VRAM is separate from app memory, can use 2GB+ without affecting app performance |
 | `ram` | CPU RAM | Maximizes RAM, minimizes VRAM | Use when VRAM is constrained - but note that high RAM usage (1GB+) can cause app slowdowns |
+
+The default, `auto`, uses VRAM for non-streaming playback and RAM for streaming.
 
 **Recommendation:** Use `vram` mode unless you have a specific reason to minimize GPU memory usage. VRAM is allocated separately from your app's heap and doesn't contribute to memory pressure warnings.
 
@@ -545,7 +404,7 @@ All frames are loaded into memory before playback begins. Best for short-to-medi
 ```jsx
 <AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation.ktx2' }}
-  streamingStrategy="ram"
+  memoryStrategy="ram"
   autoPlay
   loop
 />
@@ -555,23 +414,19 @@ All frames are loaded into memory before playback begins. Best for short-to-medi
 
 For very long animations or memory-constrained scenarios, streaming mode decodes frames on-demand during playback using a ring buffer. Only a small window of frames is kept in memory at any time, providing **constant and predictable memory usage** regardless of animation length.
 
-**Streaming requirements:**
-- File must use `.ktx2.zst` extension (externally Zstd-compressed KTX2)
-- Must use **texture array** packing (not atlas)
-- Must use **Native ASTC** encoding (not UASTC)
-- The KTX2 inside is uncompressed; Zstd compression is applied to the whole container externally
+Streaming works with **texture arrays** (`--mode array`, the encoder default) of **native ASTC**. It's used when:
 
-**Enable streaming by using `.ktx2.zst` file extension:**
+- the file is a whole-file zstd wrapper (`--outer-compression`, usually `.ktx2.zst`). These always stream.
+- `stream` is set and the file uses KTX2-internal zstd (the encoder default) or no compression (`--zstd 0`).
 
 ```jsx
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/animation.ktx2.zst' }}
-  streamingStrategy="vram"
-  streamingRingBufferSize={20}
+  source={{ uri: 'https://example.com/animation.ktx2' }}
+  stream
+  memoryStrategy="vram"
+  streamingRingSize={16}
   streamingCacheSize={60}
-  streamingPrefetchAhead={15}
-  autoPlay
-  loop
+  streamingPrefetchAhead={30}
 />
 ```
 
@@ -579,22 +434,23 @@ For very long animations or memory-constrained scenarios, streaming mode decodes
 
 | Prop | Default | Description |
 |------|---------|-------------|
-| `streamingStrategy` | `"vram"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM) |
-| `streamingRingBufferSize` | `20` | Number of GPU texture slots in ring buffer |
-| `streamingCacheSize` | `60` | (RAM mode only) Number of decoded frames to keep in CPU memory |
-| `streamingPrefetchAhead` | `15` | How many frames to decode ahead of playback position |
+| `stream` | `false` | Stream a texture array instead of loading every frame |
+| `memoryStrategy` | `"auto"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM) |
+| `streamingRingSize` | `16` | GPU texture slots in the ring buffer (4–64) |
+| `streamingCacheSize` | `60` | (RAM mode only) decoded frames kept in CPU memory |
+| `streamingPrefetchAhead` | `30` | Frames decoded ahead of the playback position (5–100) |
 
 #### VRAM Streaming
 
 Frames are decoded directly into a GPU texture ring buffer. Minimal CPU RAM usage - only the ring buffer exists in VRAM.
 
 ```
-[GPU Ring Buffer: 20 slots]
+[GPU Ring Buffer: 16 slots]
 Slot 0: Frame 100  ← Currently displaying
 Slot 1: Frame 101
 Slot 2: Frame 102
 ...
-Slot 19: Frame 119 ← Prefetched ahead
+Slot 15: Frame 115 ← Prefetched ahead
 ```
 
 #### RAM Streaming
@@ -602,7 +458,7 @@ Slot 19: Frame 119 ← Prefetched ahead
 Frames are first decoded to a CPU RAM cache, then uploaded to a smaller GPU ring buffer on demand. Minimizes VRAM usage while providing a larger decode-ahead buffer.
 
 ```
-[CPU Cache: 60 frames] → [GPU Ring Buffer: 20 slots]
+[CPU Cache: 60 frames] → [GPU Ring Buffer: 16 slots]
 Frames 80-139 cached    Frames 100-119 in GPU
 ```
 
@@ -615,25 +471,7 @@ Streaming enables playback of arbitrarily long animations with **fixed memory fo
 
 ### Encoding for Streaming
 
-```bash
-node encode-basis.js \
-  --input ./frames \
-  --output ./animation.ktx2 \
-  --width 400 \
-  --height 400 \
-  --fps 30 \
-  --no-mipmap \
-  --astc \
-  --astc-quality exhaustive \
-  --astc-block 4x4 \
-  --astc-perceptual \
-  --zstd 22 \
-  --max-texture-size 8192 \
-  --mode array \
-  --stream
-```
-
-The `--stream` flag produces an uncompressed ASTC texture array inside the KTX2 container. When combined with `--zstd N` (where N > 0), the encoder internally applies Zstd compression to the entire container and outputs a `.ktx2.zst` file suitable for streaming. This all happens in a single encoding command.
+The encoder's defaults (native ASTC, texture array, KTX2-internal zstd) already produce a streamable file; play it with `stream`. `--outer-compression` produces a whole-file zstd wrapper that the player streams while decompressing, without the `stream` prop.
 
 ---
 
@@ -650,7 +488,7 @@ For maximum playback performance and massive concurrency, uncompressed ASTC stre
 
 ### Performance Characteristics
 
-| Metric | Zstd Compressed (.ktx2.zst) | Uncompressed (.ktx2) |
+| Metric | Zstd compressed | Uncompressed (`--zstd 0`) |
 |--------|-----------------|---------------|
 | File size | ~5 MB | ~29 MB (6x larger) |
 | CPU during playback | Zstd decode + upload | Upload only |
@@ -661,36 +499,19 @@ For maximum playback performance and massive concurrency, uncompressed ASTC stre
 ### Encoding Uncompressed ASTC
 
 ```bash
-node encode-basis.js \
-  --input ./frames \
-  --output ./animation_uncompressed.ktx2 \
-  --width 400 \
-  --height 400 \
-  --fps 30 \
-  --no-mipmap \
-  --astc \
-  --astc-quality exhaustive \
-  --astc-block 4x4 \
-  --astc-perceptual \
-  --zstd 0 \
-  --max-texture-size 8192 \
-  --mode array \
-  --stream
+texenc --input ./frames --output animation_uncompressed.ktx2 --fps 30 --zstd 0
 ```
 
-The only difference from compressed streaming is `--zstd 0` instead of `--zstd 22`. This produces an uncompressed `.ktx2` file (not `.ktx2.zst`) that uses memory-mapped I/O for zero-copy frame access.
+`--zstd 0` leaves the ASTC blocks uncompressed, so the player can memory-map the file and upload frames without decompressing them.
 
 ### Usage
 
 ```jsx
-// Uncompressed streaming uses .ktx2 extension (not .ktx2.zst)
-// The player auto-detects uncompressed format from file header
 <AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation_uncompressed.ktx2' }}
-  streamingStrategy="vram"
-  streamingRingBufferSize={20}
-  autoPlay
-  loop
+  stream
+  memoryStrategy="vram"
+  streamingRingSize={16}
 />
 ```
 
@@ -698,7 +519,7 @@ The only difference from compressed streaming is `--zstd 0` instead of `--zstd 2
 
 1. **Memory-mapped file access** - The KTX2 file is mmap'd, allowing the OS to page frames in/out efficiently
 2. **Direct GPU upload** - ASTC blocks are copied directly to GPU texture memory (no Zstd decompression needed)
-3. **Ring buffer playback** - Only `streamingRingBufferSize` frames are in GPU memory at once
+3. **Ring buffer playback** - Only `streamingRingSize` frames are in GPU memory at once
 4. **Zero CPU decode** - On real devices with ASTC hardware, CPU usage approaches zero during playback
 
 ### Trade-offs
@@ -752,45 +573,29 @@ Not ideal for:
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `source` | `{ uri: string }` | Required | Animation source URL or file path |
+| `source` | `{ uri: string, cacheKey?: string }` | — | What to play; see [Sources](#sources) |
 | `style` | `ViewStyle` | — | Container style |
-| `autoPlay` | `boolean` | `false` | Start playback automatically when loaded |
-| `loop` | `boolean` | `false` | Loop playback continuously |
-| `paused` | `boolean` | `false` | Pause/resume playback |
-| `cacheKey` | `string` | — | Custom cache key for remote files |
-| `parts` | `Array<{ uri: string }>` | — | Explicit part URIs for multi-part animations |
-| `streamingStrategy` | `"vram"` \| `"ram"` | `"vram"` | Memory strategy for playback |
-| `streamingRingBufferSize` | `number` | `20` | GPU texture slots for streaming |
+| `autoPlay` | `boolean` | `true` | Start playback once loaded |
+| `loop` | `boolean` | `true` | Loop playback |
+| `paused` | `boolean` | `false` | Pause playback (and streaming decompression) |
+| `playbackSpeed` | `number` | `1.0` | Speed multiplier |
+| `cacheKey` | `string` | — | Cache identity for downloads; overrides `source.cacheKey` |
+| `parts` | `Array<{ uri: string, cacheKey?: string }>` | — | Every part of a multi-part animation, when they can't be found next to `source` |
+| `memoryStrategy` | `"auto"` \| `"vram"` \| `"ram"` | `"auto"` | Where frames are kept |
+| `stream` | `boolean` | `false` | Stream a texture array with a ring buffer |
+| `streamingRingSize` | `number` | `16` | GPU texture slots for streaming |
 | `streamingCacheSize` | `number` | `60` | CPU cache size for RAM streaming |
-| `streamingPrefetchAhead` | `number` | `15` | Frames to decode ahead |
-| `onStateChange` | `(event) => void` | — | Called when player state changes |
-| `onError` | `(event) => void` | — | Called on playback errors |
-| `onLoop` | `(event) => void` | — | Called when animation loops |
+| `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead |
+| `gpuPlayback` | `boolean` | `false` | Experimental: compute the frame index in the shader |
+| `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every rendered frame (native) |
+| `verbose` | `boolean` | `false` | Log info traces (Logcat, Xcode console, browser console); warnings and errors always log |
+| `onLoad` | `({ nativeEvent: { width, height, frameCount, frameRate, duration } }) => void` | — | Metadata is known |
+| `onStateChange` | `({ nativeEvent: { state } }) => void` | — | `state` is `"loading"`, `"ready"`, `"playing"`, `"paused"` or `"stopped"` |
+| `onFrameUpdate` | `({ nativeEvent: { frame, totalFrames } }) => void` | — | Needs `enableFrameEvents` on native |
+| `onFinished` | `() => void` | — | A non-looping animation reached its last frame |
+| `onError` | `({ nativeEvent: { error } }) => void` | — | Loading or playback failed |
 
-### State Change Events
-
-```jsx
-<AlphaVideoGpuView
-  onStateChange={({ nativeEvent }) => {
-    // nativeEvent.state: "loading" | "ready" | "playing" | "paused" | "stopped"
-    console.log('State:', nativeEvent.state);
-  }}
-/>
-```
-
-### Imperative Methods
-
-```jsx
-const playerRef = useRef(null);
-
-<AlphaVideoGpuView ref={playerRef} ... />
-
-// Control playback
-playerRef.current?.play();
-playerRef.current?.pause();
-playerRef.current?.stop();
-playerRef.current?.seekToFrame(30);
-```
+Playback is controlled with props (`paused`, `autoPlay`, a new `source`); there is no imperative ref API yet.
 
 ---
 
