@@ -8,7 +8,7 @@ Pod::Spec.new do |s|
                        DESC
   s.homepage         = 'https://github.com/danielkpl2/alpha-video-gpu'
   s.license          = { :type => 'MIT', :file => 'LICENSE' }
-  s.author           = { 'Alpha Video' => 'contact@alphavideo.dev' }
+  s.author           = { 'Daniel Kasprowicz' => 'danielkpl2@gmail.com' }
   s.source           = { :git => 'https://github.com/danielkpl2/alpha-video-gpu.git', :tag => "#{s.version}" }
 
   s.ios.deployment_target = '12.0'
