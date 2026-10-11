@@ -117,7 +117,7 @@ export function ensureSharedCanvasSize(width: number, height: number): void {
   sharedGLResources.canvas.height = newHeight;
   sharedGLResources.maxWidth = newWidth;
   sharedGLResources.maxHeight = newHeight;
-  console.log(`[KTX2Core] Shared canvas resized to ${newWidth}x${newHeight}`);
+  console.debug(`[AlphaVideoGpu] Shared canvas resized to ${newWidth}x${newHeight}`);
 }
 
 /**
@@ -145,7 +145,7 @@ export function getSharedGL(): SharedGLResources | null {
   })) as WebGL2RenderingContext | WebGLRenderingContext | null;
 
   if (!gl) {
-    console.warn('[KTX2Core] Failed to create shared WebGL context');
+    console.warn('[AlphaVideoGpu] Failed to create shared WebGL context');
     return null;
   }
 
@@ -162,7 +162,7 @@ export function getSharedGL(): SharedGLResources | null {
       const fsArr = compileShader(gl, gl.FRAGMENT_SHADER, FRAG_ARRAY);
       arrayProgram = linkProgram(gl, vsArr, fsArr);
     } catch (e) {
-      console.warn('[KTX2Core] Texture array shader failed:', e);
+      console.warn('[AlphaVideoGpu] Texture array shader failed:', e);
     }
   }
 
@@ -190,7 +190,7 @@ export function getSharedGL(): SharedGLResources | null {
     maxHeight: 512,
   };
 
-  console.log('[KTX2Core] Created shared WebGL context');
+  console.debug('[AlphaVideoGpu] Created shared WebGL context');
   return sharedGLResources;
 }
 
@@ -209,7 +209,7 @@ export function releaseSharedGL(): void {
     const ext = gl.getExtension('WEBGL_lose_context');
     if (ext) ext.loseContext();
     sharedGLResources = null;
-    console.log('[KTX2Core] Released shared WebGL context');
+    console.debug('[AlphaVideoGpu] Released shared WebGL context');
   }
 }
 

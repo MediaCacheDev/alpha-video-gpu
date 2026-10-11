@@ -51,6 +51,11 @@ export type {
 let basisModulePromise: Promise<any> | null = null;
 let basisModule: any = null;
 
+/** asset://path names the app's bundled media; on the web it is served from the site root. */
+function resolveWebUri(uri: string): string {
+  return uri.startsWith('asset://') ? '/' + uri.slice('asset://'.length).replace(/^\/+/, '') : uri;
+}
+
 // ============================================================================
 // KTX2PlayerCore
 // ============================================================================
@@ -65,6 +70,7 @@ export class KTX2PlayerCore {
   private _streamingCacheSize: number;
   private _streamingPrefetchAhead: number;
   private _memoryStrategy: MemoryStrategy;
+  private _verbose: boolean;
 
   // -- Dependency injection --
   private _basisTranscoderInit: (() => Promise<any>) | null;
@@ -169,6 +175,7 @@ export class KTX2PlayerCore {
     this._streamingCacheSize = options.streamingCacheSize ?? 60;
     this._streamingPrefetchAhead = options.streamingPrefetchAhead ?? 30;
     this._memoryStrategy = options.memoryStrategy ?? 'auto';
+    this._verbose = options.verbose ?? false;
     this._basisTranscoderInit = options.basisTranscoderInit ?? null;
     this._ZSTDDecoderClass = options.ZSTDDecoderClass ?? null;
     this._onStateChange = options.onStateChange ?? null;
@@ -252,18 +259,26 @@ export class KTX2PlayerCore {
     }
   }
 
+  set verbose(v: boolean) { this._verbose = v; }
+
   /** Reset loaded source tracking so next setSource will reload even the same URI. */
   resetSource(): void {
     this._loadedSource = null;
   }
 
   /**
-   * Load a source URL. Handles .ktx2, .ktx2.zst, .glb, multi-part, streaming, etc.
+   * Load a source: an http(s) or relative URL, or asset://path (served from the site root).
+   * Handles .ktx2, .ktx2.zst, .glb, multi-part, streaming, etc.
+   *
+   * @param cacheKey stable identity for the IndexedDB cache, for URLs that change while the file
+   *                 doesn't (presigned URLs); defaults to the URL
    */
-  async setSource(uri: string, partUris?: string[]): Promise<void> {
+  async setSource(sourceUri: string, partUris?: string[], cacheKey?: string): Promise<void> {
     try {
-      if (this._loadedSource === uri) return;
-      this._loadedSource = uri;
+      if (this._loadedSource === sourceUri) return;
+      this._loadedSource = sourceUri;
+      const uri = resolveWebUri(sourceUri);
+      partUris = partUris?.map(resolveWebUri);
       this._setState('loading');
       this._streamingCancelled = false;
 
@@ -290,12 +305,13 @@ export class KTX2PlayerCore {
       }
 
       // Fetch (with IndexedDB cache)
-      let arrayBuffer = await getCachedFile(uri);
+      const cacheId = cacheKey || uri;
+      let arrayBuffer = await getCachedFile(cacheId, this._verbose);
       if (!arrayBuffer) {
         const response = await fetch(uri);
         if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
         arrayBuffer = await response.arrayBuffer();
-        setCachedFile(uri, arrayBuffer);
+        setCachedFile(cacheId, arrayBuffer, this._verbose);
       }
       const data = new Uint8Array(arrayBuffer);
 
@@ -311,10 +327,14 @@ export class KTX2PlayerCore {
       this._currentFrame = 0;
       this._finishLoad();
     } catch (error) {
-      console.error('[KTX2Core] Load error:', error);
+      console.error('[AlphaVideoGpu] Load error:', error);
       this._setState('error');
       this._onError?.(error as Error);
     }
+  }
+
+  private _log(...args: unknown[]): void {
+    if (this._verbose) console.log(...args);
   }
 
   /** Tear down all resources. Call when the player is no longer needed. */
@@ -538,7 +558,7 @@ export class KTX2PlayerCore {
       const level0UncompressedLength = Number(view.getBigUint64(levelIndexOffset + 16, true));
       const decoder = await this._ensureZstdDecoder();
       textureData = decoder.decode(compressedData, level0UncompressedLength);
-      console.log(`[KTX2Core] WASM zstd decompressed ${level0ByteLength} -> ${textureData.length} bytes`);
+      this._log(`[AlphaVideoGpu] WASM zstd decompressed ${level0ByteLength} -> ${textureData.length} bytes`);
     } else if (supercompressionScheme === 0) {
       textureData = new Uint8Array(data.buffer, data.byteOffset + level0ByteOffset, level0ByteLength);
     } else {
@@ -602,7 +622,7 @@ export class KTX2PlayerCore {
   private async _loadGLBSource(
     gl: WebGLRenderingContext, data: Uint8Array, BasisModule: any, targetFormat: number
   ): Promise<void> {
-    console.log('[KTX2Core] Detected GLB container');
+    this._log('[AlphaVideoGpu] Detected GLB container');
     const glbResult = parseGLBContainer(data);
     if (!glbResult) throw new Error('Failed to parse GLB container');
 
@@ -613,10 +633,10 @@ export class KTX2PlayerCore {
     const isNativeASTC = metadata.mode === 'astc';
     const isTextureArray = metadata.packingMode === 'array';
 
-    console.log(`[KTX2Core] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
+    this._log(`[AlphaVideoGpu] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
 
     if (isTextureArray && gl instanceof WebGL2RenderingContext && this._arrayProgram) {
-      console.log('[KTX2Core] Using texture array mode');
+      this._log('[AlphaVideoGpu] Using texture array mode');
       const success = await this._loadTextureArray(gl, ktx2Parts[0], metadata);
       if (!success) throw new Error('Failed to load texture array');
       this._textures.push(gl.createTexture()!);
@@ -639,8 +659,8 @@ export class KTX2PlayerCore {
     const metadata = extractKTX2Metadata(data);
     if (!metadata) throw new Error('No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.');
 
-    console.log('[KTX2Core] Using embedded KTX2 metadata');
-    console.log(`[KTX2Core] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
+    this._log('[AlphaVideoGpu] Using embedded KTX2 metadata');
+    this._log(`[AlphaVideoGpu] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
     this._metadata = metadata;
     this._emitLoad(metadata);
 
@@ -649,16 +669,16 @@ export class KTX2PlayerCore {
     const isTextureArray = metadata.packingMode === 'array';
 
     if (isTextureArray && gl instanceof WebGL2RenderingContext && this._arrayProgram) {
-      console.log('[KTX2Core] Using texture array mode');
+      this._log('[AlphaVideoGpu] Using texture array mode');
       if (this._stream) {
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         const supercompressionScheme = view.getUint32(44, true);
         if (supercompressionScheme === 2) {
-          console.log('[KTX2Core] Using internal zstd streaming mode (stream=true)');
+          this._log('[AlphaVideoGpu] Using internal zstd streaming mode (stream=true)');
           const success = await this._loadInternalZstdStreamingTextureArray(gl, data, metadata);
           if (!success) throw new Error('Failed to load internal zstd streaming texture array');
         } else if (supercompressionScheme === 0) {
-          console.log('[KTX2Core] Using uncompressed streaming mode (stream=true)');
+          this._log('[AlphaVideoGpu] Using uncompressed streaming mode (stream=true)');
           const success = await this._loadUncompressedStreamingTextureArray(gl, data, metadata);
           if (!success) throw new Error('Failed to load uncompressed streaming texture array');
         } else {
@@ -714,7 +734,7 @@ export class KTX2PlayerCore {
       const layerCount = view.getUint32(32, true);
       const supercompressionScheme = view.getUint32(44, true);
 
-      console.log(`[KTX2Core] Texture array: ${width}x${height}, ${layerCount} layers (${useRamMode ? 'RAM' : 'VRAM'} mode)`);
+      this._log(`[AlphaVideoGpu] Texture array: ${width}x${height}, ${layerCount} layers (${useRamMode ? 'RAM' : 'VRAM'} mode)`);
 
       const level0Offset = Number(view.getBigUint64(80, true));
       const level0Length = Number(view.getBigUint64(88, true));
@@ -725,7 +745,7 @@ export class KTX2PlayerCore {
         const zstdData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
         const decoder = await this._ensureZstdDecoder();
         compressedData = decoder.decode(zstdData, level0UncompressedLength);
-        console.log(`[KTX2Core] WASM zstd decompressed ${level0Length} -> ${compressedData.length} bytes`);
+        this._log(`[AlphaVideoGpu] WASM zstd decompressed ${level0Length} -> ${compressedData.length} bytes`);
       } else {
         compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
       }
@@ -755,17 +775,17 @@ export class KTX2PlayerCore {
 
         const cpuMB = (compressedData.length / (1024 * 1024)).toFixed(1);
         const gpuMB = (bytesPerLayer * gpuRingSize / (1024 * 1024)).toFixed(2);
-        console.log(`[KTX2Core] RAM mode: ${layerCount} frames in CPU (${cpuMB}MB), ${gpuRingSize} slots in GPU (${gpuMB}MB)`);
+        this._log(`[AlphaVideoGpu] RAM mode: ${layerCount} frames in CPU (${cpuMB}MB), ${gpuRingSize} slots in GPU (${gpuMB}MB)`);
       } else {
         this._ramHeavyMode = false;
         gl.compressedTexImage3D(gl.TEXTURE_2D_ARRAY, 0, astcFormat, width, height, layerCount, 0, compressedData);
         const glError = gl.getError();
         if (glError !== gl.NO_ERROR) {
-          console.error('[KTX2Core] WebGL error after texture array upload:', glError);
+          console.error('[AlphaVideoGpu] WebGL error after texture array upload:', glError);
           return false;
         }
         const dataMB = (compressedData.length / (1024 * 1024)).toFixed(1);
-        console.log(`[KTX2Core] VRAM mode: ${dataMB}MB uploaded to GPU`);
+        this._log(`[AlphaVideoGpu] VRAM mode: ${dataMB}MB uploaded to GPU`);
       }
 
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -782,10 +802,10 @@ export class KTX2PlayerCore {
       }
       this._frameUVs = uvs;
 
-      console.log(`[KTX2Core] ✓ Texture array loaded: ${width}x${height}, ${layerCount} layers`);
+      this._log(`[AlphaVideoGpu] ✓ Texture array loaded: ${width}x${height}, ${layerCount} layers`);
       return true;
     } catch (error) {
-      console.error('[KTX2Core] Failed to load texture array:', error);
+      console.error('[AlphaVideoGpu] Failed to load texture array:', error);
       return false;
     }
   }
@@ -802,7 +822,7 @@ export class KTX2PlayerCore {
     const gpuCacheSize = useVram ? this._streamingCacheSize : this._streamingRingSize;
     const ringSize = Math.min(gpuCacheSize, layerCount);
 
-    console.log(`[KTX2Core] Memory strategy: ${this._memoryStrategy} (useVram=${useVram}), GPU cache: ${ringSize} slots`);
+    this._log(`[AlphaVideoGpu] Memory strategy: ${this._memoryStrategy} (useVram=${useVram}), GPU cache: ${ringSize} slots`);
 
     const bytesPerLayer = vkFormat != null
       ? getASTCBytesPerLayer(width, height, vkFormat)
@@ -824,7 +844,7 @@ export class KTX2PlayerCore {
     this._streamingHeight = height;
     this._streamingAstcFormat = astcFormat;
 
-    console.log(`[KTX2Core] Ring buffer initialized: ${ringSize} slots, ${bytesPerLayer} bytes/layer`);
+    this._log(`[AlphaVideoGpu] Ring buffer initialized: ${ringSize} slots, ${bytesPerLayer} bytes/layer`);
   }
 
   // ======== Private: Uncompressed Streaming ========
@@ -833,7 +853,7 @@ export class KTX2PlayerCore {
     gl: WebGL2RenderingContext, ktx2Data: Uint8Array, metadata: Metadata
   ): Promise<boolean> {
     try {
-      console.log('[KTX2Core] Starting uncompressed streaming playback...');
+      this._log('[AlphaVideoGpu] Starting uncompressed streaming playback...');
       const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
       const vkFormat = view.getUint32(12, true);
       const width = view.getUint32(20, true);
@@ -846,7 +866,7 @@ export class KTX2PlayerCore {
       const level0Offset = Number(view.getBigUint64(80, true));
       const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
 
-      console.log(`[KTX2Core] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
+      this._log(`[AlphaVideoGpu] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
 
       const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
       if (!astcExt) throw new Error('ASTC texture compression not supported');
@@ -906,10 +926,10 @@ export class KTX2PlayerCore {
       this._textureArray = this._streamingRingBuffer;
       this._useTextureArray = true;
 
-      console.log(`[KTX2Core] ✓ Uncompressed streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
+      this._log(`[AlphaVideoGpu] ✓ Uncompressed streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
       return true;
     } catch (error) {
-      console.error('[KTX2Core] Uncompressed streaming load failed:', error);
+      console.error('[AlphaVideoGpu] Uncompressed streaming load failed:', error);
       return false;
     }
   }
@@ -920,7 +940,7 @@ export class KTX2PlayerCore {
     gl: WebGL2RenderingContext, ktx2Data: Uint8Array, metadata: Metadata
   ): Promise<boolean> {
     try {
-      console.log('[KTX2Core] Starting internal zstd streaming playback...');
+      this._log('[AlphaVideoGpu] Starting internal zstd streaming playback...');
       const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
       const vkFormat = view.getUint32(12, true);
       const width = view.getUint32(20, true);
@@ -933,7 +953,7 @@ export class KTX2PlayerCore {
 
       const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
 
-      console.log(`[KTX2Core] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
+      this._log(`[AlphaVideoGpu] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
 
       const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
       if (!astcExt) throw new Error('ASTC texture compression not supported');
@@ -965,7 +985,7 @@ export class KTX2PlayerCore {
       // Pre-decode initial frames
       const actualRingSize = this._streamingRingActualSize;
       const prefetchCount = Math.min(this._streamingPrefetchAhead, layerCount);
-      console.log(`[KTX2Core] Pre-decoding ${prefetchCount} frames...`);
+      this._log(`[AlphaVideoGpu] Pre-decoding ${prefetchCount} frames...`);
 
       for (let i = 0; i < prefetchCount && !this._streamingCancelled; i++) {
         const frameData = await this._decodeNextFrame();
@@ -989,10 +1009,10 @@ export class KTX2PlayerCore {
 
       this._startBackgroundDecompression();
 
-      console.log(`[KTX2Core] ✓ Internal zstd streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
+      this._log(`[AlphaVideoGpu] ✓ Internal zstd streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
       return true;
     } catch (error) {
-      console.error('[KTX2Core] Internal zstd streaming load failed:', error);
+      console.error('[AlphaVideoGpu] Internal zstd streaming load failed:', error);
       return false;
     }
   }
@@ -1115,7 +1135,7 @@ export class KTX2PlayerCore {
     for (const frameIndex of toRemove) frameCache.delete(frameIndex);
 
     if (frameCache.size > this._streamingCacheSize + 10) {
-      console.warn(`[KTX2Core] Frame cache too large: ${frameCache.size} frames (max: ${this._streamingCacheSize}), playback: ${currentPlaybackFrame}`);
+      console.warn(`[AlphaVideoGpu] Frame cache too large: ${frameCache.size} frames (max: ${this._streamingCacheSize}), playback: ${currentPlaybackFrame}`);
     }
   }
 
@@ -1155,7 +1175,7 @@ export class KTX2PlayerCore {
       const result = state.generator.next();
       if (result.done) {
         state.reachedEnd = true;
-        console.log(`[KTX2Core] ✓ Streaming decompression complete: ${decodePos} frames decoded`);
+        this._log(`[AlphaVideoGpu] ✓ Streaming decompression complete: ${decodePos} frames decoded`);
         break;
       }
 
@@ -1251,7 +1271,7 @@ export class KTX2PlayerCore {
 
   private _handleStreamingLoop(): void {
     this._streamingLoopCount++;
-    console.log(`[KTX2Core] 🔄 Loop #${this._streamingLoopCount} - restarting decompression`);
+    this._log(`[AlphaVideoGpu] 🔄 Loop #${this._streamingLoopCount} - restarting decompression`);
 
     this._streamingFrameCache.clear();
     this._streamingDecodePos = 0;
@@ -1304,7 +1324,7 @@ export class KTX2PlayerCore {
     onProgress?: (loaded: number, total: number, layersReady: number) => void
   ): Promise<boolean> {
     try {
-      console.log('[KTX2Core] Starting streaming load:', uri);
+      this._log('[AlphaVideoGpu] Starting streaming load:', uri);
 
       const decoder = await this._ensureZstdDecoder();
       if (typeof decoder.decodeStreaming !== 'function') {
@@ -1328,7 +1348,7 @@ export class KTX2PlayerCore {
         onProgress?.(receivedLength, contentLength, 0);
       }
 
-      console.log(`[KTX2Core] Downloaded ${receivedLength} bytes, parsing header...`);
+      this._log(`[AlphaVideoGpu] Downloaded ${receivedLength} bytes, parsing header...`);
       this._streamingCompressedChunks = compressedChunks;
 
       // Parse header from first decompressed chunk
@@ -1364,7 +1384,7 @@ export class KTX2PlayerCore {
 
       if (!headerParsed) throw new Error('Failed to parse KTX2 header from stream');
 
-      console.log(`[KTX2Core] Streaming texture: ${width}x${height}, ${layerCount} layers`);
+      this._log(`[AlphaVideoGpu] Streaming texture: ${width}x${height}, ${layerCount} layers`);
 
       const metadata = extractKTX2Metadata(headerBuffer.subarray(0, Math.min(headerBufferLength, level0Offset + 100)));
       if (!metadata) throw new Error('No metadata found in streaming KTX2');
@@ -1412,10 +1432,10 @@ export class KTX2PlayerCore {
 
       this._continueStreamingDecompression();
 
-      console.log(`[KTX2Core] ✓ Streaming initialized: ${width}x${height}, ring=${this._streamingRingActualSize}, cache=${this._streamingCacheSize}`);
+      this._log(`[AlphaVideoGpu] ✓ Streaming initialized: ${width}x${height}, ring=${this._streamingRingActualSize}, cache=${this._streamingCacheSize}`);
       return true;
     } catch (error) {
-      console.error('[KTX2Core] Streaming load failed:', error);
+      console.error('[AlphaVideoGpu] Streaming load failed:', error);
       return false;
     }
   }

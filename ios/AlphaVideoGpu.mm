@@ -5,6 +5,7 @@
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <unistd.h>
+#import <CommonCrypto/CommonDigest.h>
 
 // Basis Universal transcoder - must define this before including
 #define BASISU_NO_ITERATOR_DEBUG_LEVEL
@@ -22,6 +23,146 @@
 
 // View manager is in separate AlphaVideoGpuViewManager.m file
 
+#define AVG_VLOG(fmt, ...) do { if (self.verbose) NSLog(@"AlphaVideoGpuView: " fmt, ##__VA_ARGS__); } while (0)
+
+#pragma mark - Source resolution
+
+static NSString *AVGSHA256Hex(NSString *text) {
+  NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+  NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+  for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    [hex appendFormat:@"%02x", digest[i]];
+  }
+  return hex;
+}
+
+static BOOL AVGFileHasData(NSString *path) {
+  NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+  return attributes != nil && attributes.fileSize > 0;
+}
+
+static BOOL AVGIsRemote(NSString *uri) {
+  return [uri hasPrefix:@"https://"] || [uri hasPrefix:@"http://"];
+}
+
+/** The URI of fileName in the same folder as uri (for multi-part files), or nil when it has no folder. */
+static NSString *AVGSiblingURI(NSString *uri, NSString *fileName) {
+  if (AVGIsRemote(uri)) {
+    return [NSURL URLWithString:fileName relativeToURL:[NSURL URLWithString:uri]].absoluteString;
+  }
+  if ([uri hasPrefix:@"asset://"] || [uri hasPrefix:@"file://"] || [uri hasPrefix:@"/"]) {
+    NSRange slash = [uri rangeOfString:@"/" options:NSBackwardsSearch];
+    return [[uri substringToIndex:slash.location + 1] stringByAppendingString:fileName];
+  }
+  return nil;
+}
+
+/** Downloads urlString into Caches unless it's already there. Blocks; call off the main thread. */
+static NSString *AVGDownload(NSString *urlString, NSString *cacheKey, NSString **error) {
+  NSURL *url = [NSURL URLWithString:urlString];
+  if (!url) {
+    *error = [NSString stringWithFormat:@"Invalid URL: %@", urlString];
+    return nil;
+  }
+
+  NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                        stringByStandardizingPath];
+  NSString *cachePath;
+  if (cacheKey.length > 0) {
+    cachePath = [[cacheDir stringByAppendingPathComponent:cacheKey] stringByStandardizingPath];
+    if (![cachePath hasPrefix:[cacheDir stringByAppendingString:@"/"]]) {
+      *error = [NSString stringWithFormat:@"cacheKey must stay inside the cache directory: %@", cacheKey];
+      return nil;
+    }
+  } else {
+    cachePath = [[cacheDir stringByAppendingPathComponent:@"alpha-video-gpu"]
+                 stringByAppendingPathComponent:AVGSHA256Hex(urlString)];
+  }
+  if (AVGFileHasData(cachePath)) {
+    return cachePath;
+  }
+
+  __block NSString *failure = nil;
+  dispatch_semaphore_t done = dispatch_semaphore_create(0);
+  NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
+      completionHandler:^(NSURL *location, NSURLResponse *response, NSError *downloadError) {
+    NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
+        ? ((NSHTTPURLResponse *)response).statusCode : 200;
+    if (downloadError || !location) {
+      failure = [NSString stringWithFormat:@"Download failed: %@", downloadError.localizedDescription ?: @"unknown error"];
+    } else if (status != 200) {
+      failure = [NSString stringWithFormat:@"Download failed: HTTP %ld for %@", (long)status, urlString];
+    } else {
+      // The temporary file is deleted when this handler returns, so move it now. Another view
+      // may have finished the same download first, in which case its file is used.
+      NSFileManager *fileManager = [NSFileManager defaultManager];
+      [fileManager createDirectoryAtPath:[cachePath stringByDeletingLastPathComponent]
+             withIntermediateDirectories:YES attributes:nil error:nil];
+      NSError *moveError = nil;
+      if (![fileManager moveItemAtPath:location.path toPath:cachePath error:&moveError] && !AVGFileHasData(cachePath)) {
+        failure = [NSString stringWithFormat:@"Cannot write cache file: %@", moveError.localizedDescription];
+      }
+    }
+    dispatch_semaphore_signal(done);
+  }];
+  [task resume];
+  dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+
+  if (failure) {
+    *error = failure;
+    return nil;
+  }
+  return cachePath;
+}
+
+/**
+ * Turns a source URI into a local file path. https:// and http:// are downloaded into Caches
+ * (named by cacheKey, or a hash of the URL), asset:// maps into the app bundle, and file:// and
+ * absolute paths pass through. Blocks; call off the main thread.
+ */
+static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **error) {
+  if (AVGIsRemote(uri)) {
+    return AVGDownload(uri, cacheKey, error);
+  }
+
+  NSString *path = nil;
+  if ([uri hasPrefix:@"asset://"]) {
+    NSString *relative = [uri substringFromIndex:@"asset://".length];
+    relative = [relative stringByRemovingPercentEncoding] ?: relative;
+    while ([relative hasPrefix:@"/"]) {
+      relative = [relative substringFromIndex:1];
+    }
+    if (relative.length > 0) {
+      path = [[NSBundle mainBundle].resourcePath stringByAppendingPathComponent:relative];
+    }
+  } else if ([uri hasPrefix:@"file://"]) {
+    NSURL *url = [NSURL URLWithString:uri];
+    path = url.isFileURL ? url.path : [uri substringFromIndex:@"file://".length];
+  } else if ([uri hasPrefix:@"/"]) {
+    path = uri;
+  }
+
+  if (!path) {
+    *error = [NSString stringWithFormat:@"Unsupported source '%@'. Use https://, file://, an absolute path or asset://", uri];
+    return nil;
+  }
+  if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+    *error = [NSString stringWithFormat:@"File not found: %@", uri];
+    return nil;
+  }
+  return path;
+}
+
+static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
+  NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+  NSData *head = [handle readDataOfLength:4];
+  [handle closeFile];
+  const uint8_t *b = (const uint8_t *)head.bytes;
+  return head.length == 4 && b[0] == 0x28 && b[1] == 0xB5 && b[2] == 0x2F && b[3] == 0xFD;
+}
+
 @implementation AlphaVideoGpuView {
   basist::transcoder_texture_format _targetFormat;
   MTLPixelFormat _metalPixelFormat;
@@ -29,8 +170,11 @@
   std::vector<std::vector<uint8_t>> _transcodedData;
   id<MTLSamplerState> _samplerState;
   BOOL _basisInitialized;
-  NSString *_basePath;
   NSString *_sourceUri;
+  // The local file the current source resolved to (a download, a bundle file or a path)
+  NSString *_localPath;
+  // Bumped for every new source, so a slow download for an old one is dropped
+  NSUInteger _sourceGeneration;
   // The cache key the loaded/loading source belongs to. Compared against self.cacheKey
   // to tell a re-signed URL for the same object apart from a new asset.
   NSString *_loadedCacheKey;
@@ -106,12 +250,12 @@
 
 - (instancetype)initWithFrame:(CGRect)frame
 {
-  NSLog(@"AlphaVideoGpuView: initWithFrame %@", NSStringFromCGRect(frame));
+  AVG_VLOG(@"initWithFrame %@", NSStringFromCGRect(frame));
   
   self = [super initWithFrame:frame];
   if (self) {
     self.device = MTLCreateSystemDefaultDevice();
-    NSLog(@"AlphaVideoGpuView: Metal device=%@", self.device.name);
+    AVG_VLOG(@"Metal device=%@", self.device.name);
     self.commandQueue = [self.device newCommandQueue];
     self.delegate = self;
     
@@ -166,7 +310,7 @@
     _isUncompressedStreaming = NO;
     _decodedRgbaCache = nil;
     _uncompressedDecoderPosition = 0;
-    _astcDecodeQueue = dispatch_queue_create("com.ktx2player.astcdecode", DISPATCH_QUEUE_SERIAL);
+    _astcDecodeQueue = dispatch_queue_create("com.alphavideo.gpu.astcdecode", DISPATCH_QUEUE_SERIAL);
     _astcBlockWidth = 4;
     _astcBlockHeight = 4;
     
@@ -192,7 +336,7 @@
 {
   // Check if running on simulator
 #if TARGET_OS_SIMULATOR
-  NSLog(@"AlphaVideoGpuView: Running on simulator - using RGBA32 fallback");
+  AVG_VLOG(@"Running on simulator - using RGBA32 fallback");
   _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
   _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
   _useCompressedFormat = NO;
@@ -203,7 +347,7 @@
   if (@available(iOS 8.0, *)) {
     // Check device capabilities - ASTC is supported on A8 and later
     if ([self.device supportsFamily:MTLGPUFamilyApple2]) {
-      NSLog(@"AlphaVideoGpuView: Using ASTC 4x4 format");
+      AVG_VLOG(@"Using ASTC 4x4 format");
       _targetFormat = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
       _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
       _useCompressedFormat = YES;
@@ -212,7 +356,7 @@
   }
   
   // Fallback to RGBA32 for older devices
-  NSLog(@"AlphaVideoGpuView: Using RGBA32 fallback format");
+  AVG_VLOG(@"Using RGBA32 fallback format");
   _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
   _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
   _useCompressedFormat = NO;
@@ -264,13 +408,13 @@
 #if !TARGET_OS_SIMULATOR
       _metalPixelFormat = fmt.pixelFormat;
 #endif
-      NSLog(@"AlphaVideoGpuView: ASTC format: %ux%u (VkFormat=%u, MTLPixelFormat=%lu, useCompressed=%d)",
+      AVG_VLOG(@"ASTC format: %ux%u (VkFormat=%u, MTLPixelFormat=%lu, useCompressed=%d)",
             fmt.blockWidth, fmt.blockHeight, vkFormat, (unsigned long)_metalPixelFormat, _useCompressedFormat);
       return YES;
     }
   }
   
-  NSLog(@"AlphaVideoGpuView: Unknown ASTC VkFormat: %u, falling back to 4x4", vkFormat);
+  AVG_VLOG(@"Unknown ASTC VkFormat: %u, falling back to 4x4", vkFormat);
 #if !TARGET_OS_SIMULATOR
   _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
 #endif
@@ -292,16 +436,16 @@
 
 - (void)setSource:(NSDictionary *)source
 {
-  NSLog(@"AlphaVideoGpuView: setSource called with: %@", source);
+  AVG_VLOG(@"setSource called with: %@", source);
   
   if (!source) {
-    NSLog(@"AlphaVideoGpuView: setSource - source is nil, ignoring");
+    AVG_VLOG(@"setSource - source is nil, ignoring");
     return;
   }
   
   NSString *uri = source[@"uri"];
   
-  NSLog(@"AlphaVideoGpuView: setSource - uri=%@", uri);
+  AVG_VLOG(@"setSource - uri=%@", uri);
   
   if (!uri || uri.length == 0) {
     NSLog(@"AlphaVideoGpuView: Invalid source - missing uri");
@@ -320,7 +464,7 @@
   
   // Check if source changed
   if ([_sourceUri isEqualToString:uri] && (_isSourceLoaded || _isSourceLoading)) {
-    NSLog(@"AlphaVideoGpuView: Source unchanged and already loaded/loading, skipping");
+    AVG_VLOG(@"Source unchanged and already loaded/loading, skipping");
     return;
   }
   
@@ -330,7 +474,7 @@
   // interrupt a loop that is supposed to run until unmount.
   if (self.cacheKey.length > 0 && [self.cacheKey isEqualToString:_loadedCacheKey]
       && (_isSourceLoaded || _isSourceLoading)) {
-    NSLog(@"AlphaVideoGpuView: Same cacheKey (%@), ignoring URL change", self.cacheKey);
+    AVG_VLOG(@"Same cacheKey (%@), ignoring URL change", self.cacheKey);
     _source = [source copy];
     _sourceUri = [uri copy];
     return;
@@ -343,9 +487,36 @@
   _isSourceLoading = YES;
   _isDestroyed = NO;
   
-  NSLog(@"AlphaVideoGpuView: Loading source...");
+  _localPath = nil;
   [self notifyStateChange:@"loading"];
-  [self loadKTX2WithSource:source];
+  [self resolveAndLoadSource];
+}
+
+/** Resolves _sourceUri to a local file off the main thread, then loads it. */
+- (void)resolveAndLoadSource
+{
+  NSUInteger generation = ++_sourceGeneration;
+  NSString *uri = _sourceUri;
+  NSString *cacheKey = self.cacheKey;
+  AVG_VLOG(@"Resolving source %@", uri);
+
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    NSString *error = nil;
+    NSString *path = AVGResolveSource(uri, cacheKey, &error);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (generation != self->_sourceGeneration) return;
+      if (self->_isDestroyed) {
+        self->_isSourceLoading = NO;
+        return;
+      }
+      if (!path) {
+        [self notifyError:error];
+        return;
+      }
+      self->_localPath = path;
+      [self loadKTX2FromFile:path];
+    });
+  });
 }
 
 - (void)notifyStateChange:(NSString *)state
@@ -389,86 +560,10 @@
 - (void)notifyError:(NSString *)error
 {
   _isSourceLoading = NO;
+  NSLog(@"AlphaVideoGpuView: Error: %@", error);
   if (self.onError) {
     self.onError(@{@"error": error ?: @"Unknown error"});
   }
-}
-
-#pragma mark - Caching
-
-- (NSData *)loadDataFromURLWithCaching:(NSString *)urlString partIndex:(NSInteger)partIndex
-{
-  NSFileManager *fileManager = [NSFileManager defaultManager];
-  NSURL *cachesDir = [[fileManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
-  
-  NSURL *cacheFileURL;
-  
-  if (self.cacheKey && self.cacheKey.length > 0) {
-    // Use cacheKey as path from caches directory
-    // For multi-part, append part index to cacheKey
-    NSString *cacheKeyPath = self.cacheKey;
-    if (self.partCount > 1) {
-      NSString *ext = [cacheKeyPath pathExtension];
-      NSString *basePath = [cacheKeyPath stringByDeletingPathExtension];
-      cacheKeyPath = [NSString stringWithFormat:@"%@_%ld.%@", basePath, (long)partIndex, ext];
-    }
-    
-    cacheFileURL = [cachesDir URLByAppendingPathComponent:cacheKeyPath];
-    
-    // Create intermediate directories
-    NSURL *parentDir = [cacheFileURL URLByDeletingLastPathComponent];
-    NSError *dirError = nil;
-    [fileManager createDirectoryAtURL:parentDir withIntermediateDirectories:YES attributes:nil error:&dirError];
-    if (dirError) {
-      NSLog(@"AlphaVideoGpuView: Failed to create cache directory: %@", dirError);
-    }
-    
-    NSLog(@"AlphaVideoGpuView: Using cacheKey: %@ -> %@", cacheKeyPath, cacheFileURL.path);
-  } else {
-    // Use hash-based caching in ktx2-cache subdirectory
-    NSURL *ktx2CacheDir = [cachesDir URLByAppendingPathComponent:@"ktx2-cache"];
-    [fileManager createDirectoryAtURL:ktx2CacheDir withIntermediateDirectories:YES attributes:nil error:nil];
-    
-    // Create hash from URL
-    const char *urlCString = [urlString UTF8String];
-    unsigned long hash = 5381;
-    int c;
-    while ((c = *urlCString++)) {
-      hash = ((hash << 5) + hash) + c;
-    }
-    
-    NSString *cacheFileName = [NSString stringWithFormat:@"%016lx.ktx2", hash];
-    cacheFileURL = [ktx2CacheDir URLByAppendingPathComponent:cacheFileName];
-    
-    NSLog(@"AlphaVideoGpuView: Using hash-based cache: %@", cacheFileURL.path);
-  }
-  
-  // Check if cached file exists
-  if ([fileManager fileExistsAtPath:cacheFileURL.path]) {
-    NSLog(@"AlphaVideoGpuView: Using cached file: %@", cacheFileURL.path);
-    return [NSData dataWithContentsOfURL:cacheFileURL];
-  }
-  
-  // Download from URL
-  NSURL *url = [NSURL URLWithString:urlString];
-  NSError *downloadError = nil;
-  NSData *downloadedData = [NSData dataWithContentsOfURL:url options:0 error:&downloadError];
-  
-  if (downloadError || !downloadedData) {
-    NSLog(@"AlphaVideoGpuView: Failed to download: %@, error: %@", urlString, downloadError);
-    return nil;
-  }
-  
-  // Save to cache
-  NSError *writeError = nil;
-  [downloadedData writeToURL:cacheFileURL options:NSDataWritingAtomic error:&writeError];
-  if (writeError) {
-    NSLog(@"AlphaVideoGpuView: Failed to write cache file: %@", writeError);
-  } else {
-    NSLog(@"AlphaVideoGpuView: Cached file to: %@", cacheFileURL.path);
-  }
-  
-  return downloadedData;
 }
 
 - (void)setupMetal
@@ -536,7 +631,7 @@
                                     "  return tex.sample(s, uv);\n"
                                     "}";
   
-  NSLog(@"AlphaVideoGpuView: Compiling Metal shaders...");
+  AVG_VLOG(@"Compiling Metal shaders...");
   
   NSError *error = nil;
   id<MTLLibrary> vertexLibrary = [self.device newLibraryWithSource:vertexShaderSource options:nil error:&error];
@@ -558,7 +653,7 @@
     NSLog(@"AlphaVideoGpuView: Failed to get fragment_main function!");
   }
   
-  NSLog(@"AlphaVideoGpuView: Shader compilation complete. vertex=%p, fragment=%p", vertexFunction, fragmentFunction);
+  AVG_VLOG(@"Shader compilation complete. vertex=%p, fragment=%p", vertexFunction, fragmentFunction);
   
   // Create pipeline
   MTLRenderPipelineDescriptor *pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -580,7 +675,7 @@
   if (error) {
     NSLog(@"AlphaVideoGpuView: Failed to create pipeline state: %@", error);
   } else {
-    NSLog(@"AlphaVideoGpuView: Pipeline state created successfully: %p", self.pipelineState);
+    AVG_VLOG(@"Pipeline state created successfully: %p", self.pipelineState);
   }
   
   // Create texture array shader for packingMode: 'array'
@@ -625,7 +720,7 @@
     if (error) {
       NSLog(@"AlphaVideoGpuView: Failed to create array pipeline state: %@", error);
     } else {
-      NSLog(@"AlphaVideoGpuView: Array pipeline state created successfully");
+      AVG_VLOG(@"Array pipeline state created successfully");
     }
   }
   
@@ -705,7 +800,7 @@
       NSError *jsonError;
       NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:valueData options:0 error:&jsonError];
       if (!jsonError) {
-        NSLog(@"AlphaVideoGpuView: Extracted embedded metadata from KTX2");
+        AVG_VLOG(@"Extracted embedded metadata from KTX2");
         return metadata;
       }
     }
@@ -755,7 +850,7 @@
   offset += 4;
   
   if (jsonChunkType != 0x4E4F534A) { // "JSON"
-    NSLog(@"AlphaVideoGpuView: Expected JSON chunk, got: 0x%X", jsonChunkType);
+    AVG_VLOG(@"Expected JSON chunk, got: 0x%X", jsonChunkType);
     return nil;
   }
   
@@ -776,7 +871,7 @@
   offset += 4;
   
   if (binChunkType != 0x004E4942) { // "BIN\0"
-    NSLog(@"AlphaVideoGpuView: Expected BIN chunk, got: 0x%X", binChunkType);
+    AVG_VLOG(@"Expected BIN chunk, got: 0x%X", binChunkType);
     return nil;
   }
   
@@ -785,7 +880,7 @@
   // Extract KTX2 parts from BIN chunk using ktx2Parts offsets
   NSArray *ktx2PartsInfo = metadata[@"ktx2Parts"];
   if (!ktx2PartsInfo || ktx2PartsInfo.count == 0) {
-    NSLog(@"AlphaVideoGpuView: No ktx2Parts found in GLB metadata");
+    AVG_VLOG(@"No ktx2Parts found in GLB metadata");
     return nil;
   }
   
@@ -801,62 +896,35 @@
   _glbKtx2Parts = [parts copy];
   _isGLBContainer = YES;
   
-  NSLog(@"AlphaVideoGpuView: Parsed GLB container: %lu KTX2 parts", (unsigned long)_glbKtx2Parts.count);
+  AVG_VLOG(@"Parsed GLB container: %lu KTX2 parts", (unsigned long)_glbKtx2Parts.count);
   
   return metadata;
 }
 
-- (void)loadKTX2WithSource:(NSDictionary *)source
+- (void)loadKTX2FromFile:(NSString *)path
 {
-  NSString *uri = source[@"uri"];
-  
-  // Store base path for part file loading
-  _basePath = [[uri stringByDeletingLastPathComponent] copy];
-  
   // Reset GLB state
   _isGLBContainer = NO;
   _glbKtx2Parts = nil;
   
-  // Check for streaming mode (.ktx2.zst files)
-  // Metro bundler may insert hash: .ktx2.{hash}.zst
-  NSRegularExpression *zstRegex = [NSRegularExpression regularExpressionWithPattern:@"\\.ktx2\\.[a-f0-9]+\\.zst" options:0 error:nil];
-  BOOL isStreamingZst = [uri hasSuffix:@".zst"] || 
-                        [uri containsString:@".zst?"] ||
-                        ([zstRegex numberOfMatchesInString:uri options:0 range:NSMakeRange(0, uri.length)] > 0);
-  
-  if (isStreamingZst) {
-    NSLog(@"AlphaVideoGpuView: Detected streaming mode (.zst): %@", uri);
-    [self loadStreamingKTX2WithSource:source];
-    return;
-  }
-  
-  // Check for uncompressed streaming mode (.ktx2 files with streamMode:true)
-  // This avoids loading the entire file into memory
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    NSString *filePath = nil;
-    if ([uri hasPrefix:@"file://"]) {
-      filePath = [[NSURL URLWithString:uri] path];
-    } else if (![uri hasPrefix:@"http://"] && ![uri hasPrefix:@"https://"]) {
-      filePath = uri;
+    // A whole-file zstd frame (.ktx2.zst) streams; recognised by content, since a cached
+    // download is named by its cache key rather than by the URL's extension
+    if (AVGFileStartsWithZstdFrame(path)) {
+      AVG_VLOG(@"Detected streaming mode (zstd frame): %@", path);
+      [self loadStreamingKTX2FromFile:path];
+      return;
     }
     
-    // Try uncompressed streaming first (for local files only)
-    if (filePath && [self checkAndPlayUncompressedStreaming:filePath]) {
-      NSLog(@"AlphaVideoGpuView: Using uncompressed streaming mode");
+    // Check for uncompressed streaming mode (.ktx2 files with streamMode:true)
+    // This avoids loading the entire file into memory
+    if ([self checkAndPlayUncompressedStreaming:path]) {
+      AVG_VLOG(@"Using uncompressed streaming mode");
       return;
     }
     
     // Fall back to loading entire file
-    NSData *fileData = nil;
-    if ([uri hasPrefix:@"http://"] || [uri hasPrefix:@"https://"]) {
-      fileData = [self loadDataFromURLWithCaching:uri partIndex:0];
-    } else if ([uri hasPrefix:@"file://"]) {
-      NSURL *fileURL = [NSURL URLWithString:uri];
-      fileData = [NSData dataWithContentsOfURL:fileURL];
-    } else {
-      fileData = [NSData dataWithContentsOfFile:uri];
-    }
-    
+    NSData *fileData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     if (!fileData) {
       dispatch_async(dispatch_get_main_queue(), ^{
         [self notifyError:@"Failed to load file"];
@@ -868,7 +936,7 @@
     
     // Check if this is a GLB container or KTX2 file
     if ([self isGLBData:fileData]) {
-      NSLog(@"AlphaVideoGpuView: Detected GLB container");
+      AVG_VLOG(@"Detected GLB container");
       metadata = [self parseGLBContainer:fileData];
       if (!metadata) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -885,33 +953,23 @@
         });
         return;
       }
-      NSLog(@"AlphaVideoGpuView: Using embedded KTX2 metadata");
+      AVG_VLOG(@"Using embedded KTX2 metadata");
     }
     
     // Continue on main thread with parsed metadata
     dispatch_async(dispatch_get_main_queue(), ^{
-      [self applyMetadataAndLoadTextures:metadata basePath:self->_basePath sourceUri:uri];
+      [self applyMetadataAndLoadTextures:metadata sourcePath:path];
     });
   });
 }
 
 #pragma mark - Streaming Decompression
 
-- (void)loadStreamingKTX2WithSource:(NSDictionary *)source
+- (void)loadStreamingKTX2FromFile:(NSString *)path
 {
-  NSString *uri = source[@"uri"];
-  
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    // Load compressed data
-    NSData *compressedData = nil;
-    if ([uri hasPrefix:@"http://"] || [uri hasPrefix:@"https://"]) {
-      compressedData = [self loadDataFromURLWithCaching:uri partIndex:0];
-    } else if ([uri hasPrefix:@"file://"]) {
-      NSURL *fileURL = [NSURL URLWithString:uri];
-      compressedData = [NSData dataWithContentsOfURL:fileURL];
-    } else {
-      compressedData = [NSData dataWithContentsOfFile:uri];
-    }
+    // Memory-mapped, so the compressed file isn't copied into RAM
+    NSData *compressedData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     
     if (!compressedData) {
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -920,7 +978,7 @@
       return;
     }
     
-    NSLog(@"AlphaVideoGpuView: Streaming compressed data: %lu bytes", (unsigned long)compressedData.length);
+    AVG_VLOG(@"Streaming compressed data: %lu bytes", (unsigned long)compressedData.length);
     
     // Initialize streaming decompression with ZSTD_DStream
     ZSTD_DStream *dstream = ZSTD_createDStream();
@@ -986,7 +1044,7 @@
             [self configureASTCFormatFromVkFormat:vkFormat];
           });
           
-          NSLog(@"AlphaVideoGpuView: Streaming texture: %ux%u, %u layers, offset=%llu, vkFormat=%u", width, height, layerCount, level0Offset, vkFormat);
+          AVG_VLOG(@"Streaming texture: %ux%u, %u layers, offset=%llu, vkFormat=%u", width, height, layerCount, level0Offset, vkFormat);
         }
       }
     }
@@ -1031,7 +1089,7 @@
     // Calculate bytes per layer using current ASTC block dimensions
     uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
     
-    NSLog(@"AlphaVideoGpuView: Bytes per layer: %u (ASTC %ux%u), level0Offset: %llu", bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
+    AVG_VLOG(@"Bytes per layer: %u (ASTC %ux%u), level0Offset: %llu", bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
     
     // Determine memory strategy
     BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
@@ -1040,7 +1098,7 @@
         MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
         MIN(self.streamingRingSize, (NSInteger)layerCount);
     
-    NSLog(@"AlphaVideoGpuView: Streaming params: strategy=%@, gpuCache=%ld, vramMode=%d", 
+    AVG_VLOG(@"Streaming params: strategy=%@, gpuCache=%ld, vramMode=%d", 
           self.memoryStrategy, (long)gpuCacheSize, useVramStrategy);
     
     // Setup on main thread
@@ -1117,10 +1175,10 @@
         if (!self->_blitCommandQueue) {
           self->_blitCommandQueue = [self.device newCommandQueue];
         }
-        NSLog(@"AlphaVideoGpuView: Created staging buffers for async blit: %u bytes each", self->_streamBytesPerLayer);
+        AVG_VLOG(@"Created staging buffers for async blit: %u bytes each", self->_streamBytesPerLayer);
       }
       
-      NSLog(@"AlphaVideoGpuView: Created streaming texture array: %ux%u, %ld GPU slots (ring buffer)", 
+      AVG_VLOG(@"Created streaming texture array: %ux%u, %ld GPU slots (ring buffer)", 
             width, height, (long)gpuCacheSize);
       
       // Pre-decode initial frames so we have something to display
@@ -1147,7 +1205,7 @@
     
     // Note: We no longer decode all frames upfront!
     // Frames are decoded on-demand during playback via decodeFramesAhead:
-    NSLog(@"AlphaVideoGpuView: Streaming setup complete - frames will be decoded on-demand during playback");
+    AVG_VLOG(@"Streaming setup complete - frames will be decoded on-demand during playback");
   });
 }
 
@@ -1158,7 +1216,7 @@
   if (!_dstream || !_compressedData || !_streamingRingBufferMode) {
     static int skipCount = 0;
     if (skipCount++ < 5) {
-      NSLog(@"AlphaVideoGpuView: decodeFramesAhead skipping - dstream=%p, compressedData=%p, ringMode=%d",
+      AVG_VLOG(@"decodeFramesAhead skipping - dstream=%p, compressedData=%p, ringMode=%d",
             _dstream, _compressedData, _streamingRingBufferMode);
     }
     return;
@@ -1176,7 +1234,7 @@
   if (framesToDecode <= 0) {
     static int skipLogCount = 0;
     if (skipLogCount++ < 10 || skipLogCount % 60 == 0) {
-      NSLog(@"AlphaVideoGpuView: decodeFramesAhead skipping - vPos=%ld, decodeVPos=%ld, framesAhead=%ld (already ahead enough)",
+      AVG_VLOG(@"decodeFramesAhead skipping - vPos=%ld, decodeVPos=%ld, framesAhead=%ld (already ahead enough)",
             (long)currentVirtualPos, (long)currentDecodeVPos, (long)framesAhead);
     }
     return;  // Already ahead enough
@@ -1186,7 +1244,7 @@
   if (decodeLogCount++ < 20 || framesToDecode > 0) {
     static int logThrottle = 0;
     if (logThrottle++ % 30 == 0 || framesToDecode > 0) {
-      NSLog(@"AlphaVideoGpuView: decodeFramesAhead vPos=%ld, decodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, decoderPos=%ld, decoderLoop=%ld",
+      AVG_VLOG(@"decodeFramesAhead vPos=%ld, decodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, decoderPos=%ld, decoderLoop=%ld",
             (long)currentVirtualPos, (long)currentDecodeVPos, (long)framesAhead, (long)framesToDecode,
             (long)_decoderPosition, (long)_decoderLoopIteration);
     }
@@ -1210,7 +1268,7 @@
       [_frameAccumulator setLength:0];
       _streamHeaderSkipped = NO;
       
-      NSLog(@"AlphaVideoGpuView: Decoder wrap-around: loop %ld, resetting input.pos from %zu to 0", 
+      AVG_VLOG(@"Decoder wrap-around: loop %ld, resetting input.pos from %zu to 0", 
             (long)_decoderLoopIteration, input.pos);
       
       // After wrap-around, recalculate how many frames we need to decode
@@ -1219,10 +1277,10 @@
       NSInteger newFramesAhead = (newDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
       framesToDecode = self.streamingPrefetchAhead - newFramesAhead;
       if (framesToDecode <= 0) {
-        NSLog(@"AlphaVideoGpuView: After wrap-around: already ahead enough, stopping decode");
+        AVG_VLOG(@"After wrap-around: already ahead enough, stopping decode");
         break;
       }
-      NSLog(@"AlphaVideoGpuView: After wrap-around: newDecodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, inputSize=%zu",
+      AVG_VLOG(@"After wrap-around: newDecodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, inputSize=%zu",
             (long)newDecodeVPos, (long)newFramesAhead, (long)framesToDecode, input.size);
       // Don't continue - fall through to decompress the header and first frames
       // The continue was causing us to skip decompression after wrap-around
@@ -1264,7 +1322,7 @@
       }
       decompressLoopCount++;
       if (result == 0) {
-        NSLog(@"AlphaVideoGpuView: ZSTD stream ended at decoderPos=%ld, inputPos=%zu/%zu, accumLen=%lu",
+        AVG_VLOG(@"ZSTD stream ended at decoderPos=%ld, inputPos=%zu/%zu, accumLen=%lu",
               (long)_decoderPosition, input.pos, input.size, (unsigned long)_frameAccumulator.length);
         break;  // Stream ended
       }
@@ -1274,7 +1332,7 @@
     if (_frameAccumulator.length < _streamBytesPerLayer && decompressLoopCount == 0) {
       static int noProgressCount = 0;
       if (noProgressCount++ < 10) {
-        NSLog(@"AlphaVideoGpuView: No decompression progress - accumLen=%lu, bytesPerLayer=%u, inputPos=%zu/%zu, decoderPos=%ld",
+        AVG_VLOG(@"No decompression progress - accumLen=%lu, bytesPerLayer=%u, inputPos=%zu/%zu, decoderPos=%ld",
               (unsigned long)_frameAccumulator.length, _streamBytesPerLayer, input.pos, input.size, (long)_decoderPosition);
       }
     }
@@ -1316,7 +1374,7 @@
         // Upload frame to GPU
         static int uploadLogCount = 0;
         if (uploadLogCount++ < 30) {
-          NSLog(@"AlphaVideoGpuView: Uploading frame %ld to GPU slot %ld (vPos=%ld, loop=%ld)", 
+          AVG_VLOG(@"Uploading frame %ld to GPU slot %ld (vPos=%ld, loop=%ld)", 
                 (long)_decoderPosition, (long)gpuSlot, (long)virtualPos, (long)_decoderLoopIteration);
         }
         [self uploadFrameToGPU:_frameAccumulator.bytes slot:gpuSlot];
@@ -1443,7 +1501,7 @@
   if (!frameData) {
     static int missCount = 0;
     if (missCount++ < 30) {
-      NSLog(@"AlphaVideoGpuView: ensureFrameInGPU - cache miss for vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu",
+      AVG_VLOG(@"ensureFrameInGPU - cache miss for vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu",
             (long)virtualPos, (long)gpuSlot, (long)slotVPos, (unsigned long)_frameCache.count);
     }
     return;
@@ -1452,7 +1510,7 @@
   // Upload to GPU
   static int ensureUploadCount = 0;
   if (ensureUploadCount++ < 30) {
-    NSLog(@"AlphaVideoGpuView: ensureFrameInGPU - uploading vPos=%ld to slot=%ld from cache",
+    AVG_VLOG(@"ensureFrameInGPU - uploading vPos=%ld to slot=%ld from cache",
           (long)virtualPos, (long)gpuSlot);
   }
   [self uploadFrameToGPU:frameData.bytes slot:gpuSlot];
@@ -1506,7 +1564,7 @@
 
 - (BOOL)checkAndPlayUncompressedStreaming:(NSString *)filePath
 {
-  NSLog(@"AlphaVideoGpuView: checkAndPlayUncompressedStreaming: %@", filePath);
+  AVG_VLOG(@"checkAndPlayUncompressedStreaming: %@", filePath);
   
   // Open file
   int fd = open([filePath UTF8String], O_RDONLY);
@@ -1548,7 +1606,7 @@
   uint32_t kvdOffset = *(uint32_t *)(headerBytes + 56);
   uint32_t kvdLength = *(uint32_t *)(headerBytes + 60);
   
-  NSLog(@"AlphaVideoGpuView: checkAndPlayUncompressedStreaming: kvdOffset=%u, kvdLength=%u", kvdOffset, kvdLength);
+  AVG_VLOG(@"checkAndPlayUncompressedStreaming: kvdOffset=%u, kvdLength=%u", kvdOffset, kvdLength);
   
   if (kvdLength == 0 || kvdOffset == 0) {
     close(fd);
@@ -1583,7 +1641,7 @@
     return NO;
   }
   
-  NSLog(@"AlphaVideoGpuView: Detected uncompressed streaming KTX2 - using mmap");
+  AVG_VLOG(@"Detected uncompressed streaming KTX2 - using mmap");
   
   // Memory map the file
   void *mmapData = mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -1612,7 +1670,7 @@
   [self configureASTCFormatFromVkFormat:vkFormat];
   uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
   
-  NSLog(@"AlphaVideoGpuView: Uncompressed streaming: %ux%u, %u layers, %u bytes/layer (ASTC %ux%u), offset=%llu",
+  AVG_VLOG(@"Uncompressed streaming: %ux%u, %u layers, %u bytes/layer (ASTC %ux%u), offset=%llu",
         width, height, layerCount, bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
   
   // Determine GPU cache size
@@ -1671,7 +1729,7 @@
       return;
     }
     
-    NSLog(@"AlphaVideoGpuView: Created uncompressed streaming texture array: %ux%u, %ld GPU slots",
+    AVG_VLOG(@"Created uncompressed streaming texture array: %ux%u, %ld GPU slots",
           width, height, (long)gpuCacheSize);
     
     self->_isSourceLoaded = YES;
@@ -1684,7 +1742,7 @@
       // Simulator: decode ASTC to RGBA on background, then upload to GPU
       dispatch_async(self->_astcDecodeQueue, ^{
         NSInteger framesToPreload = MIN(gpuCacheSize, (NSInteger)layerCount);
-        NSLog(@"AlphaVideoGpuView: Pre-decoding %ld initial frames for uncompressed streaming (simulator)", (long)framesToPreload);
+        AVG_VLOG(@"Pre-decoding %ld initial frames for uncompressed streaming (simulator)", (long)framesToPreload);
         
         for (NSInteger i = 0; i < framesToPreload && self->_mmapData; i++) {
           // Decode ASTC to RGBA
@@ -1732,7 +1790,7 @@
             self->_ringSlots[slot] = @(i);
           }
           
-          NSLog(@"AlphaVideoGpuView: Pre-decode complete, starting playback");
+          AVG_VLOG(@"Pre-decode complete, starting playback");
           
           if (self.autoPlay && !self.reactPaused) {
             [self play];
@@ -1743,7 +1801,7 @@
       // Real device: direct upload (fast, no ASTC decode needed)
       dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
         NSInteger framesToPreload = MIN(gpuCacheSize, (NSInteger)layerCount);
-        NSLog(@"AlphaVideoGpuView: Pre-uploading %ld initial frames for uncompressed streaming (device)", (long)framesToPreload);
+        AVG_VLOG(@"Pre-uploading %ld initial frames for uncompressed streaming (device)", (long)framesToPreload);
         
         for (NSInteger i = 0; i < framesToPreload; i++) {
           NSInteger slot = i % gpuCacheSize;
@@ -1751,7 +1809,7 @@
           self->_ringSlots[slot] = @(i);
         }
         
-        NSLog(@"AlphaVideoGpuView: Pre-upload complete, starting playback");
+        AVG_VLOG(@"Pre-upload complete, starting playback");
         
         dispatch_async(dispatch_get_main_queue(), ^{
           if (self.autoPlay && !self.reactPaused) {
@@ -1801,7 +1859,7 @@
       NSString *metadataJson = [[NSString alloc] initWithBytes:(bytes + valueStart) 
                                                         length:(valueEnd - valueStart) 
                                                       encoding:NSUTF8StringEncoding];
-      NSLog(@"AlphaVideoGpuView: extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
+      AVG_VLOG(@"extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
       return metadataJson;
     }
     
@@ -1984,7 +2042,7 @@
   }
 }
 
-- (void)applyMetadataAndLoadTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri
+- (void)applyMetadataAndLoadTextures:(NSDictionary *)metadata sourcePath:(NSString *)sourcePath
 {
   
   // Parse metadata (support both new 'part' and legacy 'strip' terminology)
@@ -2007,15 +2065,15 @@
   _useTextureArray = [packingMode isEqualToString:@"array"];
   _textureArrayLayerCount = [metadata[@"layerCount"] integerValue] ?: self.totalFrames;
   
-  NSLog(@"AlphaVideoGpuView: Metadata: %ld frames, %ldx%ld, %.1f fps, %ld parts, mode=%@, packing=%@",
+  AVG_VLOG(@"Metadata: %ld frames, %ldx%ld, %.1f fps, %ld parts, mode=%@, packing=%@",
         (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight,
         self.frameRate, (long)self.partCount, mode ?: @"uastc", packingMode ?: @"atlas");
   
   // Load textures based on packing mode
   if (_useTextureArray) {
-    [self loadTextureArray:metadata sourceUri:sourceUri isNativeASTC:isNativeASTC];
+    [self loadTextureArray:metadata sourcePath:sourcePath isNativeASTC:isNativeASTC];
   } else {
-    [self loadPartTextures:metadata basePath:basePath sourceUri:sourceUri isNativeASTC:isNativeASTC];
+    [self loadPartTextures:metadata sourcePath:sourcePath isNativeASTC:isNativeASTC];
   }
 }
 
@@ -2072,7 +2130,7 @@
     }
   }
   
-  NSLog(@"AlphaVideoGpuView: Decoded ASTC %ux%u (%u x %u blocks, block=%ux%u) to RGBA", width, height, blocksX, blocksY, bw, bh);
+  AVG_VLOG(@"Decoded ASTC %ux%u (%u x %u blocks, block=%ux%u) to RGBA", width, height, blocksX, blocksY, bw, bh);
   return rgbaData;
 }
 
@@ -2095,7 +2153,7 @@
   *outWidth = pixelWidth;
   *outHeight = pixelHeight;
   
-  NSLog(@"AlphaVideoGpuView: Native ASTC - VkFormat=%u, %ux%u, supercompression=%u",
+  AVG_VLOG(@"Native ASTC - VkFormat=%u, %ux%u, supercompression=%u",
         vkFormat, pixelWidth, pixelHeight, supercompressionScheme);
   
   // Configure ASTC format from vkFormat (sets _metalPixelFormat, _astcBlockWidth, _astcBlockHeight)
@@ -2107,7 +2165,7 @@
   uint64_t level0ByteLength = *(uint64_t *)(bytes + 88);
   uint64_t level0UncompressedLength = *(uint64_t *)(bytes + 96);
   
-  NSLog(@"AlphaVideoGpuView: Level 0 - offset=%llu, length=%llu, uncompressed=%llu",
+  AVG_VLOG(@"Level 0 - offset=%llu, length=%llu, uncompressed=%llu",
         level0ByteOffset, level0ByteLength, level0UncompressedLength);
   
   if (level0ByteOffset + level0ByteLength > ktx2Data.length) {
@@ -2119,7 +2177,7 @@
   
   if (supercompressionScheme == 2) {
     // Zstandard compression - use basis_universal's bundled zstd
-    NSLog(@"AlphaVideoGpuView: Decompressing Zstandard data...");
+    AVG_VLOG(@"Decompressing Zstandard data...");
     
     const uint8_t *compressedData = bytes + level0ByteOffset;
     size_t compressedSize = (size_t)level0ByteLength;
@@ -2145,7 +2203,7 @@
     }
     
     textureData = decompressedData;
-    NSLog(@"AlphaVideoGpuView: Decompressed %zu bytes", decodedSize);
+    AVG_VLOG(@"Decompressed %zu bytes", decodedSize);
   } else if (supercompressionScheme == 0) {
     // No supercompression
     textureData = [NSData dataWithBytes:(bytes + level0ByteOffset) length:(size_t)level0ByteLength];
@@ -2197,27 +2255,45 @@
     return nil;
   }
   
-  NSLog(@"AlphaVideoGpuView: Transcoded UASTC %ux%u (%u bytes)", width, height, dataSize);
+  AVG_VLOG(@"Transcoded UASTC %ux%u (%u bytes)", width, height, dataSize);
   return transcodedData;
 }
 
-- (NSString *)getPartPath:(NSInteger)partIndex partsArray:(NSArray *)partsArray basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri useExplicitParts:(BOOL)useExplicitParts
+/**
+ * The URI of a part file: from the parts prop, else the file the metadata names (or
+ * <name>_<index>.ktx2) in the source's folder. Nil when the source has no folder.
+ */
+- (NSString *)partURIAtIndex:(NSInteger)partIndex partsArray:(NSArray *)partsArray useExplicitParts:(BOOL)useExplicitParts
 {
-  if (useExplicitParts && partIndex < self.parts.count) {
-    NSDictionary *partDict = self.parts[partIndex];
-    return partDict[@"uri"];
-  } else if (self.partCount > 1 && partsArray && partIndex < partsArray.count) {
-    NSString *partFilename = partsArray[partIndex][@"file"];
-    if (partFilename) {
-      return [basePath stringByAppendingPathComponent:partFilename];
-    } else {
-      NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
-      baseName = [baseName stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
-      return [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld.ktx2", baseName, (long)partIndex]];
-    }
-  } else {
-    return sourceUri;
+  if (useExplicitParts && partIndex < (NSInteger)self.parts.count) {
+    return self.parts[partIndex][@"uri"];
   }
+  NSString *fileName = partIndex < (NSInteger)partsArray.count ? partsArray[partIndex][@"file"] : nil;
+  if (!fileName) {
+    NSString *name = [[_sourceUri componentsSeparatedByString:@"?"].firstObject lastPathComponent];
+    name = [name stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
+    name = [name stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
+    fileName = [NSString stringWithFormat:@"%@_%ld.ktx2", name, (long)partIndex];
+  }
+  return AVGSiblingURI(_sourceUri, fileName);
+}
+
+/**
+ * The cache key for a downloaded part: its own key from the parts prop, else the source's key
+ * with the index before the extension (glow.ktx2 becomes glow_1.ktx2).
+ */
+- (NSString *)partCacheKeyAtIndex:(NSInteger)partIndex useExplicitParts:(BOOL)useExplicitParts
+{
+  if (useExplicitParts && partIndex < (NSInteger)self.parts.count) {
+    NSString *key = self.parts[partIndex][@"cacheKey"];
+    if ([key isKindOfClass:[NSString class]] && key.length > 0) return key;
+  }
+  NSString *key = _loadedCacheKey;
+  if (key.length == 0) return nil;
+  NSString *ext = key.pathExtension;
+  NSString *base = ext.length > 0 ? key.stringByDeletingPathExtension : key;
+  NSString *indexed = [NSString stringWithFormat:@"%@_%ld", base, (long)partIndex];
+  return ext.length > 0 ? [indexed stringByAppendingPathExtension:ext] : indexed;
 }
 
 #pragma mark - Texture Array Loading
@@ -2226,7 +2302,7 @@
  * Load a KTX2 texture array (one frame per layer).
  * Uses Metal's MTLTextureType2DArray for efficient frame switching.
  */
-- (void)loadTextureArray:(NSDictionary *)metadata sourceUri:(NSString *)sourceUri isNativeASTC:(BOOL)isNativeASTC
+- (void)loadTextureArray:(NSDictionary *)metadata sourcePath:(NSString *)filePath isNativeASTC:(BOOL)isNativeASTC
 {
   _cachedMetadata = metadata;
   _isNativeASTC = isNativeASTC;
@@ -2236,39 +2312,7 @@
   
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
     // Load the KTX2 file
-    NSData *ktx2Data = nil;
-    NSString *filePath = nil;
-    
-    if ([sourceUri hasPrefix:@"http://"] || [sourceUri hasPrefix:@"https://"]) {
-      ktx2Data = [self loadDataFromURLWithCaching:sourceUri partIndex:0];
-      // For streaming mode, we need the cached file path
-      // Compute it the same way as loadDataFromURLWithCaching
-      if (streamMode) {
-        NSFileManager *fileManager = [NSFileManager defaultManager];
-        NSURL *cachesDir = [[fileManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
-        if (self.cacheKey && self.cacheKey.length > 0) {
-          filePath = [[cachesDir URLByAppendingPathComponent:self.cacheKey] path];
-        } else {
-          NSURL *ktx2CacheDir = [cachesDir URLByAppendingPathComponent:@"ktx2-cache"];
-          const char *urlCString = [sourceUri UTF8String];
-          unsigned long hash = 5381;
-          int c;
-          while ((c = *urlCString++)) {
-            hash = ((hash << 5) + hash) + c;
-          }
-          NSString *cacheFileName = [NSString stringWithFormat:@"%016lx.ktx2", hash];
-          filePath = [[ktx2CacheDir URLByAppendingPathComponent:cacheFileName] path];
-        }
-        NSLog(@"AlphaVideoGpuView: Streaming mode - using cached file path: %@", filePath);
-      }
-    } else if ([sourceUri hasPrefix:@"file://"]) {
-      NSURL *fileURL = [NSURL URLWithString:sourceUri];
-      filePath = [fileURL path];
-      ktx2Data = [NSData dataWithContentsOfURL:fileURL];
-    } else {
-      filePath = sourceUri;
-      ktx2Data = [NSData dataWithContentsOfFile:sourceUri];
-    }
+    NSData *ktx2Data = [NSData dataWithContentsOfFile:filePath options:NSDataReadingMappedIfSafe error:nil];
     
     if (!ktx2Data || ktx2Data.length < 104) {
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -2295,12 +2339,12 @@
       [self configureASTCFormatFromVkFormat:vkFormat];
     });
     
-    NSLog(@"AlphaVideoGpuView: Texture array: %ux%u, %u layers, supercompression=%u, streamMode=%d, vkFormat=%u",
+    AVG_VLOG(@"Texture array: %ux%u, %u layers, supercompression=%u, streamMode=%d, vkFormat=%u",
           width, height, layerCount, supercompressionScheme, streamMode, vkFormat);
     
     // Check for internal zstd streaming mode
     if (streamMode && supercompressionScheme == 2 && filePath) {
-      NSLog(@"AlphaVideoGpuView: Using internal zstd streaming mode");
+      AVG_VLOG(@"Using internal zstd streaming mode");
       [self loadInternalZstdStreamingTextureArray:filePath
                                             width:width
                                            height:height
@@ -2333,7 +2377,7 @@
       }
       
       astcData = decompressedData;
-      NSLog(@"AlphaVideoGpuView: Decompressed %llu -> %zu bytes", level0Length, result);
+      AVG_VLOG(@"Decompressed %llu -> %zu bytes", level0Length, result);
     } else {
       // Uncompressed
       astcData = [NSData dataWithBytes:bytes + level0Offset length:(NSUInteger)level0Length];
@@ -2344,13 +2388,13 @@
     uint32_t blocksY = (height + _astcBlockHeight - 1) / _astcBlockHeight;
     uint32_t bytesPerLayer = blocksX * blocksY * 16;
     
-    NSLog(@"AlphaVideoGpuView: ASTC data: %lu bytes, %u bytes/layer (ASTC %ux%u), %u layers",
+    AVG_VLOG(@"ASTC data: %lu bytes, %u bytes/layer (ASTC %ux%u), %u layers",
           (unsigned long)astcData.length, bytesPerLayer, _astcBlockWidth, _astcBlockHeight, layerCount);
     
     // Pre-decode ASTC to RGBA on background thread for simulator (avoid main thread freeze)
     NSMutableArray<NSData *> *decodedLayers = nil;
     if (!self->_useCompressedFormat) {
-      NSLog(@"AlphaVideoGpuView: Pre-decoding %u ASTC layers to RGBA on background thread (simulator)", layerCount);
+      AVG_VLOG(@"Pre-decoding %u ASTC layers to RGBA on background thread (simulator)", layerCount);
       decodedLayers = [NSMutableArray arrayWithCapacity:layerCount];
       const uint8_t *astcBytes = (const uint8_t *)[astcData bytes];
       
@@ -2365,7 +2409,7 @@
           [decodedLayers addObject:[NSData data]];
         }
       }
-      NSLog(@"AlphaVideoGpuView: Pre-decode complete, uploading to GPU");
+      AVG_VLOG(@"Pre-decode complete, uploading to GPU");
     }
     
     // Create texture array and upload on main thread (fast - just memcpy)
@@ -2451,14 +2495,14 @@
         [cmdBuf waitUntilCompleted];  // Wait for blit to complete before releasing staging
         
         // Staging texture will be released when it goes out of scope
-        NSLog(@"AlphaVideoGpuView: Blitted staging texture to Private storage");
+        AVG_VLOG(@"Blitted staging texture to Private storage");
       }
       
       self->_textureArrayLayerCount = layerCount;
       self->_isSourceLoaded = YES;
       self->_isSourceLoading = NO;
       
-      NSLog(@"AlphaVideoGpuView: ✓ Texture array loaded: %ux%u, %u layers (Private storage: %@)", 
+      AVG_VLOG(@"✓ Texture array loaded: %ux%u, %u layers (Private storage: %@)", 
             width, height, layerCount, usePrivateStorage ? @"YES" : @"NO");
       
       [self notifyLoad];
@@ -2475,7 +2519,7 @@
 
 /**
  * Load a KTX2 texture array with internal zstd compression using streaming decompression.
- * This is similar to loadStreamingKTX2WithSource but for internal zstd (supercompressionScheme=2)
+ * This is similar to loadStreamingKTX2FromFile but for internal zstd (supercompressionScheme=2)
  * where the KTX2 header is uncompressed and only level0 data is zstd compressed.
  */
 - (void)loadInternalZstdStreamingTextureArray:(NSString *)filePath
@@ -2486,8 +2530,8 @@
                                  level0Length:(uint64_t)level0Length
                                      metadata:(NSDictionary *)metadata
 {
-  NSLog(@"AlphaVideoGpuView: Starting internal zstd streaming: %@", filePath);
-  NSLog(@"AlphaVideoGpuView: Internal zstd: %ux%u, %u layers, offset=%llu, compressedSize=%llu",
+  AVG_VLOG(@"Starting internal zstd streaming: %@", filePath);
+  AVG_VLOG(@"Internal zstd: %ux%u, %u layers, offset=%llu, compressedSize=%llu",
         width, height, layerCount, level0Offset, level0Length);
   
   // Open file and mmap only the compressed data portion
@@ -2559,7 +2603,7 @@
       MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
       MIN(self.streamingRingSize, (NSInteger)layerCount);
   
-  NSLog(@"AlphaVideoGpuView: Internal zstd streaming params: strategy=%@, gpuCache=%ld, bytesPerLayer=%u (ASTC %ux%u)",
+  AVG_VLOG(@"Internal zstd streaming params: strategy=%@, gpuCache=%ld, bytesPerLayer=%u (ASTC %ux%u)",
         self.memoryStrategy, (long)gpuCacheSize, bytesPerLayer, _astcBlockWidth, _astcBlockHeight);
   
   // Store streaming state
@@ -2625,7 +2669,7 @@
       return;
     }
     
-    NSLog(@"AlphaVideoGpuView: Created internal zstd streaming texture array: %ux%u, %ld GPU slots",
+    AVG_VLOG(@"Created internal zstd streaming texture array: %ux%u, %ld GPU slots",
           width, height, (long)gpuCacheSize);
     
     // Pre-decode initial frames
@@ -2641,10 +2685,10 @@
     }
   });
   
-  NSLog(@"AlphaVideoGpuView: Internal zstd streaming setup complete");
+  AVG_VLOG(@"Internal zstd streaming setup complete");
 }
 
-- (void)loadPartTextures:(NSDictionary *)metadata basePath:(NSString *)basePath sourceUri:(NSString *)sourceUri isNativeASTC:(BOOL)isNativeASTC
+- (void)loadPartTextures:(NSDictionary *)metadata sourcePath:(NSString *)sourcePath isNativeASTC:(BOOL)isNativeASTC
 {
   _cachedMetadata = metadata;
   _isNativeASTC = isNativeASTC;
@@ -2656,18 +2700,18 @@
     
     // Check if we're loading from GLB container
     if (self->_isGLBContainer && self->_glbKtx2Parts && self->_glbKtx2Parts.count > 0) {
-      NSLog(@"AlphaVideoGpuView: Loading %lu KTX2 parts from GLB container...", (unsigned long)self->_glbKtx2Parts.count);
+      AVG_VLOG(@"Loading %lu KTX2 parts from GLB container...", (unsigned long)self->_glbKtx2Parts.count);
       
       for (NSInteger i = 0; i < (NSInteger)self->_glbKtx2Parts.count; i++) {
         NSData *ktx2Data = self->_glbKtx2Parts[i];
-        NSLog(@"AlphaVideoGpuView: GLB part %ld size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
+        AVG_VLOG(@"GLB part %ld size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
         
         uint32_t width = 0, height = 0;
         NSData *textureData = nil;
         uint32_t blocksX = 0, blocksY = 0;
         
         if (isNativeASTC) {
-          NSLog(@"AlphaVideoGpuView: Using native ASTC loader for GLB part %ld", (long)i);
+          AVG_VLOG(@"Using native ASTC loader for GLB part %ld", (long)i);
           textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
           
           if (!textureData) {
@@ -2679,7 +2723,7 @@
           blocksY = (height + self->_astcBlockHeight - 1) / self->_astcBlockHeight;
           
           if (!self->_useCompressedFormat) {
-            NSLog(@"AlphaVideoGpuView: ASTC not supported - decoding to RGBA");
+            AVG_VLOG(@"ASTC not supported - decoding to RGBA");
             textureData = [self decodeASTCToRGBA:textureData width:width height:height];
             if (!textureData) {
               NSLog(@"AlphaVideoGpuView: Failed to decode ASTC to RGBA for GLB part %ld", (long)i);
@@ -2727,7 +2771,7 @@
           @"blocksY": @(blocksY)
         }];
         
-        NSLog(@"AlphaVideoGpuView: Loaded GLB part %ld: %ux%u", (long)i, width, height);
+        AVG_VLOG(@"Loaded GLB part %ld: %ux%u", (long)i, width, height);
       }
     } else {
       // Load from separate files (original behavior)
@@ -2735,34 +2779,25 @@
       NSInteger actualPartCount = useExplicitParts ? self.parts.count : self.partCount;
       
       for (NSInteger i = 0; i < actualPartCount; i++) {
-        NSString *partPath;
-        
-        if (useExplicitParts && i < self.parts.count) {
-          NSDictionary *partDict = self.parts[i];
-          partPath = partDict[@"uri"];
-        } else if (self.partCount > 1 && partsArray && i < partsArray.count) {
-          NSString *partFilename = partsArray[i][@"file"];
-          if (partFilename) {
-            partPath = [basePath stringByAppendingPathComponent:partFilename];
-          } else {
-            NSString *baseName = [[sourceUri lastPathComponent] stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
-            baseName = [baseName stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
-            partPath = [basePath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld.ktx2", baseName, (long)i]];
-          }
+        // A single-file atlas is its own part 0
+        NSString *partUri = actualPartCount > 1
+            ? [self partURIAtIndex:i partsArray:partsArray useExplicitParts:useExplicitParts]
+            : self->_sourceUri;
+        NSString *partPath = nil;
+        NSString *resolveError = nil;
+        if (!partUri) {
+          resolveError = @"no folder to find it in; pass the parts prop";
+        } else if ([partUri isEqualToString:self->_sourceUri]) {
+          partPath = sourcePath;
         } else {
-          partPath = sourceUri;
+          partPath = AVGResolveSource(partUri, [self partCacheKeyAtIndex:i useExplicitParts:useExplicitParts], &resolveError);
         }
         
-        NSLog(@"AlphaVideoGpuView: Loading part %ld: %@%@", (long)i, partPath, useExplicitParts ? @" (explicit)" : @"");
+        AVG_VLOG(@"Loading part %ld: %@%@", (long)i, partUri, useExplicitParts ? @" (explicit)" : @"");
         
-        NSData *ktx2Data = nil;
-        if ([partPath hasPrefix:@"http://"] || [partPath hasPrefix:@"https://"]) {
-          ktx2Data = [self loadDataFromURLWithCaching:partPath partIndex:i];
-        } else if ([partPath hasPrefix:@"file://"]) {
-          NSURL *fileURL = [NSURL URLWithString:partPath];
-          ktx2Data = [NSData dataWithContentsOfURL:fileURL];
-        } else {
-          ktx2Data = [NSData dataWithContentsOfFile:partPath];
+        NSData *ktx2Data = partPath ? [NSData dataWithContentsOfFile:partPath] : nil;
+        if (resolveError) {
+          NSLog(@"AlphaVideoGpuView: Can't load part %ld (%@): %@", (long)i, partUri, resolveError);
         }
         
         if (!ktx2Data) {
@@ -2770,7 +2805,7 @@
           continue;
         }
         
-        NSLog(@"AlphaVideoGpuView: Part %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
+        AVG_VLOG(@"Part %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
         
         uint32_t width = 0, height = 0;
         NSData *textureData = nil;
@@ -2778,7 +2813,7 @@
         
         if (isNativeASTC) {
           // Native ASTC mode - load directly without transcoding
-          NSLog(@"AlphaVideoGpuView: Using native ASTC loader for part %ld", (long)i);
+          AVG_VLOG(@"Using native ASTC loader for part %ld", (long)i);
           textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
           
           if (!textureData) {
@@ -2791,8 +2826,8 @@
           
           // Check if we need to decode ASTC to RGBA (simulator or unsupported device)
           if (!self->_useCompressedFormat) {
-            NSLog(@"AlphaVideoGpuView: ASTC not supported - decoding to RGBA (simulator/fallback mode)");
-            NSLog(@"AlphaVideoGpuView: Note: ASTC textures require a real device for optimal performance");
+            AVG_VLOG(@"ASTC not supported - decoding to RGBA (simulator/fallback mode)");
+            AVG_VLOG(@"Note: ASTC textures require a real device for optimal performance");
             textureData = [self decodeASTCToRGBA:textureData width:width height:height];
             if (!textureData) {
               NSLog(@"AlphaVideoGpuView: Failed to decode ASTC to RGBA for part %ld", (long)i);
@@ -2814,7 +2849,7 @@
           
           width = transcoder.get_width();
           height = transcoder.get_height();
-          NSLog(@"AlphaVideoGpuView: Part %ld dimensions: %dx%d", (long)i, width, height);
+          AVG_VLOG(@"Part %ld dimensions: %dx%d", (long)i, width, height);
           
           // Calculate transcoded data size
           uint32_t dataSize;
@@ -2847,14 +2882,14 @@
           @"isNativeASTC": @(isNativeASTC)
         }];
         
-        NSLog(@"AlphaVideoGpuView: %@ part %ld successfully", isNativeASTC ? @"Loaded native ASTC" : @"Transcoded", (long)i);
+        AVG_VLOG(@"%@ part %ld successfully", isNativeASTC ? @"Loaded native ASTC" : @"Transcoded", (long)i);
       }
     }
     
     // Dispatch to main thread for Metal texture creation and UI updates
     dispatch_async(dispatch_get_main_queue(), ^{
       if (self->_isDestroyed) {
-        NSLog(@"AlphaVideoGpuView: View destroyed during loading, aborting");
+        AVG_VLOG(@"View destroyed during loading, aborting");
         return;
       }
       
@@ -2888,13 +2923,13 @@
         [partWidths addObject:@(width)];
         [partHeights addObject:@(height)];
         
-        NSLog(@"AlphaVideoGpuView: Created texture %p (%dx%d)", texture, width, height);
+        AVG_VLOG(@"Created texture %p (%dx%d)", texture, width, height);
       }
       
       self.partTextures = [textures copy];
       self->_partWidths = [partWidths copy];
       self->_partHeights = [partHeights copy];
-      NSLog(@"AlphaVideoGpuView: Loaded %lu part textures total", (unsigned long)self.partTextures.count);
+      AVG_VLOG(@"Loaded %lu part textures total", (unsigned long)self.partTextures.count);
       
       if (self.partTextures.count == 0) {
         [self notifyError:@"No textures loaded"];
@@ -2917,11 +2952,11 @@
 
 - (void)play
 {
-  NSLog(@"AlphaVideoGpuView: play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu, gpuPlayback=%d", 
+  AVG_VLOG(@"play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu, gpuPlayback=%d", 
         self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count, self.gpuPlayback);
   
   if (!self.isPlaying && self.totalFrames > 0) {
-    NSLog(@"AlphaVideoGpuView: Starting playback...");
+    AVG_VLOG(@"Starting playback...");
     self.isPlaying = YES;
     self.lastFrameTime = CACurrentMediaTime();
     
@@ -2976,7 +3011,7 @@
 {
   if (_reactPaused != newPaused) {
     _reactPaused = newPaused;
-    NSLog(@"AlphaVideoGpuView: setReactPaused: %d", newPaused);
+    AVG_VLOG(@"setReactPaused: %d", newPaused);
     
     if (newPaused) {
       // Stop playback
@@ -3073,7 +3108,7 @@
             // Frame not ready yet - skip this update
             static int notReadyCount = 0;
             if (notReadyCount++ < 20) {
-              NSLog(@"AlphaVideoGpuView: Frame not ready - frame=%ld, vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu, decoderPos=%ld",
+              AVG_VLOG(@"Frame not ready - frame=%ld, vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu, decoderPos=%ld",
                     (long)self.currentFrame, (long)virtualPos, (long)gpuSlot, (long)slotVPos, 
                     (unsigned long)_frameCache.count, (long)_decoderPosition);
             }
@@ -3090,14 +3125,14 @@
           if (_streamingRingBufferMode) {
             _playbackLoopIteration++;
             NSInteger nextVPos = (_playbackLoopIteration * self.totalFrames) % (self.totalFrames * 2);
-            NSLog(@"AlphaVideoGpuView: Playback loop wrap-around: iteration %ld, nextVPos=%ld, decoderLoop=%ld, decoderPos=%ld, cacheSize=%lu",
+            AVG_VLOG(@"Playback loop wrap-around: iteration %ld, nextVPos=%ld, decoderLoop=%ld, decoderPos=%ld, cacheSize=%lu",
                   (long)_playbackLoopIteration, (long)nextVPos, (long)_decoderLoopIteration, (long)_decoderPosition, (unsigned long)_frameCache.count);
             // Log first few slot states
-            for (int i = 0; i < MIN(4, _streamingRingBufferSize); i++) {
-              NSLog(@"  slot[%d] = vPos %ld", i, (long)[_ringSlots[i] integerValue]);
+            for (int i = 0; self.verbose && i < MIN(4, _streamingRingBufferSize); i++) {
+              AVG_VLOG(@"  slot[%d] = vPos %ld", i, (long)[_ringSlots[i] integerValue]);
             }
             // Log if next frame is in cache
-            NSLog(@"  cache has nextVPos=%ld: %@", (long)nextVPos, _frameCache[@(nextVPos)] ? @"YES" : @"NO");
+            AVG_VLOG(@"  cache has nextVPos=%ld: %@", (long)nextVPos, _frameCache[@(nextVPos)] ? @"YES" : @"NO");
             
             // CRITICAL: Immediately upload frame 0 of new loop to GPU before next render
             // This prevents showing stale frame from previous loop
@@ -3209,7 +3244,7 @@
   // Check for texture array mode
   if (_useTextureArray && _textureArray && _arrayPipelineState) {
     if (drawCount < 5) {
-      NSLog(@"AlphaVideoGpuView: drawInMTKView - rendering texture array frame %ld", (long)self.currentFrame);
+      AVG_VLOG(@"drawInMTKView - rendering texture array frame %ld", (long)self.currentFrame);
       drawCount++;
     }
     
@@ -3282,14 +3317,14 @@
   // Standard atlas mode rendering
   if (!self.currentTexture || !self.pipelineState) {
     if (drawCount < 5) {
-      NSLog(@"AlphaVideoGpuView: drawInMTKView - skipping (texture=%p, pipeline=%p)", self.currentTexture, self.pipelineState);
+      AVG_VLOG(@"drawInMTKView - skipping (texture=%p, pipeline=%p)", self.currentTexture, self.pipelineState);
     }
     drawCount++;
     return;
   }
   
   if (drawCount < 5) {
-    NSLog(@"AlphaVideoGpuView: drawInMTKView - rendering frame %ld", (long)self.currentFrame);
+    AVG_VLOG(@"drawInMTKView - rendering frame %ld", (long)self.currentFrame);
     drawCount++;
   }
   
@@ -3322,7 +3357,7 @@
 
 - (void)cleanup
 {
-  NSLog(@"AlphaVideoGpuView: cleanup");
+  AVG_VLOG(@"cleanup");
   _isDestroyed = YES;
   _isSourceLoaded = NO;
   _isSourceLoading = NO;
@@ -3374,18 +3409,22 @@
   
   if (newSuperview == nil) {
     // View is being removed - cleanup
-    NSLog(@"AlphaVideoGpuView: willMoveToSuperview nil - cleaning up");
+    AVG_VLOG(@"willMoveToSuperview nil - cleaning up");
     [self cleanup];
   } else {
     // View is being added - restart if we have a source
-    NSLog(@"AlphaVideoGpuView: willMoveToSuperview - view added");
+    AVG_VLOG(@"willMoveToSuperview - view added");
     _isDestroyed = NO;
     
     // If we have a source but it's not loaded or loading, reload it
     if (_source && !_isSourceLoaded && !_isSourceLoading) {
-      NSLog(@"AlphaVideoGpuView: Restarting playback after view re-added");
+      AVG_VLOG(@"Restarting playback after view re-added");
       _isSourceLoading = YES;
-      [self loadKTX2WithSource:_source];
+      if (_localPath) {
+        [self loadKTX2FromFile:_localPath];
+      } else {
+        [self resolveAndLoadSource];
+      }
     }
   }
 }
@@ -3396,18 +3435,18 @@
   
   if (self.window == nil) {
     // View removed from window - pause but don't cleanup yet
-    NSLog(@"AlphaVideoGpuView: didMoveToWindow nil - pausing");
+    AVG_VLOG(@"didMoveToWindow nil - pausing");
     [self pause];
   } else if (_source && _isSourceLoaded && self.autoPlay && !self.isPlaying) {
     // View added to window and we have loaded source - resume
-    NSLog(@"AlphaVideoGpuView: didMoveToWindow - resuming playback");
+    AVG_VLOG(@"didMoveToWindow - resuming playback");
     [self play];
   }
 }
 
 - (void)dealloc
 {
-  NSLog(@"AlphaVideoGpuView: dealloc");
+  AVG_VLOG(@"dealloc");
   [self cleanup];
 }
 

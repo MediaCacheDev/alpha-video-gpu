@@ -30,7 +30,7 @@ export function parseGLBContainer(data: Uint8Array): GLBParseResult | null {
 
     const version = view.getUint32(4, true);
     if (version !== 2) {
-      console.warn('[KTX2Core] Unsupported GLB version:', version);
+      console.warn('[AlphaVideoGpu] Unsupported GLB version:', version);
       return null;
     }
 
@@ -45,7 +45,7 @@ export function parseGLBContainer(data: Uint8Array): GLBParseResult | null {
     if (jsonChunkType !== 0x4e4f534a) {
       // 'JSON' in little-endian
       console.warn(
-        '[KTX2Core] Expected JSON chunk, got:',
+        '[AlphaVideoGpu] Expected JSON chunk, got:',
         jsonChunkType.toString(16)
       );
       return null;
@@ -66,7 +66,7 @@ export function parseGLBContainer(data: Uint8Array): GLBParseResult | null {
     if (binChunkType !== 0x004e4942) {
       // 'BIN\0' in little-endian
       console.warn(
-        '[KTX2Core] Expected BIN chunk, got:',
+        '[AlphaVideoGpu] Expected BIN chunk, got:',
         binChunkType.toString(16)
       );
       return null;
@@ -82,10 +82,9 @@ export function parseGLBContainer(data: Uint8Array): GLBParseResult | null {
       );
     }
 
-    console.log(`[KTX2Core] Parsed GLB container: ${ktx2Parts.length} KTX2 parts`);
     return { metadata, ktx2Parts };
   } catch (error) {
-    console.warn('[KTX2Core] Failed to parse GLB:', error);
+    console.warn('[AlphaVideoGpu] Failed to parse GLB:', error);
     return null;
   }
 }
@@ -151,7 +150,7 @@ export function extractKTX2Metadata(ktx2Data: Uint8Array): Metadata | null {
 
     return null;
   } catch (error) {
-    console.warn('[KTX2Core] Failed to extract KTX2 metadata:', error);
+    console.warn('[AlphaVideoGpu] Failed to extract KTX2 metadata:', error);
     return null;
   }
 }

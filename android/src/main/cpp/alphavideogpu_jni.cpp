@@ -23,8 +23,13 @@
 // Proper ASTC decoder for emulator fallback (from richgel999/astc_dec)
 #include "astc_decomp.h"
 
-#define LOG_TAG "KTX2Player"
+#define LOG_TAG "AlphaVideoGpu"
+// Info traces are compiled in only when ALPHA_VIDEO_GPU_DEBUG_LOGS is defined.
+#ifdef ALPHA_VIDEO_GPU_DEBUG_LOGS
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#endif
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
@@ -919,92 +924,87 @@ static std::mutex g_streaming_mutex;
 static std::atomic<jlong> g_next_stream_id{1};
 
 /**
- * Initialize streaming decompression with a file path (memory-mapped).
- * This is the preferred method - avoids copying data to Java/C++ heap.
- * Returns a unique stream ID (> 0), or 0 on error.
+ * Maps [offset, offset + length) of fd into the state's input. The descriptor is duplicated, so
+ * the caller may close its own copy. A negative length means "to the end of the file".
  */
-JNIEXPORT jlong JNICALL
-Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressInitFromFile(JNIEnv *env, jclass clazz,
-                                                                            jstring file_path) {
-    const char* path = env->GetStringUTFChars(file_path, nullptr);
-    if (!path) {
-        LOGE("Failed to get file path string");
-        return 0;
-    }
-    
-    // Create new per-instance state
-    auto state = std::make_unique<StreamingDecompressState>();
-    
-    // Open file
-    state->fd = open(path, O_RDONLY);
+static bool mapFdRange(StreamingDecompressState* state, int fd, int64_t offset, int64_t length) {
+    state->fd = dup(fd);
     if (state->fd < 0) {
-        LOGE("Failed to open file: %s (errno=%d)", path, errno);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
+        LOGE("Failed to dup descriptor (errno=%d)", errno);
+        return false;
     }
-    
-    // Get file size
+
     struct stat st;
     if (fstat(state->fd, &st) < 0) {
-        LOGE("Failed to stat file: %s", path);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
+        LOGE("Failed to stat descriptor (errno=%d)", errno);
+        return false;
     }
-    state->mmap_size = st.st_size;
-    
-    // Memory-map the file (read-only, private)
-    state->mmap_ptr = mmap(nullptr, state->mmap_size, PROT_READ, MAP_PRIVATE, state->fd, 0);
-    if (state->mmap_ptr == MAP_FAILED) {
-        LOGE("Failed to mmap file: %s (errno=%d)", path, errno);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
+    if (length < 0) length = st.st_size - offset;
+    if (offset < 0 || length <= 0 || offset + length > st.st_size) {
+        LOGE("Range [%lld, +%lld) is outside the file (%lld bytes)",
+             (long long)offset, (long long)length, (long long)st.st_size);
+        return false;
     }
-    
-    // Advise kernel we'll read sequentially
-    madvise(state->mmap_ptr, state->mmap_size, MADV_SEQUENTIAL);
-    
-    // Set up unified input pointer
-    state->input_data = static_cast<const uint8_t*>(state->mmap_ptr);
-    state->input_size = state->mmap_size;
+
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    off_t aligned_offset = (offset / page_size) * page_size;
+    size_t offset_adjustment = offset - aligned_offset;
+    size_t mmap_length = length + offset_adjustment;
+
+    void* ptr = mmap(nullptr, mmap_length, PROT_READ, MAP_PRIVATE, state->fd, aligned_offset);
+    if (ptr == MAP_FAILED) {
+        LOGE("Failed to mmap %zu bytes (errno=%d)", mmap_length, errno);
+        return false;
+    }
+    state->mmap_ptr = ptr;
+    state->mmap_size = mmap_length;
+    madvise(ptr, mmap_length, MADV_SEQUENTIAL);
+
+    state->input_data = static_cast<const uint8_t*>(ptr) + offset_adjustment;
+    state->input_size = length;
     state->input_pos = 0;
-    
-    // Create decompression stream
+    return true;
+}
+
+/** Creates the zstd stream for a state whose input is set, and registers it. Returns 0 on error. */
+static jlong registerStream(std::unique_ptr<StreamingDecompressState> state) {
     state->dstream = ZSTD_createDStream();
     if (!state->dstream) {
         LOGE("Failed to create ZSTD_DStream");
-        env->ReleaseStringUTFChars(file_path, path);
         return 0;
     }
-    
     size_t initResult = ZSTD_initDStream(state->dstream);
     if (ZSTD_isError(initResult)) {
         LOGE("Failed to init ZSTD_DStream: %s", ZSTD_getErrorName(initResult));
-        env->ReleaseStringUTFChars(file_path, path);
         return 0;
     }
-    
-    // Allocate output buffer
     state->output.resize(64 * 1024);
-    
-    // Generate unique stream ID and store state
+
     jlong streamId = g_next_stream_id.fetch_add(1);
-    
-    LOGI("Streaming decompression initialized from mmap: stream %lld, %zu bytes from %s", 
-         (long long)streamId, state->mmap_size, path);
-    
-    env->ReleaseStringUTFChars(file_path, path);
-    
-    {
-        std::lock_guard<std::mutex> lock(g_streaming_mutex);
-        g_streaming_states[streamId] = std::move(state);
-    }
-    
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    g_streaming_states[streamId] = std::move(state);
+    return streamId;
+}
+
+/**
+ * Initialize streaming decompression of a whole zstd frame (.ktx2.zst) from a memory-mapped
+ * descriptor range: a file, or an uncompressed APK asset or raw resource.
+ * Returns a unique stream ID (> 0), or 0 on error.
+ */
+JNIEXPORT jlong JNICALL
+Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeStreamingDecompressInitFromFd(JNIEnv *env, jclass clazz,
+                                                                          jint fd, jlong offset,
+                                                                          jlong length) {
+    auto state = std::make_unique<StreamingDecompressState>();
+    if (!mapFdRange(state.get(), fd, offset, length)) return 0;
+    jlong streamId = registerStream(std::move(state));
+    LOGI("Streaming decompression initialized from mmap: stream %lld", (long long)streamId);
     return streamId;
 }
 
 /**
  * Initialize streaming decompression with compressed data (fallback).
- * Use nativeStreamingDecompressInitFromFile when possible for better memory efficiency.
+ * Use nativeStreamingDecompressInitFromFd when possible for better memory efficiency.
  * Returns a unique stream ID (> 0), or 0 on error.
  */
 JNIEXPORT jlong JNICALL
@@ -1669,104 +1669,22 @@ Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeUploadTextureArrayLayerPBO(JNI
 /**
  * Initialize streaming decompression for internal KTX2 zstd (supercompressionScheme=2).
  * Unlike outer .zst files, only the level0 data is compressed - header is uncompressed.
- * 
- * @param file_path Path to the .ktx2 file
- * @param data_offset Offset to the compressed level0 data (from KTX2 header)
+ *
+ * @param fd Descriptor of the file holding the KTX2 (it may start at an offset, e.g. an APK asset)
+ * @param data_offset Offset of the compressed level0 data within the descriptor
  * @param compressed_size Size of compressed data
  * @return Stream ID (> 0), or 0 on error
  */
 JNIEXPORT jlong JNICALL
 Java_com_alphavideo_gpu_AlphaVideoGpuModule_nativeInternalZstdStreamingInit(JNIEnv *env, jclass clazz,
-                                                                       jstring file_path,
+                                                                       jint fd,
                                                                        jlong data_offset,
                                                                        jlong compressed_size) {
-    const char* path = env->GetStringUTFChars(file_path, nullptr);
-    if (!path) {
-        LOGE("Failed to get file path string");
-        return 0;
-    }
-    
-    // Create new per-instance state
     auto state = std::make_unique<StreamingDecompressState>();
-    
-    // Open file
-    state->fd = open(path, O_RDONLY);
-    if (state->fd < 0) {
-        LOGE("Failed to open file for internal zstd: %s (errno=%d)", path, errno);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
-    }
-    
-    // Get file size for validation
-    struct stat st;
-    if (fstat(state->fd, &st) < 0) {
-        LOGE("Failed to stat file: %s", path);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
-    }
-    
-    // Validate offset and size
-    if (data_offset + compressed_size > st.st_size) {
-        LOGE("Internal zstd data extends beyond file: offset=%lld, size=%lld, fileSize=%lld",
-             (long long)data_offset, (long long)compressed_size, (long long)st.st_size);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
-    }
-    
-    // Memory-map only the compressed data portion
-    // Use page-aligned offset for mmap
-    long page_size = sysconf(_SC_PAGE_SIZE);
-    off_t aligned_offset = (data_offset / page_size) * page_size;
-    size_t offset_adjustment = data_offset - aligned_offset;
-    size_t mmap_length = compressed_size + offset_adjustment;
-    
-    state->mmap_ptr = mmap(nullptr, mmap_length, PROT_READ, MAP_PRIVATE, state->fd, aligned_offset);
-    if (state->mmap_ptr == MAP_FAILED) {
-        LOGE("Failed to mmap internal zstd data: %s (errno=%d)", path, errno);
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
-    }
-    state->mmap_size = mmap_length;
-    
-    // Advise kernel we'll read sequentially
-    madvise(state->mmap_ptr, state->mmap_size, MADV_SEQUENTIAL);
-    
-    // Set up unified input pointer (adjusted for page alignment)
-    state->input_data = static_cast<const uint8_t*>(state->mmap_ptr) + offset_adjustment;
-    state->input_size = compressed_size;
-    state->input_pos = 0;
-    
-    // Create decompression stream
-    state->dstream = ZSTD_createDStream();
-    if (!state->dstream) {
-        LOGE("Failed to create ZSTD_DStream for internal zstd");
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
-    }
-    
-    size_t initResult = ZSTD_initDStream(state->dstream);
-    if (ZSTD_isError(initResult)) {
-        LOGE("Failed to init ZSTD_DStream for internal zstd: %s", ZSTD_getErrorName(initResult));
-        env->ReleaseStringUTFChars(file_path, path);
-        return 0;
-    }
-    
-    // Allocate output buffer
-    state->output.resize(64 * 1024);
-    
-    // Generate unique stream ID and store state
-    jlong streamId = g_next_stream_id.fetch_add(1);
-    
-    LOGI("Internal zstd streaming initialized: stream %lld, offset=%lld, size=%lld from %s", 
-         (long long)streamId, (long long)data_offset, (long long)compressed_size, path);
-    
-    env->ReleaseStringUTFChars(file_path, path);
-    
-    {
-        std::lock_guard<std::mutex> lock(g_streaming_mutex);
-        g_streaming_states[streamId] = std::move(state);
-    }
-    
+    if (!mapFdRange(state.get(), fd, data_offset, compressed_size)) return 0;
+    jlong streamId = registerStream(std::move(state));
+    LOGI("Internal zstd streaming initialized: stream %lld, offset=%lld, size=%lld",
+         (long long)streamId, (long long)data_offset, (long long)compressed_size);
     return streamId;
 }
 

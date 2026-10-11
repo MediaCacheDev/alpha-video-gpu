@@ -70,6 +70,8 @@ export interface KTX2PlayerCoreOptions {
   streamingPrefetchAhead?: number;
   /** Memory strategy: 'auto' | 'vram' | 'ram'. Default: 'auto' */
   memoryStrategy?: MemoryStrategy;
+  /** Log info traces to the console (warnings and errors always log). Default: false */
+  verbose?: boolean;
 
   // Dependency injection — allows different bundling strategies
   /** Function that returns a Promise resolving to the Basis Universal module */

@@ -1,8 +1,16 @@
 import type { ViewProps, HostComponent } from 'react-native';
 import { requireNativeComponent } from 'react-native';
 
+/**
+ * Where to load from:
+ * - `https://…` / `http://…`: downloaded once into the app cache (named by `cacheKey`, else a hash of the URL)
+ * - `file:///abs/path` or `/abs/path`: read in place
+ * - `asset://relative/path`: Android APK `assets/`, the iOS app bundle, or the site root on web
+ * - Android only: `content://…`, or a res/raw name (what `require()` resolves to in a release build)
+ */
 export interface SourceType {
   uri?: string;
+  /** Stable identity for the download cache, for URLs that change while the file doesn't (presigned URLs) */
   cacheKey?: string;
 }
 
@@ -17,7 +25,10 @@ export interface AlphaVideoGpuLoadEvent {
 export interface NativeProps extends ViewProps {
   source?: SourceType | null;
   onLoad?: (event: { nativeEvent: AlphaVideoGpuLoadEvent }) => void;
-  /** For multi-part animations: array of all part sources (first part contains metadata) */
+  /**
+   * For multi-part animations whose part files can't be found next to `source` (res/raw,
+   * content://, presigned URLs): every part's source, first part containing the metadata.
+   */
   parts?: ReadonlyArray<SourceType> | null;
   autoPlay?: boolean;
   loop?: boolean;
@@ -59,6 +70,11 @@ export interface NativeProps extends ViewProps {
    * Only applies to packingMode='array' files.
    */
   stream?: boolean;
+
+  /** Send onFrameUpdate for every rendered frame. Default: false */
+  enableFrameEvents?: boolean;
+  /** Log info traces (Logcat / Xcode console). Warnings and errors always log. Default: false */
+  verbose?: boolean;
 }
 
 export default requireNativeComponent<NativeProps>(

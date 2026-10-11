@@ -1,6 +1,7 @@
 package com.alphavideo.gpu;
 
 import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.SurfaceTexture;
 import android.opengl.EGL14;
 import android.opengl.EGLConfig;
@@ -25,15 +26,11 @@ import com.facebook.react.uimanager.events.EventDispatcher;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.util.Arrays;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -117,8 +114,11 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     }
     private List<PartInfo> partInfoList = new ArrayList<>();
     
-    // Explicit part URIs (for bundled assets where sibling files can't be auto-discovered)
+    // Explicit part URIs and their optional cache keys (for sources whose siblings can't be found)
     private String[] explicitPartUris = null;
+    private String[] explicitPartCacheKeys = null;
+    
+    private volatile boolean verbose = false;
     
     
     // OpenGL resources
@@ -439,7 +439,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // finished player can still be revived by setting the same source again).
         boolean playing = isPlaybackRunning.get() && !shouldStop.get();
         if (source != null && source.equals(mSource) && playing) {
-            Log.d(TAG, "setSource: unchanged and still playing, ignoring");
+            logD("setSource: unchanged and still playing, ignoring");
             return;
         }
 
@@ -451,12 +451,12 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         if (source != null && playing
                 && mCacheKey != null && !mCacheKey.isEmpty()
                 && mCacheKey.equals(mPlayingCacheKey)) {
-            Log.d(TAG, "setSource: same cacheKey (" + mCacheKey + ") still playing, ignoring URL change");
+            logD("setSource: same cacheKey (" + mCacheKey + ") still playing, ignoring URL change");
             mSource = source;
             return;
         }
 
-        Log.d(TAG, "setSource: " + (source != null ? source.substring(0, Math.min(80, source.length())) : "null"));
+        logD("setSource: " + (source != null ? source.substring(0, Math.min(80, source.length())) : "null"));
         
         stopPlayback();
         mSource = source;
@@ -469,7 +469,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     
     public void setCacheKey(String cacheKey) {
         mCacheKey = cacheKey;
-        Log.d(TAG, "setCacheKey: " + cacheKey);
+        logD("setCacheKey: " + cacheKey);
     }
     
     public void setAutoPlay(boolean autoPlay) {
@@ -490,22 +490,22 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     
     public void setGpuPlayback(boolean gpuPlayback) {
         this.gpuPlayback = gpuPlayback;
-        Log.d(TAG, "setGpuPlayback: " + gpuPlayback);
+        logD("setGpuPlayback: " + gpuPlayback);
     }
     
     public void setStreamingRingSize(int size) {
         this.configStreamingRingSize = Math.max(4, Math.min(64, size));
-        Log.d(TAG, "setStreamingRingSize: " + this.configStreamingRingSize);
+        logD("setStreamingRingSize: " + this.configStreamingRingSize);
     }
     
     public void setStreamingCacheSize(int size) {
         this.configStreamingCacheSize = Math.max(10, Math.min(200, size));
-        Log.d(TAG, "setStreamingCacheSize: " + this.configStreamingCacheSize);
+        logD("setStreamingCacheSize: " + this.configStreamingCacheSize);
     }
     
     public void setStreamingPrefetchAhead(int frames) {
         this.configStreamingPrefetchAhead = Math.max(5, Math.min(100, frames));
-        Log.d(TAG, "setStreamingPrefetchAhead: " + this.configStreamingPrefetchAhead);
+        logD("setStreamingPrefetchAhead: " + this.configStreamingPrefetchAhead);
     }
     
     /**
@@ -520,7 +520,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         } else {
             this.memoryStrategy = "auto";
         }
-        Log.d(TAG, "setMemoryStrategy: " + this.memoryStrategy);
+        logD("setMemoryStrategy: " + this.memoryStrategy);
     }
     
     /**
@@ -530,7 +530,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
      */
     public void setStream(boolean stream) {
         this.streamProp = stream;
-        Log.d(TAG, "setStream: " + stream);
+        logD("setStream: " + stream);
     }
     
     /**
@@ -540,7 +540,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     public void setPaused(boolean paused) {
         boolean wasPaused = isPaused.getAndSet(paused);
         if (paused != wasPaused) {
-            Log.d(TAG, "setPaused: " + paused);
+            logD("setPaused: " + paused);
             if (paused) {
                 // Stop playback
                 isPlaying.set(false);
@@ -554,12 +554,20 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     }
     
     /**
-     * Set explicit part URIs for multi-part animations.
-     * Used when bundled assets can't be auto-discovered from sibling files.
+     * Set explicit part URIs for multi-part animations, for sources whose siblings can't be
+     * found from the source URI (res/raw, content://, presigned URLs).
+     *
+     * @param partCacheKeys optional cache keys for remote parts, by index (entries may be null)
      */
-    public void setPartUris(String[] partUris) {
+    public void setParts(String[] partUris, String[] partCacheKeys) {
         this.explicitPartUris = partUris;
-        Log.d(TAG, "setPartUris: " + (partUris != null ? partUris.length + " parts" : "null"));
+        this.explicitPartCacheKeys = partCacheKeys;
+        logD("setParts: " + (partUris != null ? partUris.length + " parts" : "null"));
+    }
+
+    /** Logs debug and info traces when true; warnings and errors are always logged. */
+    public void setVerbose(boolean verbose) {
+        this.verbose = verbose;
     }
     
     public void play() {
@@ -607,7 +615,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // relaunch. Returning without doing this leaves shouldStop raised with no
         // worker running, which strands the view until the surface is recreated.
         if (!isPlaybackRunning.compareAndSet(false, true)) {
-            Log.d(TAG, "startPlayback: worker still running, queueing restart");
+            logD("startPlayback: worker still running, queueing restart");
             pendingRestart.set(true);
             return;
         }
@@ -646,18 +654,15 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     }
     
     private void playAnimation() {
-        String localPath = mSource;
-        
-        // Handle HTTP URLs
-        if (mSource.startsWith("http://") || mSource.startsWith("https://")) {
-            localPath = downloadToCache(mSource);
-            if (localPath == null) {
-                mainHandler.post(() -> notifyError("Failed to download KTX2 file"));
-                return;
-            }
-        } else if (mSource.startsWith("file://")) {
-            localPath = mSource.substring(7);
+        final AlphaVideoGpuSource local;
+        try {
+            local = resolveSource(mSource, mPlayingCacheKey);
+        } catch (IOException | IllegalArgumentException e) {
+            if (shouldStop.get()) return;  // a cancelled download
+            mainHandler.post(() -> notifyError("Failed to load " + mSource + ": " + e.getMessage()));
+            return;
         }
+        if (shouldStop.get()) return;
         
         // Initialize OpenGL
         SurfaceTexture surfaceTexture = getSurfaceTexture();
@@ -669,25 +674,31 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // Detect texture format first (needed for transcoding)
         detectAndCacheTextureFormat();
         
-        // Check for streaming mode (.ktx2.zst files)
-        boolean isStreamingZst = localPath.endsWith(".zst") || localPath.contains(".zst?") || 
-                                  localPath.matches(".*\\.ktx2\\.[a-f0-9]+\\.zst.*");
-        if (isStreamingZst) {
-            Log.i(TAG, "Detected streaming mode (.zst): " + localPath);
-            playStreamingAnimation(localPath);
+        // A whole-file zstd frame (.ktx2.zst) streams; recognised by content, since a cached
+        // download is named by its cache key rather than by the URL's extension
+        byte[] fileHead;
+        try {
+            fileHead = local.readHead(getContext(), 4);
+        } catch (IOException e) {
+            mainHandler.post(() -> notifyError("Failed to read file: " + e.getMessage()));
+            return;
+        }
+        if (isZstdFrame(fileHead)) {
+            logI("Detected streaming mode (zstd frame): " + local);
+            playStreamingAnimation(local);
             return;
         }
         
         // Check for uncompressed streaming mode BEFORE loading file into RAM
         // This avoids allocating ~29MB per player instance for streaming files
-        if (checkAndPlayUncompressedStreaming(localPath)) {
+        if (checkAndPlayUncompressedStreaming(local)) {
             return; // Handled by uncompressed streaming path
         }
         
         // Read file data (only for non-streaming paths)
         byte[] fileData = null;
         try {
-            fileData = readFileBytes(localPath);
+            fileData = local.readAll(getContext());
         } catch (IOException e) {
             mainHandler.post(() -> notifyError("Failed to read file: " + e.getMessage()));
             return;
@@ -700,7 +711,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // Check if this is a GLB container or KTX2 file
         String metadataJson;
         if (isGLBData(fileData)) {
-            Log.i(TAG, "Detected GLB container");
+            logI("Detected GLB container");
             metadataJson = parseGLBContainer(fileData);
             if (metadataJson == null) {
                 mainHandler.post(() -> notifyError("Failed to parse GLB container"));
@@ -713,13 +724,13 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 mainHandler.post(() -> notifyError("No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."));
                 return;
             }
-            Log.i(TAG, "Using embedded KTX2 metadata");
+            logI("Using embedded KTX2 metadata");
         }
         
         // Parse metadata
         try {
             parseMetadata(metadataJson);
-            Log.i(TAG, "isNativeASTC: " + isNativeASTC);
+            logI("isNativeASTC: " + isNativeASTC);
         } catch (Exception e) {
             mainHandler.post(() -> notifyError("Failed to parse metadata: " + e.getMessage()));
             return;
@@ -729,15 +740,15 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         if (streamProp && useTextureArray) {
             // Check supercompressionScheme from KTX2 header
             int supercompressionScheme = getSupercompressionScheme(fileData);
-            Log.i(TAG, "Streaming mode enabled (stream=true), supercompression=" + supercompressionScheme);
+            logI("Streaming mode enabled (stream=true), supercompression=" + supercompressionScheme);
             
             if (supercompressionScheme == 2) {
                 // Internal Zstd compression - use internal zstd streaming (not outer .zst)
-                playInternalZstdStreamingAnimation(localPath, fileData);
+                playInternalZstdStreamingAnimation(local, fileData);
                 return;
             } else if (supercompressionScheme == 0) {
                 // Uncompressed - use mmap streaming
-                playUncompressedStreamingAnimation(localPath);
+                playUncompressedStreamingAnimation(local);
                 return;
             } else {
                 Log.w(TAG, "Unsupported supercompression for streaming: " + supercompressionScheme + ", falling back to non-stream");
@@ -746,7 +757,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         
         // Load textures (non-streaming path)
         try {
-            loadPartTextures(localPath);
+            loadPartTextures(local);
         } catch (Exception e) {
             mainHandler.post(() -> notifyError("Failed to load textures: " + e.getMessage()));
             return;
@@ -777,7 +788,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         long gpuPlaybackStartTime = System.nanoTime();
         gpuElapsedTime = 0.0f;
         
-        Log.d(TAG, "Starting render loop (gpuPlayback=" + gpuPlayback + ")");
+        logD("Starting render loop (gpuPlayback=" + gpuPlayback + ")");
         
         do {
             long loopStartTime = System.nanoTime();
@@ -873,64 +884,23 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
      * Play streaming animation from .ktx2.zst file.
      * Uses progressive decompression and ring buffer for memory efficiency.
      */
-    private void playStreamingAnimation(String localPath) {
-        Log.i(TAG, "Starting streaming animation: " + localPath);
+    private void playStreamingAnimation(AlphaVideoGpuSource local) {
+        logI("Starting streaming animation: " + local);
         
-        // Try to use memory-mapped file init (preferred - avoids copying to Java heap)
-        // Falls back to byte array init for HTTP URLs or assets
-        final long[] streamId = {0};
-        final String[] effectivePath = {localPath};
-        boolean useMmap = false;
-        
-        // Check if this is a local file path that can be memory-mapped
-        if (!localPath.startsWith("http://") && !localPath.startsWith("https://") &&
-            !localPath.startsWith("asset://") && !localPath.startsWith("assets://")) {
-            
-            // For file:// URLs, strip the prefix
-            String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
-            File file = new File(filePath);
-            
-            if (file.exists() && file.canRead()) {
-                Log.i(TAG, "Using memory-mapped file init: " + filePath);
-                streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInitFromFile(filePath);
-                effectivePath[0] = filePath;
-                useMmap = true;
-            }
-        }
-        
-        // Fallback: download/read to byte array (for HTTP URLs, assets, or if mmap failed)
+        // Prefer a memory-mapped stream (no copy into the Java or native heap). Fall back to
+        // reading the file into memory when it can't be mapped.
+        final long[] streamId = {openMappedZstdStream(local)};
+        boolean useMmap = streamId[0] != 0;
         byte[] compressedData = null;
-        if (streamId[0] == 0) {
+        if (!useMmap) {
             try {
-                // For HTTP URLs, download to cache first
-                String pathToRead = localPath;
-                if (localPath.startsWith("http://") || localPath.startsWith("https://")) {
-                    pathToRead = downloadToCache(localPath);
-                    if (pathToRead == null) {
-                        mainHandler.post(() -> notifyError("Failed to download streaming file"));
-                        return;
-                    }
-                    effectivePath[0] = pathToRead;
-                    
-                    // Try mmap on the cached file
-                    File cachedFile = new File(pathToRead);
-                    if (cachedFile.exists() && cachedFile.canRead()) {
-                        Log.i(TAG, "Using memory-mapped cached file: " + pathToRead);
-                        streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInitFromFile(pathToRead);
-                        useMmap = true;
-                    }
-                }
-                
-                // If still no stream ID, fall back to byte array
-                if (streamId[0] == 0) {
-                    compressedData = readFileBytes(pathToRead);
-                    Log.i(TAG, "Using byte array init (fallback): " + compressedData.length + " bytes");
-                    streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInit(compressedData);
-                }
+                compressedData = local.readAll(getContext());
             } catch (IOException e) {
                 mainHandler.post(() -> notifyError("Failed to read streaming file: " + e.getMessage()));
                 return;
             }
+            logI("Using byte array init (fallback): " + compressedData.length + " bytes");
+            streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInit(compressedData);
         }
         
         if (streamId[0] == 0) {
@@ -938,9 +908,8 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             return;
         }
         
-        // For loop restart, we need to remember the path (mmap) or keep the data (fallback)
+        // For loop restart, we need to reopen the mapping or keep the data (fallback)
         final boolean finalUseMmap = useMmap;
-        final String finalPath = effectivePath[0];
         final byte[] finalCompressedData = useMmap ? null : compressedData;  // Only keep if not using mmap
         
         // Buffer size for decompression chunks
@@ -988,7 +957,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     // Configure ASTC format from vkFormat
                     configureASTCFromVkFormat(vkFormat);
                     
-                    Log.i(TAG, "Streaming texture: " + width + "x" + height + ", " + layerCount + " layers, offset=" + level0Offset + ", vkFormat=" + vkFormat);
+                    logI("Streaming texture: " + width + "x" + height + ", " + layerCount + " layers, offset=" + level0Offset + ", vkFormat=" + vkFormat);
                 }
             }
             
@@ -1042,7 +1011,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         final int CPU_CACHE_SIZE = useVramStrategy ? 5 : configStreamingCacheSize;  // Minimal CPU cache for VRAM mode
         final int PREFETCH_AHEAD = configStreamingPrefetchAhead;  // Same prefetch behavior for both modes
         
-        Log.i(TAG, "Streaming params: strategy=" + memoryStrategy + 
+        logI("Streaming params: strategy=" + memoryStrategy + 
               ", gpuCache=" + GPU_CACHE_SIZE + ", cpuCache=" + CPU_CACHE_SIZE + 
               ", prefetch=" + PREFETCH_AHEAD + ", vramMode=" + useVramStrategy);
         
@@ -1059,10 +1028,10 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         textureArrayLayerCount = textureLayerCount;
         
         if (useVramStrategy) {
-            Log.i(TAG, "Created VRAM streaming cache: ID=" + textureArrayId + ", " + width + "x" + height + 
+            logI("Created VRAM streaming cache: ID=" + textureArrayId + ", " + width + "x" + height + 
                   ", " + textureLayerCount + " GPU slots (total frames: " + layerCount + ")");
         } else {
-            Log.i(TAG, "Created RAM streaming ring buffer: ID=" + textureArrayId + ", " + width + "x" + height + 
+            logI("Created RAM streaming ring buffer: ID=" + textureArrayId + ", " + width + "x" + height + 
                   ", " + textureLayerCount + " GPU slots, " + CPU_CACHE_SIZE + " CPU cache (total frames: " + layerCount + ")");
         }
         
@@ -1082,7 +1051,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         if (useAstc) {
             pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
             if (pbosInitialized) {
-                Log.i(TAG, "PBOs initialized for async uploads: " + bytesPerLayer + " bytes per buffer");
+                logI("PBOs initialized for async uploads: " + bytesPerLayer + " bytes per buffer");
             }
         }
         
@@ -1118,7 +1087,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             frameAccumulatorBuffer = ByteBuffer.allocateDirect(bytesPerLayer + bufferSize);
             bufferPool = null;
             frameCache = new java.util.concurrent.ConcurrentHashMap<>();  // Only for blocked frames
-            Log.i(TAG, "VRAM mode: Pre-allocated direct frame buffer: " + (bytesPerLayer + bufferSize) + " bytes");
+            logI("VRAM mode: Pre-allocated direct frame buffer: " + (bytesPerLayer + bufferSize) + " bytes");
         } else {
             // RAM mode: DirectByteBuffer for accumulation (zero-copy decompression),
             // byte[] pool for CPU cache storage
@@ -1129,12 +1098,12 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 bufferPool.offer(new byte[bytesPerLayer]);
             }
             frameCache = new java.util.concurrent.ConcurrentHashMap<>();
-            Log.i(TAG, "RAM mode: Pre-allocated direct accumulator + buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
+            logI("RAM mode: Pre-allocated direct accumulator + buffer pool: " + POOL_SIZE + " buffers x " + bytesPerLayer + " bytes = " + 
                   (POOL_SIZE * bytesPerLayer / 1024) + " KB");
         }
         
         // Both modes now use DirectByteBuffer for accumulation (frameAccumulatorBuffer)
-        Log.i(TAG, "Pre-allocated direct decompression buffer: " + bufferSize + " bytes");
+        logI("Pre-allocated direct decompression buffer: " + bufferSize + " bytes");
         
         // Skip header bytes from already-read data
         byte[] existingData = headerStream.toByteArray();
@@ -1197,12 +1166,14 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     bytesToSkip[0] = (int) finalLevel0Offset;
                     AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
                     // Use mmap if available, otherwise fall back to byte array
-                    if (finalUseMmap) {
-                        streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInitFromFile(finalPath);
-                    } else {
-                        streamId[0] = AlphaVideoGpuModule.nativeStreamingDecompressInit(finalCompressedData);
+                    streamId[0] = finalUseMmap
+                        ? openMappedZstdStream(local)
+                        : AlphaVideoGpuModule.nativeStreamingDecompressInit(finalCompressedData);
+                    if (streamId[0] == 0) {
+                        decompressEnded[0] = true;
+                        break;
                     }
-                    Log.i(TAG, "Prefetch wrap-around: restarting decompression for loop " + decoderLoopIteration[0]);
+                    logI("Prefetch wrap-around: restarting decompression for loop " + decoderLoopIteration[0]);
                     continue;
                 }
                 
@@ -1516,13 +1487,13 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             // End of one loop iteration
             if (!loop) break;
             playbackLoopIteration++;
-            Log.i(TAG, "Loop transition: now on playbackLoop=" + playbackLoopIteration + 
+            logI("Loop transition: now on playbackLoop=" + playbackLoopIteration + 
                   ", decoderLoop=" + decoderLoopIteration[0] + ", decodePos=" + decodePos[0] +
                   ", cacheSize=" + frameCache.size() + ", ringSlots[0]=" + ringSlots[0]);
         }
         
         AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
-        Log.i(TAG, "Streaming animation ended");
+        logI("Streaming animation ended");
     }
     
     /**
@@ -1530,18 +1501,13 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
      * Reads only the header (~1KB) to detect streaming mode - avoids loading entire file into RAM.
      * @return true if handled as uncompressed streaming, false otherwise
      */
-    private boolean checkAndPlayUncompressedStreaming(String localPath) {
-        Log.d(TAG, "checkAndPlayUncompressedStreaming: checking " + localPath);
+    private boolean checkAndPlayUncompressedStreaming(AlphaVideoGpuSource local) {
+        logD("checkAndPlayUncompressedStreaming: checking " + local);
         try {
-            String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
-            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(filePath, "r");
-            
             // Read just the header (first 256 bytes is enough for KTX2 header + basic metadata check)
-            byte[] headerBytes = new byte[256];
-            int bytesRead = raf.read(headerBytes);
-            if (bytesRead < 100) {
-                Log.d(TAG, "checkAndPlayUncompressedStreaming: file too small (" + bytesRead + " bytes)");
-                raf.close();
+            byte[] headerBytes = local.readHead(getContext(), 256);
+            if (headerBytes.length < 100) {
+                logD("checkAndPlayUncompressedStreaming: file too small (" + headerBytes.length + " bytes)");
                 return false; // Too small to be valid KTX2
             }
             
@@ -1553,46 +1519,40 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             byte[] ktx2Magic = {(byte)0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, (byte)0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
             boolean isKtx2 = java.util.Arrays.equals(magic, ktx2Magic);
             if (!isKtx2) {
-                Log.d(TAG, "checkAndPlayUncompressedStreaming: not a KTX2 file (magic mismatch)");
-                raf.close();
+                logD("checkAndPlayUncompressedStreaming: not a KTX2 file (magic mismatch)");
                 return false; // Not a KTX2 file
             }
             
             // Check supercompressionScheme at offset 44
             int supercompressionScheme = header.getInt(44);
-            Log.d(TAG, "checkAndPlayUncompressedStreaming: supercompression=" + supercompressionScheme);
+            logD("checkAndPlayUncompressedStreaming: supercompression=" + supercompressionScheme);
             if (supercompressionScheme != 0) {
-                raf.close();
                 return false; // Not uncompressed - let other paths handle it
             }
             
             // Read KVD offset and length from header (bytes 56-59 and 60-63, little-endian uint32)
             int kvdByteOffset = header.getInt(56);
             int kvdByteLength = header.getInt(60);
-            Log.d(TAG, "checkAndPlayUncompressedStreaming: kvdOffset=" + kvdByteOffset + ", kvdLength=" + kvdByteLength);
+            logD("checkAndPlayUncompressedStreaming: kvdOffset=" + kvdByteOffset + ", kvdLength=" + kvdByteLength);
             
             if (kvdByteLength == 0 || kvdByteOffset == 0) {
-                Log.d(TAG, "checkAndPlayUncompressedStreaming: no metadata section");
-                raf.close();
+                logD("checkAndPlayUncompressedStreaming: no metadata section");
                 return false; // No metadata
             }
             
             // Read metadata section
-            raf.seek(kvdByteOffset);
-            byte[] metadataBytes = new byte[Math.min(kvdByteLength, 4096)]; // Cap at 4KB for safety
-            raf.read(metadataBytes);
-            raf.close();
+            byte[] metadataBytes = local.readRange(getContext(), kvdByteOffset, Math.min(kvdByteLength, 4096)); // Cap at 4KB for safety
             
             // Extract metadata JSON using the same logic as extractKTX2Metadata
             String metadataJson = extractMetadataJsonFromKvdBytes(metadataBytes);
             if (metadataJson == null) {
-                Log.d(TAG, "checkAndPlayUncompressedStreaming: failed to extract metadata JSON from KVD");
+                logD("checkAndPlayUncompressedStreaming: failed to extract metadata JSON from KVD");
                 return false;
             }
             
             // Check for streamMode in metadata
             boolean hasStreamMode = metadataJson.contains("\"streamMode\":true") || metadataJson.contains("\"streamMode\": true");
-            Log.d(TAG, "checkAndPlayUncompressedStreaming: hasStreamMode=" + hasStreamMode);
+            logD("checkAndPlayUncompressedStreaming: hasStreamMode=" + hasStreamMode);
             if (!hasStreamMode) {
                 return false; // Not streaming mode
             }
@@ -1600,15 +1560,15 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             // Parse metadata to set up isNativeASTC, frameRate, etc.
             try {
                 parseMetadata(metadataJson);
-                Log.i(TAG, "Uncompressed streaming detected: isNativeASTC=" + isNativeASTC);
+                logI("Uncompressed streaming detected: isNativeASTC=" + isNativeASTC);
             } catch (Exception e) {
                 Log.e(TAG, "Failed to parse metadata for uncompressed streaming: " + e.getMessage());
                 return false;
             }
             
             // All checks passed - this is uncompressed streaming mode
-            Log.i(TAG, "Detected uncompressed streaming KTX2 (supercompression=0, streamMode=true) - using mmap streaming");
-            playUncompressedStreamingAnimation(localPath);
+            logI("Detected uncompressed streaming KTX2 (supercompression=0, streamMode=true) - using mmap streaming");
+            playUncompressedStreamingAnimation(local);
             return true;
             
         } catch (Exception e) {
@@ -1674,7 +1634,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     }
                     
                     String metadataJson = new String(kvdBytes, valueStart, valueEnd - valueStart, "UTF-8");
-                    Log.d(TAG, "extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
+                    logD("extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
                     return metadataJson;
                 }
                 
@@ -1696,21 +1656,23 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
      * This is the fastest streaming mode - no decompression overhead.
      * Does not require pre-loading the file into memory - reads header from mmap.
      */
-    private void playUncompressedStreamingAnimation(String localPath) {
-        Log.i(TAG, "Starting uncompressed streaming animation: " + localPath);
+    private void playUncompressedStreamingAnimation(AlphaVideoGpuSource local) {
+        logI("Starting uncompressed streaming animation: " + local);
         
-        // Memory-map the file for zero-copy reads - do this FIRST to avoid loading file into RAM
+        // Memory-map the file for zero-copy reads - do this FIRST to avoid loading file into RAM.
+        // The mapping stays valid after the descriptor and channel are closed.
         final ByteBuffer mmapBuffer;
-        try {
-            String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
-            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(filePath, "r");
-            java.nio.channels.FileChannel channel = raf.getChannel();
-            mmapBuffer = channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, channel.size());
+        try (AssetFileDescriptor afd = local.openFd(getContext());
+             FileInputStream in = new FileInputStream(afd.getFileDescriptor())) {
+            java.nio.channels.FileChannel channel = in.getChannel();
+            long start = afd.getStartOffset();
+            long length = afd.getLength() >= 0 ? afd.getLength() : channel.size() - start;
+            mmapBuffer = channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, start, length);
             mmapBuffer.order(ByteOrder.LITTLE_ENDIAN);
-            Log.i(TAG, "Memory-mapped file: " + channel.size() + " bytes");
+            logI("Memory-mapped file: " + length + " bytes");
         } catch (Exception e) {
-            Log.e(TAG, "Failed to memory-map file: " + e.getMessage());
-            mainHandler.post(() -> notifyError("Failed to memory-map file: " + e.getMessage()));
+            Log.e(TAG, "Failed to memory-map " + local + ": " + e.getMessage());
+            mainHandler.post(() -> notifyError("Failed to stream " + local + ": " + e.getMessage()));
             return;
         }
         
@@ -1728,7 +1690,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // Calculate bytes per frame using dynamic ASTC block size
         int bytesPerLayer = astcBytesPerLayer(pixelWidth, pixelHeight);
         
-        Log.i(TAG, "Uncompressed streaming: " + pixelWidth + "x" + pixelHeight + ", " + 
+        logI("Uncompressed streaming: " + pixelWidth + "x" + pixelHeight + ", " + 
               layerCount + " layers, " + bytesPerLayer + " bytes/layer (ASTC " + astcBlockWidth + "x" + astcBlockHeight + "), data offset=" + level0ByteOffset);
         
         // Determine GPU cache size based on memory strategy
@@ -1738,7 +1700,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             Math.min(configStreamingCacheSize, layerCount) : 
             Math.min(configStreamingRingSize, layerCount);
         
-        Log.i(TAG, "Uncompressed streaming params: strategy=" + memoryStrategy + 
+        logI("Uncompressed streaming params: strategy=" + memoryStrategy + 
               ", gpuCache=" + gpuCacheSize + ", vramMode=" + useVramStrategy);
         
         // Create GPU texture array
@@ -1748,7 +1710,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             return;
         }
         
-        Log.i(TAG, "Created uncompressed streaming texture array: ID=" + textureArrayId + 
+        logI("Created uncompressed streaming texture array: ID=" + textureArrayId + 
               ", " + pixelWidth + "x" + pixelHeight + ", " + gpuCacheSize + " GPU slots");
         
         // Initialize ring buffer tracking
@@ -1761,7 +1723,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         if (useAstc) {
             pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
             if (pbosInitialized) {
-                Log.i(TAG, "PBOs initialized for uncompressed streaming: " + bytesPerLayer + " bytes per buffer");
+                logI("PBOs initialized for uncompressed streaming: " + bytesPerLayer + " bytes per buffer");
             }
         }
         
@@ -1784,7 +1746,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         
         // Frame timing - use metadata frameRate (already parsed)
         long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
-        Log.i(TAG, "Uncompressed streaming timing: frameRate=" + frameRate + ", playbackSpeed=" + playbackSpeed + 
+        logI("Uncompressed streaming timing: frameRate=" + frameRate + ", playbackSpeed=" + playbackSpeed + 
               ", frameIntervalNs=" + frameIntervalNs + " (" + (frameIntervalNs / 1_000_000.0) + "ms)");
         
         // Capture finals for lambda
@@ -1849,7 +1811,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 
                 // Debug logging every 30 frames
                 if (debugFrameCounter % 30 == 0) {
-                    Log.d(TAG, "Uncompressed frame " + currentFrame + "/" + finalLayerCount + 
+                    logD("Uncompressed frame " + currentFrame + "/" + finalLayerCount + 
                           ", gpuSlot=" + (currentFrame % finalGpuCacheSize) + 
                           ", ringSize=" + streamingRingSize);
                 }
@@ -1878,10 +1840,10 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             
             // Reset for next loop
             Arrays.fill(ringSlots, -1);
-            Log.i(TAG, "Uncompressed streaming loop restart");
+            logI("Uncompressed streaming loop restart");
         }
         
-        Log.i(TAG, "Uncompressed streaming animation ended");
+        logI("Uncompressed streaming animation ended");
     }
     
     /**
@@ -1889,11 +1851,11 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
      * Unlike outer .zst files, only the level0 data is compressed - header is uncompressed.
      * This allows streaming decompression without parsing the header from the compressed stream.
      * 
-     * @param localPath Path to the .ktx2 file
+     * @param local The .ktx2 file
      * @param headerData Already-read file data containing the KTX2 header (used to get level0 offset/size)
      */
-    private void playInternalZstdStreamingAnimation(String localPath, byte[] headerData) {
-        Log.i(TAG, "Starting internal zstd streaming animation: " + localPath);
+    private void playInternalZstdStreamingAnimation(AlphaVideoGpuSource local, byte[] headerData) {
+        logI("Starting internal zstd streaming animation: " + local);
         
         // Parse KTX2 header to get level0 info
         ByteBuffer header = ByteBuffer.wrap(headerData).order(ByteOrder.LITTLE_ENDIAN);
@@ -1909,7 +1871,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // Configure ASTC format from vkFormat
         configureASTCFromVkFormat(vkFormat);
         
-        Log.i(TAG, "Internal zstd: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + " layers, " +
+        logI("Internal zstd: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + " layers, " +
               "compressed=" + level0Length + ", uncompressed=" + level0UncompressedLength + ", vkFormat=" + vkFormat);
         
         // Calculate bytes per layer using dynamic ASTC block size
@@ -1921,11 +1883,14 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             Log.w(TAG, "Uncompressed size mismatch: header=" + level0UncompressedLength + ", expected=" + expectedUncompressed);
         }
         
-        // Get file path for mmap
-        String filePath = localPath.startsWith("file://") ? localPath.substring(7) : localPath;
-        
-        // Initialize internal zstd streaming decompression
-        final long[] streamId = {AlphaVideoGpuModule.nativeInternalZstdStreamingInit(filePath, level0Offset, level0Length)};
+        // Initialize internal zstd streaming decompression over a memory-mapped range
+        final long[] streamId = {0};
+        try {
+            streamId[0] = openInternalZstdStream(local, level0Offset, level0Length);
+        } catch (IOException e) {
+            mainHandler.post(() -> notifyError("Failed to stream " + local + ": " + e.getMessage()));
+            return;
+        }
         if (streamId[0] == 0) {
             mainHandler.post(() -> notifyError("Failed to initialize internal zstd streaming"));
             return;
@@ -1946,7 +1911,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         final int CPU_CACHE_SIZE = useVramStrategy ? 5 : configStreamingCacheSize;
         final int PREFETCH_AHEAD = configStreamingPrefetchAhead;
         
-        Log.i(TAG, "Internal zstd streaming params: strategy=" + memoryStrategy + 
+        logI("Internal zstd streaming params: strategy=" + memoryStrategy + 
               ", gpuCache=" + GPU_CACHE_SIZE + ", cpuCache=" + CPU_CACHE_SIZE + 
               ", prefetch=" + PREFETCH_AHEAD);
         
@@ -1960,7 +1925,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         }
         textureArrayLayerCount = textureLayerCount;
         
-        Log.i(TAG, "Created internal zstd streaming texture array: ID=" + textureArrayId + 
+        logI("Created internal zstd streaming texture array: ID=" + textureArrayId + 
               ", " + pixelWidth + "x" + pixelHeight + ", " + textureLayerCount + " GPU slots");
         
         streamingRingBufferMode = true;
@@ -1970,7 +1935,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         if (useAstc) {
             pbosInitialized = AlphaVideoGpuModule.nativeInitPBOs(textureArrayId, bytesPerLayer);
             if (pbosInitialized) {
-                Log.i(TAG, "PBOs initialized for internal zstd streaming: " + bytesPerLayer + " bytes per buffer");
+                logI("PBOs initialized for internal zstd streaming: " + bytesPerLayer + " bytes per buffer");
             }
         }
         
@@ -2021,7 +1986,6 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         final int finalLayerCount = layerCount;
         final boolean finalUseAstc = useAstc;
         final int finalGpuCacheSize = textureLayerCount;
-        final String finalFilePath = filePath;
         final long finalLevel0Offset = level0Offset;
         final long finalLevel0Length = level0Length;
         
@@ -2055,8 +2019,17 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     decompressEnded[0] = false;
                     frameAccumulatorBuffer.clear();  // Both modes use DirectByteBuffer now
                     AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
-                    streamId[0] = AlphaVideoGpuModule.nativeInternalZstdStreamingInit(finalFilePath, finalLevel0Offset, finalLevel0Length);
-                    Log.i(TAG, "Internal zstd prefetch wrap-around: restarting for loop " + decoderLoopIteration[0]);
+                    try {
+                        streamId[0] = openInternalZstdStream(local, finalLevel0Offset, finalLevel0Length);
+                    } catch (IOException e) {
+                        Log.e(TAG, "Cannot reopen " + local + " for the next loop: " + e.getMessage());
+                        streamId[0] = 0;
+                    }
+                    if (streamId[0] == 0) {
+                        decompressEnded[0] = true;
+                        break;
+                    }
+                    logI("Internal zstd prefetch wrap-around: restarting for loop " + decoderLoopIteration[0]);
                     continue;
                 }
                 
@@ -2279,11 +2252,11 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             
             if (!loop) break;
             playbackLoopIteration++;
-            Log.i(TAG, "Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
+            logI("Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
         }
         
         AlphaVideoGpuModule.nativeStreamingDecompressEnd(streamId[0]);
-        Log.i(TAG, "Internal zstd streaming animation ended");
+        logI("Internal zstd streaming animation ended");
     }
     
     private boolean initGL(SurfaceTexture surfaceTexture) {
@@ -2344,7 +2317,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         GLES30.glEnable(GLES30.GL_BLEND);
         GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE_MINUS_SRC_ALPHA);
         
-        Log.d(TAG, "OpenGL ES 3.0 initialized successfully");
+        logD("OpenGL ES 3.0 initialized successfully");
         return true;
     }
     
@@ -2353,13 +2326,13 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         
         if (extensions != null) {
             if (extensions.contains("GL_KHR_texture_compression_astc_ldr")) {
-                Log.i(TAG, "Using ASTC 4x4 format");
+                logI("Using ASTC 4x4 format");
                 cachedTextureFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
                 return;
             }
             if (extensions.contains("GL_OES_compressed_ETC2_RGBA8_texture") ||
                 extensions.contains("ETC2")) {
-                Log.i(TAG, "Using ETC2 RGBA format");
+                logI("Using ETC2 RGBA format");
                 cachedTextureFormat = GL_COMPRESSED_RGBA8_ETC2_EAC;
                 return;
             }
@@ -2409,7 +2382,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         uniformTextureHeightLocation = GLES30.glGetUniformLocation(program, "uTextureHeight");
         uniformGpuPlaybackLocation = GLES30.glGetUniformLocation(program, "uGpuPlayback");
         
-        Log.d(TAG, "Shaders initialized successfully (gpuPlayback uniforms: " + 
+        logD("Shaders initialized successfully (gpuPlayback uniforms: " + 
               (uniformGpuPlaybackLocation >= 0 ? "found" : "not found") + ")");
         
         // Initialize texture array shader (for packingMode: 'array')
@@ -2453,7 +2426,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         GLES30.glDeleteShader(fragmentShader);
         
         arrayUniformLayerLocation = GLES30.glGetUniformLocation(arrayProgram, "uLayer");
-        Log.d(TAG, "Texture array shader initialized (uLayer location: " + arrayUniformLayerLocation + ")");
+        logD("Texture array shader initialized (uLayer location: " + arrayUniformLayerLocation + ")");
     }
     
     private int compileShader(int type, String source) {
@@ -2550,7 +2523,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 glbKtx2Parts.add(partData);
             }
             
-            Log.i(TAG, "Parsed GLB container: " + glbKtx2Parts.size() + " KTX2 parts");
+            logI("Parsed GLB container: " + glbKtx2Parts.size() + " KTX2 parts");
             isGLBContainer = true;
             
             return jsonData;
@@ -2614,7 +2587,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     }
                     
                     String metadataJson = new String(ktx2Data, valueStart, valueEnd - valueStart, "UTF-8");
-                    Log.d(TAG, "Extracted embedded metadata from KTX2: " + metadataJson.substring(0, Math.min(200, metadataJson.length())) + "...");
+                    logD("Extracted embedded metadata from KTX2: " + metadataJson.substring(0, Math.min(200, metadataJson.length())) + "...");
                     return metadataJson;
                 }
                 
@@ -2664,7 +2637,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 info.columns = partObj.optInt("columns", framesPerRow);
                 info.file = partObj.optString("file", null);
                 partInfoList.add(info);
-                Log.d(TAG, "Part " + i + ": " + info.file + " (" + info.rows + "x" + info.columns + ")");
+                logD("Part " + i + ": " + info.file + " (" + info.rows + "x" + info.columns + ")");
             }
         }
         
@@ -2680,9 +2653,9 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         // Check for stream mode (internal streaming flag in metadata)
         metadataStreamMode = metadata.optBoolean("streamMode", false);
         
-        Log.i(TAG, "Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
+        logI("Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
                 ", " + frameRate + " fps, " + partCount + " parts");
-        Log.i(TAG, "Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode + 
+        logI("Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode + 
                 ", streamMode=" + metadataStreamMode);
     }
     
@@ -2727,7 +2700,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             case 183: astcBlockWidth = 12; astcBlockHeight = 12; astcGlFormat = GL_COMPRESSED_RGBA_ASTC_12x12_KHR; break;
             default:  astcBlockWidth = 4;  astcBlockHeight = 4;  astcGlFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR;   break;
         }
-        Log.i(TAG, "ASTC format: " + astcBlockWidth + "x" + astcBlockHeight + " (vkFormat=" + vkFormat + ", glFormat=0x" + Integer.toHexString(astcGlFormat) + ")");
+        logI("ASTC format: " + astcBlockWidth + "x" + astcBlockHeight + " (vkFormat=" + vkFormat + ", glFormat=0x" + Integer.toHexString(astcGlFormat) + ")");
     }
     
     /**
@@ -2812,7 +2785,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
             
-            Log.d(TAG, "ASTC uploaded on render thread: ID=" + textureIds[0] + ", " + pixelWidth + "x" + pixelHeight);
+            logD("ASTC uploaded on render thread: ID=" + textureIds[0] + ", " + pixelWidth + "x" + pixelHeight);
             return new int[] { textureIds[0], pixelWidth, pixelHeight };
         } catch (Exception e) {
             Log.e(TAG, "Failed to upload ASTC: " + e.getMessage());
@@ -2853,7 +2826,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
             
-            Log.d(TAG, "Transcoded texture uploaded on render thread: ID=" + textureIds[0] + 
+            logD("Transcoded texture uploaded on render thread: ID=" + textureIds[0] + 
                     ", " + pixelWidth + "x" + pixelHeight + ", compressed=" + isCompressed);
             return new int[] { textureIds[0], pixelWidth, pixelHeight };
         } catch (Exception e) {
@@ -2883,7 +2856,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             // Configure ASTC format from vkFormat
             configureASTCFromVkFormat(vkFormat);
             
-            Log.d(TAG, "Native ASTC - VkFormat=" + vkFormat + ", " + pixelWidth + "x" + pixelHeight + 
+            logD("Native ASTC - VkFormat=" + vkFormat + ", " + pixelWidth + "x" + pixelHeight + 
                   ", supercompression=" + supercompressionScheme);
             
             // Read level index (after 80-byte header)
@@ -2891,21 +2864,21 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             long level0ByteLength = header.getLong(88);
             long level0UncompressedLength = header.getLong(96);
             
-            Log.d(TAG, "Level 0 - offset=" + level0ByteOffset + ", length=" + level0ByteLength + 
+            logD("Level 0 - offset=" + level0ByteOffset + ", length=" + level0ByteLength + 
                   ", uncompressed=" + level0UncompressedLength);
             
             byte[] textureData;
             
             if (supercompressionScheme == 2) {
                 // Zstandard compression - use native decompression
-                Log.d(TAG, "Decompressing Zstandard data...");
+                logD("Decompressing Zstandard data...");
                 textureData = AlphaVideoGpuModule.nativeDecompressZstd(
                     ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, (int)level0UncompressedLength);
                 if (textureData == null) {
                     Log.e(TAG, "Zstd decompression failed");
                     return null;
                 }
-                Log.d(TAG, "Decompressed " + textureData.length + " bytes");
+                logD("Decompressed " + textureData.length + " bytes");
             } else if (supercompressionScheme == 0) {
                 // No supercompression
                 textureData = new byte[(int)level0ByteLength];
@@ -2949,7 +2922,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
             
-            Log.d(TAG, "Native ASTC texture uploaded: ID=" + textureIds[0] + ", " + pixelWidth + "x" + pixelHeight);
+            logD("Native ASTC texture uploaded: ID=" + textureIds[0] + ", " + pixelWidth + "x" + pixelHeight);
             
             return new int[] { textureIds[0], pixelWidth, pixelHeight };
         } catch (Exception e) {
@@ -2997,7 +2970,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             int bytesPerLayer = astcBytesPerLayer(pixelWidth, pixelHeight);
             int totalSize = bytesPerLayer * layerCount;
             
-            Log.d(TAG, "KTX2 header: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + 
+            logD("KTX2 header: " + pixelWidth + "x" + pixelHeight + ", " + layerCount + 
                   " layers, supercompression=" + supercompressionScheme);
             
             // Allocate direct ByteBuffer for zero-copy GPU uploads
@@ -3021,7 +2994,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 return null;
             }
             
-            Log.d(TAG, "Decoded " + layerCount + " frames to direct ByteBuffer, " + 
+            logD("Decoded " + layerCount + " frames to direct ByteBuffer, " + 
                   bytesPerLayer + " bytes each, total " + (totalSize / 1024) + " KB");
             
             return new Object[] { pixelWidth, pixelHeight, layerCount, bytesPerLayer, frameBuffer };
@@ -3031,23 +3004,21 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         }
     }
     
-    private void loadPartTextures(String ktx2Path) throws Exception {
-        String basePath = ktx2Path.replaceAll("_\\d+\\.ktx2$", "").replaceAll("\\.ktx2$", "");
-        
+    private void loadPartTextures(AlphaVideoGpuSource local) throws Exception {
         List<Integer> loadedTextureIds = new ArrayList<>();
         List<Integer> loadedTextureWidths = new ArrayList<>();
         List<Integer> loadedTextureHeights = new ArrayList<>();
         
         // Check if we're loading from GLB container
         if (isGLBContainer && glbKtx2Parts != null && glbKtx2Parts.size() > 0) {
-            Log.d(TAG, "Loading " + glbKtx2Parts.size() + " KTX2 parts from GLB container...");
+            logD("Loading " + glbKtx2Parts.size() + " KTX2 parts from GLB container...");
             
             for (int i = 0; i < glbKtx2Parts.size(); i++) {
                 byte[] ktx2Data = glbKtx2Parts.get(i);
                 
                 int[] result;
                 if (isNativeASTC) {
-                    Log.d(TAG, "Using native ASTC loader for GLB part " + i);
+                    logD("Using native ASTC loader for GLB part " + i);
                     result = loadNativeASTCFromKTX2(ktx2Data);
                 } else {
                     result = AlphaVideoGpuModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
@@ -3057,7 +3028,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     loadedTextureIds.add(result[0]);
                     loadedTextureWidths.add(result[1]);
                     loadedTextureHeights.add(result[2]);
-                    Log.d(TAG, "Loaded GLB part " + i + " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
+                    logD("Loaded GLB part " + i + " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
                 } else {
                     Log.e(TAG, "Failed to load GLB part " + i);
                 }
@@ -3069,10 +3040,10 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             
             if (actualPartCount > 1 && (useExplicitParts || !partInfoList.isEmpty())) {
                 // Load all parts from separate files
-                Log.d(TAG, "Loading " + actualPartCount + " part files" + (useExplicitParts ? " (explicit URIs)" : "") + "...");
+                logD("Loading " + actualPartCount + " part files" + (useExplicitParts ? " (explicit URIs)" : "") + "...");
                 
                 for (int i = 0; i < actualPartCount; i++) {
-                    int[] result = loadSinglePart(i, ktx2Path, basePath, useExplicitParts);
+                    int[] result = loadSinglePart(i, local, useExplicitParts);
                     if (result != null) {
                         loadedTextureIds.add(result[0]);
                         loadedTextureWidths.add(result[1]);
@@ -3081,12 +3052,9 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 }
             } else if (useTextureArray) {
                 // Load texture array (packingMode: 'array')
-                Log.d(TAG, "Loading texture array from: " + ktx2Path);
+                logD("Loading texture array from: " + local);
                 
-                byte[] ktx2Data = readFileBytes(ktx2Path);
-                if (ktx2Data == null) {
-                    throw new Exception("Failed to read KTX2 file: " + ktx2Path);
-                }
+                byte[] ktx2Data = local.readAll(getContext());
                 
                 boolean useAstc = isNativeASTC && isASTCSupported();
                 
@@ -3096,7 +3064,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 boolean useRamMode = "ram".equals(memoryStrategy);
                 
                 if (useRamMode) {
-                    Log.d(TAG, "RAM-heavy mode: Decoding texture array to RAM, will upload per-frame");
+                    logD("RAM-heavy mode: Decoding texture array to RAM, will upload per-frame");
                     
                     // Decode all frames to RAM using nativeLoadTextureArrayToRam
                     // This returns frame data in a contiguous direct ByteBuffer (zero-copy)
@@ -3122,7 +3090,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     ramHeavyMode = true;
                     ramUploadedFrame = -1;
                     
-                    Log.d(TAG, "RAM-heavy texture array: " + layerCount + " frames in direct ByteBuffer (" + 
+                    logD("RAM-heavy texture array: " + layerCount + " frames in direct ByteBuffer (" + 
                           (ramFrameCount * ramBytesPerFrame / 1024) + " KB), " +
                           gpuRingSize + " slots in GPU ring buffer");
                     
@@ -3130,7 +3098,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     loadedTextureWidths.add(texWidth);
                     loadedTextureHeights.add(texHeight);
                 } else {
-                    Log.d(TAG, "VRAM mode: Loading texture array with ASTC=" + useAstc);
+                    logD("VRAM mode: Loading texture array with ASTC=" + useAstc);
                     
                     int[] result = AlphaVideoGpuModule.nativeLoadTextureArray(ktx2Data, useAstc);
                     if (result == null || result.length < 4) {
@@ -3143,7 +3111,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     textureArrayLayerCount = result[3];
                     ramHeavyMode = false;
                     
-                    Log.d(TAG, "Loaded texture array ID " + textureArrayId + 
+                    logD("Loaded texture array ID " + textureArrayId + 
                           " (" + texWidth + "x" + texHeight + ", " + textureArrayLayerCount + " layers)");
                     
                     // For texture arrays, we don't use the regular texture list
@@ -3153,16 +3121,13 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                     loadedTextureHeights.add(texHeight);
                 }
             } else {
-                Log.d(TAG, "Loading single KTX2 file: " + ktx2Path + (isNativeASTC ? " (native ASTC)" : ""));
+                logD("Loading single KTX2 file: " + local + (isNativeASTC ? " (native ASTC)" : ""));
                 
-                byte[] ktx2Data = readFileBytes(ktx2Path);
-                if (ktx2Data == null) {
-                    throw new Exception("Failed to read KTX2 file: " + ktx2Path);
-                }
+                byte[] ktx2Data = local.readAll(getContext());
                 
                 int[] result;
                 if (isNativeASTC) {
-                    Log.d(TAG, "Using native ASTC loader");
+                    logD("Using native ASTC loader");
                     result = loadNativeASTCFromKTX2(ktx2Data);
                 } else {
                     result = AlphaVideoGpuModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
@@ -3176,7 +3141,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
                 loadedTextureWidths.add(result[1]);
                 loadedTextureHeights.add(result[2]);
                 
-                Log.d(TAG, (isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " texture ID " + 
+                logD((isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " texture ID " + 
                       result[0] + " (" + result[1] + "x" + result[2] + ")");
             }
         }
@@ -3190,47 +3155,65 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             textureHeights[i] = loadedTextureHeights.get(i);
         }
         
-        Log.d(TAG, "Loaded " + textureIds.length + " textures");
+        logD("Loaded " + textureIds.length + " textures");
     }
     
     /**
-     * Get the path/URL for a specific part file.
+     * The URI of a part file: from the parts prop, else the file the metadata names (or
+     * {@code <name>_<index>.ktx2}) in the source's folder. Null when the source has no folder.
      */
-    private String getPartPath(int partIndex, String ktx2Path, String basePath, boolean useExplicitParts) {
+    private String getPartUri(int partIndex, boolean useExplicitParts) {
         if (useExplicitParts && partIndex < explicitPartUris.length && explicitPartUris[partIndex] != null) {
-            // Use explicit URI from parts prop
             return explicitPartUris[partIndex];
-        } else if (partIndex < partInfoList.size() && partInfoList.get(partIndex).file != null) {
-            // Use filename from metadata
-            File ktx2File = new File(ktx2Path);
-            File parentDir = ktx2File.getParentFile();
-            if (parentDir != null) {
-                return new File(parentDir, partInfoList.get(partIndex).file).getAbsolutePath();
-            } else {
-                return partInfoList.get(partIndex).file;
-            }
-        } else {
-            // Fallback: construct path from base name
-            return basePath + "_" + partIndex + ".ktx2";
         }
+        String fileName;
+        if (partIndex < partInfoList.size() && partInfoList.get(partIndex).file != null) {
+            fileName = partInfoList.get(partIndex).file;
+        } else {
+            String name = mSource.substring(mSource.lastIndexOf('/') + 1);
+            int query = name.indexOf('?');
+            if (query >= 0) name = name.substring(0, query);
+            fileName = name.replaceAll("_\\d+\\.ktx2$", "").replaceAll("\\.ktx2$", "") + "_" + partIndex + ".ktx2";
+        }
+        return AlphaVideoGpuSource.resolveSibling(mSource, fileName);
+    }
+
+    /**
+     * The cache key for a downloaded part: its own key from the parts prop, else the source's
+     * key with the index before the extension ({@code glow.ktx2} becomes {@code glow_1.ktx2}).
+     */
+    private String getPartCacheKey(int partIndex, boolean useExplicitParts) {
+        if (useExplicitParts && explicitPartCacheKeys != null && partIndex < explicitPartCacheKeys.length
+                && explicitPartCacheKeys[partIndex] != null) {
+            return explicitPartCacheKeys[partIndex];
+        }
+        String key = mPlayingCacheKey;
+        if (key == null || key.isEmpty()) return null;
+        int dot = key.lastIndexOf('.');
+        if (dot > key.lastIndexOf('/')) {
+            return key.substring(0, dot) + "_" + partIndex + key.substring(dot);
+        }
+        return key + "_" + partIndex;
     }
     
     /**
      * Load a single part texture. Used by both normal and stream mode.
      */
-    private int[] loadSinglePart(int partIndex, String ktx2Path, String basePath, boolean useExplicitParts) throws Exception {
-        String partPath = getPartPath(partIndex, ktx2Path, basePath, useExplicitParts);
-        
-        Log.d(TAG, "Loading part " + partIndex + ": " + partPath);
-        
-        byte[] ktx2Data = readFileBytes(partPath);
-        if (ktx2Data == null) {
-            throw new Exception("Failed to read part file: " + partPath);
+    private int[] loadSinglePart(int partIndex, AlphaVideoGpuSource local, boolean useExplicitParts) throws Exception {
+        String partUri = getPartUri(partIndex, useExplicitParts);
+        if (partUri == null) {
+            throw new Exception("Can't locate part " + partIndex + " next to " + local + "; pass the parts prop");
         }
+        
+        logD("Loading part " + partIndex + ": " + partUri);
+        
+        byte[] ktx2Data = partUri.equals(mSource)
+            ? local.readAll(getContext())
+            : resolveSource(partUri, getPartCacheKey(partIndex, useExplicitParts)).readAll(getContext());
         
         int[] result;
         if (isNativeASTC) {
-            Log.d(TAG, "Using native ASTC loader for part " + partIndex);
+            logD("Using native ASTC loader for part " + partIndex);
             result = loadNativeASTCFromKTX2(ktx2Data);
         } else {
             result = AlphaVideoGpuModule.nativeTranscodeKTX2(ktx2Data, cachedTextureFormat);
@@ -3240,7 +3223,7 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
             throw new Exception("Failed to " + (isNativeASTC ? "load native ASTC" : "transcode") + " part " + partIndex);
         }
         
-        Log.d(TAG, (isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " part " + partIndex + 
+        logD((isNativeASTC ? "Loaded native ASTC" : "Transcoded") + " part " + partIndex + 
               " texture ID " + result[0] + " (" + result[1] + "x" + result[2] + ")");
         
         return result;
@@ -3488,253 +3471,55 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
         }
     }
     
-    private byte[] readFileBytes(String path) throws IOException {
-        InputStream is = null;
-        
-        // Handle HTTP URLs (e.g., from Metro bundler in debug mode)
-        // Download and CACHE to avoid re-downloading during playback
-        if (path.startsWith("http://") || path.startsWith("https://")) {
-            String cachedPath = downloadPartToCache(path);
-            if (cachedPath == null) {
-                throw new IOException("Failed to download and cache: " + path);
-            }
-            // Now read from the cached file
-            File cachedFile = new File(cachedPath);
-            is = new FileInputStream(cachedFile);
-            try {
-                ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                byte[] buffer = new byte[8192];
-                int len;
-                while ((len = is.read(buffer)) != -1) {
-                    bos.write(buffer, 0, len);
-                }
-                return bos.toByteArray();
-            } finally {
-                is.close();
-            }
+    /** Turns a source URI into a local file, downloading remote ones into the cache first. */
+    private AlphaVideoGpuSource resolveSource(String uri, String cacheKey) throws IOException {
+        if (AlphaVideoGpuDownloader.isRemote(uri)) {
+            File file = AlphaVideoGpuDownloader.fetch(getContext(), uri, cacheKey, shouldStop);
+            return AlphaVideoGpuSource.file(file.getPath());
         }
-        
-        if (path.startsWith("assets://") || path.startsWith("asset://")) {
-            String assetPath = path.replaceFirst("assets?://", "");
-            is = getContext().getAssets().open(assetPath);
-        } else {
-            File file = new File(path);
-            if (file.exists()) {
-                is = new FileInputStream(file);
-            } else {
-                try {
-                    is = getContext().getAssets().open(path);
-                } catch (IOException e) {
-                    return null;
-                }
-            }
-        }
-        
-        if (is == null) return null;
-        
-        try {
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            byte[] buffer = new byte[8192];
-            int len;
-            while ((len = is.read(buffer)) != -1) {
-                bos.write(buffer, 0, len);
-            }
-            return bos.toByteArray();
-        } finally {
-            is.close();
-        }
+        return AlphaVideoGpuSource.parse(uri);
     }
-    
+
     /**
-     * Download bytes from an HTTP URL (used for Metro bundler in debug mode)
+     * Starts a memory-mapped zstd stream over the whole file, or returns 0 when the file can't be
+     * mapped (a compressed APK asset, or a content:// pipe); callers then read it into memory.
      */
-    private byte[] downloadBytes(String urlString) throws IOException {
-        java.net.URL url = new java.net.URL(urlString);
-        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(30000);
-        conn.setRequestProperty("User-Agent", "KTX2Player/1.0");
-        
-        int responseCode = conn.getResponseCode();
-        if (responseCode != java.net.HttpURLConnection.HTTP_OK) {
-            Log.e(TAG, "Download failed: HTTP " + responseCode + " for " + urlString);
-            throw new IOException("HTTP " + responseCode);
-        }
-        
-        Log.d(TAG, "Downloaded " + conn.getContentLength() + " bytes from " + urlString.substring(0, Math.min(80, urlString.length())));
-        
-        try (InputStream in = conn.getInputStream();
-             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            int len;
-            while ((len = in.read(buffer)) != -1) {
-                bos.write(buffer, 0, len);
-            }
-            return bos.toByteArray();
+    private long openMappedZstdStream(AlphaVideoGpuSource local) {
+        try (AssetFileDescriptor afd = local.openFd(getContext())) {
+            return AlphaVideoGpuModule.nativeStreamingDecompressInitFromFd(
+                afd.getParcelFileDescriptor().getFd(), afd.getStartOffset(), afd.getLength());
+        } catch (IOException e) {
+            Log.w(TAG, "Cannot memory-map " + local + ", reading it into memory instead: " + e.getMessage());
+            return 0;
         }
     }
-    
-    /**
-     * Download a part file to cache. Uses URL hash as cache key.
-     * Returns the cached file path, or null on failure.
-     */
-    private String downloadPartToCache(String urlString) {
-        try {
-            // Generate hash from URL for cache key
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
-            byte[] hashBytes = md.digest(urlString.getBytes());
-            StringBuilder sb = new StringBuilder();
-            for (byte b : hashBytes) {
-                sb.append(String.format("%02x", b));
-            }
-            String hash = sb.toString().substring(0, 16);
-            
-            File cacheDir = new File(getContext().getCacheDir(), "ktx2-parts-cache");
-            if (!cacheDir.exists()) {
-                cacheDir.mkdirs();
-            }
-            
-            File cacheFile = new File(cacheDir, hash + ".ktx2");
-            
-            // Return cached file if it exists
-            if (cacheFile.exists()) {
-                Log.d(TAG, "Using cached part: " + cacheFile.getAbsolutePath());
-                return cacheFile.getAbsolutePath();
-            }
-            
-            // Download to cache
-            Log.d(TAG, "Downloading part to cache: " + urlString.substring(0, Math.min(80, urlString.length())));
-            
-            java.net.URL url = new java.net.URL(urlString);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(30000);
-            conn.setRequestProperty("User-Agent", "KTX2Player/1.0");
-            
-            int responseCode = conn.getResponseCode();
-            if (responseCode != java.net.HttpURLConnection.HTTP_OK) {
-                Log.e(TAG, "Part download failed: HTTP " + responseCode);
-                return null;
-            }
-            
-            // Download to temp file first, then rename
-            File tempFile = new File(cacheDir, hash + ".tmp");
-            
-            try (InputStream in = conn.getInputStream();
-                 FileOutputStream out = new FileOutputStream(tempFile)) {
-                byte[] buffer = new byte[8192];
-                int bytesRead;
-                int totalBytes = 0;
-                while ((bytesRead = in.read(buffer)) != -1) {
-                    out.write(buffer, 0, bytesRead);
-                    totalBytes += bytesRead;
-                }
-                Log.d(TAG, "Downloaded " + totalBytes + " bytes to cache");
-            }
-            
-            // Rename temp to final
-            if (tempFile.renameTo(cacheFile)) {
-                return cacheFile.getAbsolutePath();
-            } else {
-                // Fallback: copy if rename fails
-                tempFile.delete();
-                return null;
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to download part to cache: " + e.getMessage());
-            return null;
+
+    /** Starts a zstd stream over the level0 data of an internally compressed KTX2, memory-mapped in place. */
+    private long openInternalZstdStream(AlphaVideoGpuSource local, long level0Offset, long level0Length) throws IOException {
+        try (AssetFileDescriptor afd = local.openFd(getContext())) {
+            return AlphaVideoGpuModule.nativeInternalZstdStreamingInit(
+                afd.getParcelFileDescriptor().getFd(), afd.getStartOffset() + level0Offset, level0Length);
         }
     }
-    
-    private String downloadToCache(String urlString) {
-        try {
-            File cacheFile;
-            String tempSuffix;
-            
-            if (mCacheKey != null && !mCacheKey.isEmpty()) {
-                cacheFile = new File(getContext().getCacheDir(), mCacheKey);
-                File parentDir = cacheFile.getParentFile();
-                if (parentDir != null && !parentDir.exists()) {
-                    parentDir.mkdirs();
-                }
-                tempSuffix = String.valueOf(mCacheKey.hashCode());
-                Log.d(TAG, "Using custom cacheKey: " + mCacheKey);
-            } else {
-                java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
-                byte[] hashBytes = md.digest(urlString.getBytes());
-                StringBuilder sb = new StringBuilder();
-                for (byte b : hashBytes) {
-                    sb.append(String.format("%02x", b));
-                }
-                String hash = sb.toString().substring(0, 16);
-                
-                File cacheDir = new File(getContext().getCacheDir(), "ktx2-cache");
-                if (!cacheDir.exists()) {
-                    cacheDir.mkdirs();
-                }
-                
-                // Preserve .zst extension for streaming files
-                String extension = ".ktx2";
-                if (urlString.contains(".zst")) {
-                    extension = ".ktx2.zst";
-                }
-                cacheFile = new File(cacheDir, hash + extension);
-                tempSuffix = hash;
-            }
-            
-            if (cacheFile.exists()) {
-                Log.d(TAG, "Using cached: " + cacheFile.getAbsolutePath());
-                return cacheFile.getAbsolutePath();
-            }
-            
-            java.net.URL url = new java.net.URL(urlString);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(30000);
-            conn.setRequestProperty("User-Agent", "KTX2Player/1.0");
-            
-            int responseCode = conn.getResponseCode();
-            if (responseCode != java.net.HttpURLConnection.HTTP_OK) {
-                Log.e(TAG, "Download failed: HTTP " + responseCode);
-                return null;
-            }
-            
-            // Preserve extension for temp file (matches cacheFile extension)
-            String tempExtension = urlString.contains(".zst") ? ".ktx2.zst" : ".ktx2";
-            File tempFile = new File(getContext().getCacheDir(), "ktx2_tmp_" + tempSuffix + tempExtension);
-            
-            try (InputStream in = conn.getInputStream();
-                 FileOutputStream out = new FileOutputStream(tempFile)) {
-                byte[] buffer = new byte[8192];
-                int bytesRead;
-                int totalBytes = 0;
-                while ((bytesRead = in.read(buffer)) != -1) {
-                    if (shouldStop.get()) {
-                        tempFile.delete();
-                        return null;
-                    }
-                    out.write(buffer, 0, bytesRead);
-                    totalBytes += bytesRead;
-                }
-                Log.d(TAG, "Downloaded " + totalBytes + " bytes");
-            }
-            
-            if (tempFile.renameTo(cacheFile)) {
-                return cacheFile.getAbsolutePath();
-            } else {
-                return tempFile.getAbsolutePath();
-            }
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Download failed", e);
-            return null;
-        }
+
+    private void logD(String message) {
+        if (verbose) Log.d(TAG, message);
     }
-    
+
+    private void logI(String message) {
+        if (verbose) Log.i(TAG, message);
+    }
+
+    private static boolean isZstdFrame(byte[] head) {
+        return head.length >= 4
+            && (head[0] & 0xFF) == 0x28 && (head[1] & 0xFF) == 0xB5
+            && (head[2] & 0xFF) == 0x2F && (head[3] & 0xFF) == 0xFD;
+    }
+
     // TextureView.SurfaceTextureListener implementation
     @Override
     public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
-        Log.d(TAG, "onSurfaceTextureAvailable: " + width + "x" + height);
+        logD("onSurfaceTextureAvailable: " + width + "x" + height);
         isDestroyed.set(false);
         shouldStop.set(false);
         // Always start playback if we have a source - handles screen navigation
@@ -3745,12 +3530,12 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     
     @Override
     public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
-        Log.d(TAG, "onSurfaceTextureSizeChanged: " + width + "x" + height);
+        logD("onSurfaceTextureSizeChanged: " + width + "x" + height);
     }
     
     @Override
     public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
-        Log.d(TAG, "onSurfaceTextureDestroyed");
+        logD("onSurfaceTextureDestroyed");
         isDestroyed.set(true);
         shouldStop.set(true);
         isPlaying.set(false);
@@ -3768,14 +3553,14 @@ public class AlphaVideoGpuTextureView extends TextureView implements TextureView
     @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
-        Log.d(TAG, "onDetachedFromWindow");
+        logD("onDetachedFromWindow");
         destroy();
     }
     
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
-        Log.d(TAG, "onAttachedToWindow");
+        logD("onAttachedToWindow");
         isDestroyed.set(false);
     }
 }

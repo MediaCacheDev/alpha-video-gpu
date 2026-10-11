@@ -32,6 +32,8 @@ export interface AlphaVideoGpuPlayerProps {
   src?: string;
   /** Optional array of part URIs for multi-part animations */
   parts?: string[];
+  /** Stable identity for the IndexedDB cache, for URLs that change while the file doesn't */
+  cacheKey?: string;
   /** Canvas width in pixels */
   width?: number;
   /** Canvas height in pixels */
@@ -52,6 +54,8 @@ export interface AlphaVideoGpuPlayerProps {
   streamingCacheSize?: number;
   streamingPrefetchAhead?: number;
   memoryStrategy?: MemoryStrategy;
+  /** Log info traces to the console. Default: false */
+  verbose?: boolean;
 
   // Callbacks
   onLoad?: (event: KTX2LoadEvent) => void;
@@ -64,6 +68,7 @@ export interface AlphaVideoGpuPlayerProps {
 export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
   src,
   parts,
+  cacheKey,
   width = 300,
   height = 300,
   className,
@@ -77,6 +82,7 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
   streamingCacheSize,
   streamingPrefetchAhead,
   memoryStrategy,
+  verbose = false,
   onLoad,
   onStateChange,
   onFrameUpdate,
@@ -101,6 +107,7 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
       streamingCacheSize,
       streamingPrefetchAhead,
       memoryStrategy,
+      verbose,
       basisTranscoderInit: initBasisTranscoder,
       ZSTDDecoderClass: ZSTDDecoder as any,
       onStateChange,
@@ -126,12 +133,16 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
   // Load source
   useEffect(() => {
     const core = coreRef.current;
-    if (!core || !src || loadedSrcRef.current === src) return;
-    loadedSrcRef.current = src;
-    core.setSource(src, parts);
+    if (!core || !src) return;
+    const identity = cacheKey || src;
+    if (loadedSrcRef.current === identity) return;
+    loadedSrcRef.current = identity;
+    core.setSource(src, parts, cacheKey);
     return () => { loadedSrcRef.current = null; core.resetSource(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src]);
+  }, [cacheKey || src]);
+
+  useEffect(() => { if (coreRef.current) coreRef.current.verbose = verbose; }, [verbose]);
 
   // Playback speed
   useEffect(() => { if (coreRef.current) coreRef.current.playbackSpeed = playbackSpeed; }, [playbackSpeed]);

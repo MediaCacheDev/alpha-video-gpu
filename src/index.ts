@@ -4,16 +4,12 @@ import type React from 'react';
 // Re-export native component types
 export * from './AlphaVideoGpuViewNativeComponent';
 
-// Source type for the wrapper component
-export interface AlphaVideoGpuSource {
-  uri?: string;
-  path?: string;
-  cacheKey?: string;
-}
+// Source type for the wrapper component (see SourceType for the URI forms)
+export type AlphaVideoGpuSource = import('./AlphaVideoGpuViewNativeComponent').SourceType;
 
 // Props for the main AlphaVideoGpuView wrapper component (index.js)
 export interface AlphaVideoGpuViewProps {
-  /** Source object with uri/path, or string path (legacy) */
+  /** Source object, or a bare URI string (legacy) */
   source?: AlphaVideoGpuSource | string | null;
   /** Start playing automatically (default: true) */
   autoPlay?: boolean;
@@ -21,7 +17,9 @@ export interface AlphaVideoGpuViewProps {
   loop?: boolean;
   /** Playback speed multiplier (default: 1.0) */
   playbackSpeed?: number;
-  /** Custom cache key for remote downloads */
+  /** Multi-part animations: every part's source, when the parts can't be found next to `source` */
+  parts?: ReadonlyArray<AlphaVideoGpuSource> | null;
+  /** Cache key for remote downloads (same as `source.cacheKey`) */
   cacheKey?: string;
   /** Pause playback */
   paused?: boolean;
@@ -45,6 +43,10 @@ export interface AlphaVideoGpuViewProps {
   memoryStrategy?: 'auto' | 'vram' | 'ram';
   stream?: boolean;
   gpuPlayback?: boolean;
+  /** Send onFrameUpdate for every rendered frame (native). Default: false */
+  enableFrameEvents?: boolean;
+  /** Log info traces. Warnings and errors always log. Default: false */
+  verbose?: boolean;
 }
 
 // The actual component is defined in index.js, but we declare the type here

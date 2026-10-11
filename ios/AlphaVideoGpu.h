@@ -31,6 +31,7 @@
 @property (nonatomic, assign) NSInteger streamingPrefetchAhead; // Frames to decode ahead of playback
 @property (nonatomic, copy) NSString *memoryStrategy;           // "auto", "vram", "ram"
 @property (nonatomic, assign) BOOL stream;                      // Enable streaming mode for texture arrays
+@property (nonatomic, assign) BOOL verbose;                     // Log info traces (warnings and errors always log)
 
 // Animation properties
 @property (nonatomic, assign) NSInteger currentFrame;
@@ -59,7 +60,6 @@
 @property (nonatomic, copy) RCTDirectEventBlock onFinished;
 @property (nonatomic, copy) RCTDirectEventBlock onError;
 
-- (void)loadKTX2WithSource:(NSDictionary *)source;
 - (void)play;
 - (void)pause;
 - (void)stop;

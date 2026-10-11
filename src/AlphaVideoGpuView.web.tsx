@@ -25,8 +25,16 @@ import type { KTX2LoadEvent } from './web/types';
 export type { KTX2LoadEvent as AlphaVideoGpuLoadEvent, PlayerState } from './web/types';
 export type { KTX2LoadEvent } from './web/types'; // Legacy alias
 
+/**
+ * Where to load from (on web, `asset://` and http(s) URLs apply):
+ * - `https://…` / `http://…`: downloaded once into the app cache (named by `cacheKey`, else a hash of the URL)
+ * - `file:///abs/path` or `/abs/path`: read in place
+ * - `asset://relative/path`: Android APK `assets/`, the iOS app bundle, or the site root on web
+ * - Android only: `content://…`, or a res/raw name (what `require()` resolves to in a release build)
+ */
 export interface SourceType {
   uri?: string;
+  /** Stable identity for the cache, for URLs that change while the file doesn't (presigned URLs) */
   cacheKey?: string;
 }
 
@@ -59,6 +67,8 @@ export interface AlphaVideoGpuViewProps {
   memoryStrategy?: 'auto' | 'vram' | 'ram';
   /** Enable streaming mode for texture array playback. Default: false */
   stream?: boolean;
+  /** Log info traces to the console. Default: false */
+  verbose?: boolean;
 }
 
 // ============================================================================
@@ -72,6 +82,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
   loop = true,
   playbackSpeed = 1.0,
   paused = false,
+  cacheKey,
   style,
   onLoad,
   onStateChange,
@@ -83,6 +94,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
   streamingPrefetchAhead = 30,
   memoryStrategy = 'auto',
   stream = false,
+  verbose = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const coreRef = useRef<KTX2PlayerCore | null>(null);
@@ -109,6 +121,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
       streamingCacheSize,
       streamingPrefetchAhead,
       memoryStrategy,
+      verbose,
       basisTranscoderInit: initBundledBasis,
       ZSTDDecoderClass: ZSTDDecoderClass as any,
       onStateChange,
@@ -142,7 +155,8 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
   // lists its media, so the URL changes while still addressing the same object; keying
   // the load on it would resetSource() and refetch on each refresh, visibly restarting
   // a loop that should run until unmount. The cache key is the stable identity.
-  const sourceIdentity = normalizedSource?.cacheKey || normalizedSource?.uri || null;
+  const sourceCacheKey = normalizedSource?.cacheKey || cacheKey;
+  const sourceIdentity = sourceCacheKey || normalizedSource?.uri || null;
 
   // Load source when it changes
   useEffect(() => {
@@ -152,7 +166,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
 
     loadedSourceRef.current = sourceIdentity;
     const partUris = parts?.map(p => p.uri).filter(Boolean) as string[] | undefined;
-    core.setSource(uri, partUris);
+    core.setSource(uri, partUris, sourceCacheKey);
 
     return () => {
       loadedSourceRef.current = null;
@@ -160,6 +174,12 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceIdentity]);
+
+  useEffect(() => {
+    if (coreRef.current) {
+      coreRef.current.verbose = verbose;
+    }
+  }, [verbose]);
 
   // Handle playback speed changes
   useEffect(() => {

@@ -16,7 +16,7 @@ function openCacheDb(): Promise<IDBDatabase> {
   cacheDbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(KTX2_CACHE_DB_NAME, KTX2_CACHE_VERSION);
     request.onerror = () => {
-      console.warn('[KTX2Core] IndexedDB cache unavailable:', request.error);
+      console.warn('[AlphaVideoGpu] IndexedDB cache unavailable:', request.error);
       reject(request.error);
     };
     request.onsuccess = () => resolve(request.result);
@@ -32,9 +32,9 @@ function openCacheDb(): Promise<IDBDatabase> {
 }
 
 /**
- * Retrieve a cached file by URL. Returns null on miss or error.
+ * Retrieve a cached file by its key (the cache key, or the URL). Returns null on miss or error.
  */
-export async function getCachedFile(url: string): Promise<ArrayBuffer | null> {
+export async function getCachedFile(url: string, verbose = false): Promise<ArrayBuffer | null> {
   try {
     const db = await openCacheDb();
     return new Promise((resolve) => {
@@ -43,7 +43,7 @@ export async function getCachedFile(url: string): Promise<ArrayBuffer | null> {
       const request = store.get(url);
       request.onsuccess = () => {
         if (request.result) {
-          console.log(`[KTX2Core] Cache hit: ${url}`);
+          if (verbose) console.log(`[AlphaVideoGpu] Cache hit: ${url}`);
           resolve(request.result.data);
         } else {
           resolve(null);
@@ -61,7 +61,8 @@ export async function getCachedFile(url: string): Promise<ArrayBuffer | null> {
  */
 export async function setCachedFile(
   url: string,
-  data: ArrayBuffer
+  data: ArrayBuffer,
+  verbose = false
 ): Promise<void> {
   try {
     const db = await openCacheDb();
@@ -70,8 +71,8 @@ export async function setCachedFile(
       const store = tx.objectStore(KTX2_CACHE_STORE_NAME);
       store.put({ url, data, timestamp: Date.now() });
       tx.oncomplete = () => {
-        console.log(
-          `[KTX2Core] Cached: ${url} (${(data.byteLength / 1024 / 1024).toFixed(1)}MB)`
+        if (verbose) console.log(
+          `[AlphaVideoGpu] Cached: ${url} (${(data.byteLength / 1024 / 1024).toFixed(1)}MB)`
         );
         resolve();
       };
