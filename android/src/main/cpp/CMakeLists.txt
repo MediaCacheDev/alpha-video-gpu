@@ -38,6 +38,9 @@ target_compile_definitions(alphavideogpu PRIVATE
     BASISU_NO_ITERATOR_DEBUG_LEVEL=1
 )
 
+# Google Play requires 16 KB-aligned segments for Android 15+; NDK r27 and older link 4 KB by default.
+target_link_options(alphavideogpu PRIVATE "-Wl,-z,max-page-size=16384")
+
 target_link_libraries(alphavideogpu
     basis_transcoder
     EGL
