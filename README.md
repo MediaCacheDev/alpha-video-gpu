@@ -692,15 +692,15 @@ Not ideal for:
 | `streamingRingSize` | `number` | `16` | GPU texture slots for streaming |
 | `streamingCacheSize` | `number` | `60` | CPU cache size for RAM streaming |
 | `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead |
-| `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every rendered frame (native) |
+| `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every frame played, not only after seeks |
 | `verbose` | `boolean` | `false` | Log info traces (Logcat, Xcode console, browser console); warnings and errors always log |
 | `onLoad` | `({ nativeEvent: { width, height, frameCount, frameRate, duration } }) => void` | — | Metadata is known |
 | `onStateChange` | `({ nativeEvent: { state } }) => void` | — | `state` is `"loading"`, `"ready"`, `"playing"`, `"paused"` or `"stopped"` |
-| `onFrameUpdate` | `({ nativeEvent: { frame, totalFrames } }) => void` | — | Needs `enableFrameEvents` on native |
+| `onFrameUpdate` | `({ nativeEvent: { frame, totalFrames } }) => void` | — | After a seek, and for every frame with `enableFrameEvents` |
 | `onFinished` | `() => void` | — | A non-looping animation reached its last frame |
 | `onError` | `({ nativeEvent: { error } }) => void` | — | Loading or playback failed |
 
-Playback is controlled with props (`paused`, `autoPlay`, a new `source`); there is no imperative ref API yet.
+The events have the same shape on Android, iOS and web. Playback is controlled with props (`paused`, `autoPlay`, a new `source`) and with the ref (see [Usage](#usage)).
 
 ---
 

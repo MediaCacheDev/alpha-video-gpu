@@ -44,12 +44,15 @@ export interface AlphaVideoGpuViewProps {
   paused?: boolean;
   cacheKey?: string;
   style?: any;
+  // Events have the native shape, so the same handlers work on every platform
   /** Called when file metadata is loaded, provides dimensions and frame info */
-  onLoad?: (event: AlphaVideoGpuLoadEvent) => void;
-  onStateChange?: (state: string) => void;
-  onFrameUpdate?: (frame: number, total: number) => void;
-  onFinished?: () => void;
-  onError?: (error: Error) => void;
+  onLoad?: (event: { nativeEvent: AlphaVideoGpuLoadEvent }) => void;
+  onStateChange?: (event: { nativeEvent: { state: string } }) => void;
+  onFrameUpdate?: (event: { nativeEvent: { frame: number; totalFrames: number } }) => void;
+  onFinished?: (event: { nativeEvent: {} }) => void;
+  onError?: (event: { nativeEvent: { error: string } }) => void;
+  /** Send onFrameUpdate for every frame played; seeks always send it. Default: false */
+  enableFrameEvents?: boolean;
 
   // Streaming parameters (for .ktx2.zst files)
   /** GPU ring buffer slots (VRAM). Default: 16 */
@@ -97,11 +100,14 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   streamingPrefetchAhead = 30,
   memoryStrategy = 'auto',
   stream = false,
+  enableFrameEvents = false,
   verbose = false,
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const coreRef = useRef<AlphaVideoGpuCore | null>(null);
   const loadedSourceRef = useRef<string | null>(null);
+  const callbacksRef = useRef({ onLoad, onStateChange, onFrameUpdate, onFinished, onError });
+  callbacksRef.current = { onLoad, onStateChange, onFrameUpdate, onFinished, onError };
 
   useImperativeHandle(ref, () => ({
     play: () => coreRef.current?.play(),
@@ -133,13 +139,15 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
       streamingPrefetchAhead,
       memoryStrategy,
       verbose,
+      frameEvents: enableFrameEvents,
       basisTranscoderInit: initBasisTranscoder,
       ZSTDDecoderClass: ZSTDDecoder,
-      onStateChange,
-      onLoad,
-      onFrameUpdate,
-      onFinished,
-      onError,
+      onStateChange: state => callbacksRef.current.onStateChange?.({ nativeEvent: { state } }),
+      onLoad: event => callbacksRef.current.onLoad?.({ nativeEvent: event }),
+      onFrameUpdate: (frame, totalFrames) =>
+        callbacksRef.current.onFrameUpdate?.({ nativeEvent: { frame, totalFrames } }),
+      onFinished: () => callbacksRef.current.onFinished?.({ nativeEvent: {} }),
+      onError: error => callbacksRef.current.onError?.({ nativeEvent: { error: error.message } }),
     });
 
     return () => {
@@ -150,17 +158,6 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
     // Only create/destroy on mount/unmount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Keep callbacks in sync with latest props
-  useEffect(() => {
-    coreRef.current?.updateCallbacks({
-      onStateChange,
-      onLoad,
-      onFrameUpdate,
-      onFinished,
-      onError,
-    });
-  }, [onStateChange, onLoad, onFrameUpdate, onFinished, onError]);
 
   // What identifies "the same video". A presigned URL is re-signed every time the app
   // lists its media, so the URL changes while still addressing the same object; keying
@@ -191,6 +188,12 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
       coreRef.current.verbose = verbose;
     }
   }, [verbose]);
+
+  useEffect(() => {
+    if (coreRef.current) {
+      coreRef.current.frameEvents = enableFrameEvents;
+    }
+  }, [enableFrameEvents]);
 
   // Handle playback speed changes
   useEffect(() => {

@@ -85,6 +85,8 @@ export interface KTX2PlayerCoreOptions {
   onFrameUpdate?: (frame: number, total: number) => void;
   onFinished?: () => void;
   onError?: (error: Error) => void;
+  /** Call onFrameUpdate for every frame played; seeks always call it. Default: true */
+  frameEvents?: boolean;
 }
 
 /**

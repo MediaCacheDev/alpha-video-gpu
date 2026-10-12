@@ -80,6 +80,7 @@ export class KTX2PlayerCore {
   private _onStateChange: ((state: PlayerState) => void) | null;
   private _onLoad: ((event: KTX2LoadEvent) => void) | null;
   private _onFrameUpdate: ((frame: number, total: number) => void) | null;
+  private _frameEvents: boolean;
   private _onFinished: (() => void) | null;
   private _onError: ((error: Error) => void) | null;
 
@@ -172,6 +173,7 @@ export class KTX2PlayerCore {
     this._onFrameUpdate = options.onFrameUpdate ?? null;
     this._onFinished = options.onFinished ?? null;
     this._onError = options.onError ?? null;
+    this._frameEvents = options.frameEvents ?? true;
   }
 
   // ======== Public API ========
@@ -187,6 +189,10 @@ export class KTX2PlayerCore {
   /** Whether a source starts playing once loaded. */
   set autoPlay(v: boolean) { this._autoPlay = v; }
   get autoPlay(): boolean { return this._autoPlay; }
+
+  /** Whether onFrameUpdate fires for every frame played, not only for seeks. */
+  set frameEvents(v: boolean) { this._frameEvents = v; }
+  get frameEvents(): boolean { return this._frameEvents; }
 
   set loop(v: boolean) { this._loop = v; }
   get loop(): boolean { return this._loop; }
@@ -394,6 +400,7 @@ export class KTX2PlayerCore {
     this._streamingMode = false;
     this._streamingFrameCache.clear();
     this._streamingCompressedChunks = null;
+    this._closeStreamingGenerator();
     this._streamingDecompressState = null;
     this._ramFrameData = null;
     this._ramHeavyMode = false;
@@ -510,6 +517,7 @@ export class KTX2PlayerCore {
     this._streamingMode = false;
     this._streamingFrameCache.clear();
     this._streamingCompressedChunks = null;
+    this._closeStreamingGenerator();
     this._streamingDecompressState = null;
   }
 
@@ -922,39 +930,29 @@ export class KTX2PlayerCore {
       const fullDataRef = ktx2Data;
       const actualRingSize = this._streamingRingActualSize;
 
-      for (let i = 0; i < actualRingSize; i++) {
-        const frameOffset = level0Offset + (i * bytesPerLayer);
-        const frameData = new Uint8Array(fullDataRef.buffer, fullDataRef.byteOffset + frameOffset, bytesPerLayer);
-        gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
-        gl.compressedTexSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i % actualRingSize, width, height, 1, astcFormat, frameData);
-        this._streamingRingSlots[i % actualRingSize] = i;
-        this._streamingFrameCache.set(i, frameData.slice());
-      }
-
-      // Proxy cache for on-demand frame loading
-      const originalCache = this._streamingFrameCache;
-      const loadFrameOnDemand = (frameIndex: number): Uint8Array | null => {
+      // Every frame is a view into the file, so the "cache" holds nothing and copies nothing
+      const frameView = (frameIndex: number): Uint8Array | undefined => {
         const frameOffset = level0Offset + (frameIndex * bytesPerLayer);
-        if (frameOffset + bytesPerLayer > fullDataRef.length) return null;
+        if (frameIndex < 0 || frameOffset + bytesPerLayer > fullDataRef.length) return undefined;
         return new Uint8Array(fullDataRef.buffer, fullDataRef.byteOffset + frameOffset, bytesPerLayer);
       };
 
-      this._streamingFrameCache = new Map();
-      const proxyCache = {
-        get: (frameIndex: number): Uint8Array | undefined => {
-          if (originalCache.has(frameIndex)) return originalCache.get(frameIndex);
-          const frameData = loadFrameOnDemand(frameIndex);
-          if (frameData) { originalCache.set(frameIndex, frameData.slice()); return originalCache.get(frameIndex); }
-          return undefined;
-        },
+      for (let i = 0; i < actualRingSize; i++) {
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
+        gl.compressedTexSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, width, height, 1, astcFormat, frameView(i)!);
+        this._streamingRingSlots[i] = i;
+      }
+
+      const fileFrames = {
+        get: frameView,
         has: (frameIndex: number): boolean => frameIndex >= 0 && frameIndex < layerCount,
-        set: (frameIndex: number, data: Uint8Array) => { originalCache.set(frameIndex, data); },
-        delete: (frameIndex: number) => { originalCache.delete(frameIndex); },
-        clear: () => { originalCache.clear(); },
-        get size() { return originalCache.size; },
-        keys: () => originalCache.keys(),
+        set: () => {},
+        delete: () => {},
+        clear: () => {},
+        size: 0,
+        keys: () => [][Symbol.iterator](),
       };
-      this._streamingFrameCache = proxyCache as any;
+      this._streamingFrameCache = fileFrames as any;
 
       const uvs: FrameUV[] = [];
       for (let i = 0; i < metadata.frameCount; i++) uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
@@ -1093,15 +1091,20 @@ export class KTX2PlayerCore {
     this._backgroundDecodeRunning = true;
     const decompressLoop = async () => {
       const layerCount = this._streamingLayerCount;
+      // In RAM mode frames past the cache window would be evicted as soon as they're decoded
+      const aheadLimit = this._useVramStrategy
+        ? this._streamingPrefetchAhead
+        : Math.min(this._streamingPrefetchAhead, this._streamingCacheSize);
       while (!this._streamingCancelled && this._streamingDecodePos < layerCount) {
         const framesAhead = this._streamingDecodePos - this._currentFrame;
-        if (framesAhead < this._streamingPrefetchAhead) {
+        if (framesAhead < aheadLimit) {
           const frameData = await this._decodeNextFrame();
           if (frameData) {
             const frameIndex = this._streamingDecodePos;
             if (frameIndex >= this._streamingSkipTo) this._streamingFrameCache.set(frameIndex, frameData);
             this._streamingDecodePos++;
             this._streamingFramesReady = this._streamingDecodePos;
+            this._evictOldFramesFromCache(this._currentFrame);
           } else {
             break;
           }
@@ -1360,6 +1363,13 @@ export class KTX2PlayerCore {
     }
   }
 
+  /** Closes the zstd stream, which frees its WASM buffers; a no-op once it has finished. */
+  private _closeStreamingGenerator(): void {
+    try {
+      this._streamingDecompressState?.generator?.return?.();
+    } catch { /* already closed */ }
+  }
+
   /** Decodes from the start again, dropping the frames before skipTo. */
   private _restartStreamingDecode(skipTo: number): void {
     this._streamingFrameCache.clear();
@@ -1369,14 +1379,7 @@ export class KTX2PlayerCore {
     this._streamingDecompressPaused = false;
 
     const state = this._streamingDecompressState;
-
-    // Drain old generator to free WASM resources
-    if (state?.generator && !state.reachedEnd) {
-      try {
-        let result = state.generator.next();
-        while (!result.done) result = state.generator.next();
-      } catch { /* ignore */ }
-    }
+    this._closeStreamingGenerator();
 
     const compressedChunks = this._streamingCompressedChunks;
     if (compressedChunks && compressedChunks.length > 0 && this._zstdDecoder?.decodeStreaming) {
@@ -1716,7 +1719,7 @@ export class KTX2PlayerCore {
       // A frame that isn't decoded yet holds playback rather than being skipped
       if (elapsed >= frameInterval / this._playbackSpeed && this._render()) {
         this._lastFrameTime = timestamp - (elapsed % (frameInterval / this._playbackSpeed));
-        this._onFrameUpdate?.(this._currentFrame, metadata.frameCount);
+        if (this._frameEvents) this._onFrameUpdate?.(this._currentFrame, metadata.frameCount);
 
         if (this._currentFrame + 1 < metadata.frameCount) {
           this._currentFrame++;

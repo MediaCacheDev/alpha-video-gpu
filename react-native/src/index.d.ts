@@ -25,12 +25,13 @@ export interface AlphaVideoGpuViewProps {
   paused?: boolean;
   /** View style */
   style?: ViewStyle;
+  // Every event has this shape on Android, iOS and web
   /** Callback when player state changes */
   onStateChange?: (event: { nativeEvent: { state: string } }) => void;
-  /** Callback on each frame update */
-  onFrameUpdate?: (event: { nativeEvent: { frame: number } }) => void;
+  /** Callback after a seek, and for every frame played with `enableFrameEvents` */
+  onFrameUpdate?: (event: { nativeEvent: { frame: number; totalFrames: number } }) => void;
   /** Callback when playback finishes */
-  onFinished?: () => void;
+  onFinished?: (event: { nativeEvent: {} }) => void;
   /** Callback on error */
   onError?: (event: { nativeEvent: { error: string } }) => void;
   /** Callback when loaded */
@@ -42,7 +43,7 @@ export interface AlphaVideoGpuViewProps {
   streamingPrefetchAhead?: number;
   memoryStrategy?: 'auto' | 'vram' | 'ram';
   stream?: boolean;
-  /** Send onFrameUpdate for every rendered frame (native). Default: false */
+  /** Send onFrameUpdate for every frame played; seeks always send it. Default: false */
   enableFrameEvents?: boolean;
   /** Log info traces. Warnings and errors always log. Default: false */
   verbose?: boolean;
