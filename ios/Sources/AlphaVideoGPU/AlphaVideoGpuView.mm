@@ -238,6 +238,11 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   NSInteger _decoderLoopIteration;         // Which loop iteration the decoder is on
   NSInteger _playbackLoopIteration;        // Which loop iteration playback is on
   BOOL _useVramStrategy;                   // True for VRAM-heavy mode
+
+  // The shown frame changed (a load or a seek) and is drawn once decoded, playing or not
+  BOOL _frameOwed;
+  // A clip that doesn't loop has reached its last frame; playing again starts it over
+  BOOL _ended;
   
   // Streaming decompression state
   ZSTD_DStream *_dstream;
@@ -492,6 +497,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   _isSourceLoaded = NO;
   _isSourceLoading = YES;
   _isDestroyed = NO;
+  self.currentFrame = 0;
+  _ended = NO;
+  _frameOwed = NO;
   
   _localPath = nil;
   [self notifyStateChange:@"loading"];
@@ -532,6 +540,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 - (void)notifyLoad
 {
+  // Every load path reports here, once it can draw; show the first frame even before playing
+  _frameOwed = YES;
+  [self updateDisplayLink];
   if (self.onLoad) self.onLoad(self.frameWidth, self.frameHeight, self.totalFrames, self.frameRate);
 }
 
@@ -1248,25 +1259,8 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     }
     
     // Skip header bytes if needed
-    if (!_streamHeaderSkipped) {
-      while (_frameAccumulator.length < _streamLevel0Offset && input.pos < input.size) {
-        ZSTD_outBuffer output = { decompressBuffer.mutableBytes, outputBufferSize, 0 };
-        size_t result = ZSTD_decompressStream(_dstream, &output, &input);
-        if (ZSTD_isError(result)) break;
-        if (output.pos > 0) {
-          [_frameAccumulator appendBytes:decompressBuffer.bytes length:output.pos];
-        }
-      }
-      
-      if (_frameAccumulator.length >= _streamLevel0Offset) {
-        // Remove header data, keep frame data
-        NSData *frameData = [NSData dataWithBytes:((const uint8_t *)_frameAccumulator.bytes + _streamLevel0Offset)
-                                           length:_frameAccumulator.length - _streamLevel0Offset];
-        [_frameAccumulator setData:frameData];
-        _streamHeaderSkipped = YES;
-      } else {
-        break;  // Not enough data yet
-      }
+    if (![self skipStreamHeader:&input buffer:decompressBuffer]) {
+      break;  // Not enough data yet
     }
     
     // Decompress until we have a full frame
@@ -1366,6 +1360,111 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   }
   
   _compressedDataPos = input.pos;
+}
+
+/** Decompresses past the KTX2 header of a whole-file zstd stream; NO if the input ran out first. */
+- (BOOL)skipStreamHeader:(ZSTD_inBuffer *)input buffer:(NSMutableData *)decompressBuffer
+{
+  if (_streamHeaderSkipped) return YES;
+  while (_frameAccumulator.length < _streamLevel0Offset && input->pos < input->size) {
+    ZSTD_outBuffer output = { decompressBuffer.mutableBytes, decompressBuffer.length, 0 };
+    size_t result = ZSTD_decompressStream(_dstream, &output, input);
+    if (ZSTD_isError(result)) break;
+    if (output.pos > 0) {
+      [_frameAccumulator appendBytes:decompressBuffer.bytes length:output.pos];
+    }
+  }
+  if (_frameAccumulator.length < _streamLevel0Offset) return NO;
+  // Remove header data, keep frame data
+  [_frameAccumulator replaceBytesInRange:NSMakeRange(0, _streamLevel0Offset) withBytes:NULL length:0];
+  _streamHeaderSkipped = YES;
+  return YES;
+}
+
+/** Decompresses and drops the next bytes of frame data, for a seek. */
+- (void)skipDecodedBytes:(uint64_t)bytes
+{
+  NSMutableData *decompressBuffer = [NSMutableData dataWithLength:ZSTD_DStreamOutSize()];
+  ZSTD_inBuffer input = { _compressedData.bytes, _compressedData.length, _compressedDataPos };
+  if ([self skipStreamHeader:&input buffer:decompressBuffer]) {
+    uint64_t held = MIN((uint64_t)_frameAccumulator.length, bytes);
+    [_frameAccumulator replaceBytesInRange:NSMakeRange(0, (NSUInteger)held) withBytes:NULL length:0];
+    bytes -= held;
+    while (bytes > 0) {
+      ZSTD_outBuffer output = { decompressBuffer.mutableBytes, decompressBuffer.length, 0 };
+      size_t result = ZSTD_decompressStream(_dstream, &output, &input);
+      if (ZSTD_isError(result)) {
+        NSLog(@"AlphaVideoGpuView: Decompression error while seeking: %s", ZSTD_getErrorName(result));
+        break;
+      }
+      if (output.pos > bytes) {
+        [_frameAccumulator appendBytes:(const uint8_t *)decompressBuffer.bytes + bytes length:output.pos - (size_t)bytes];
+        bytes = 0;
+      } else {
+        bytes -= output.pos;
+      }
+      if (result == 0 || (output.pos == 0 && input.pos >= input.size)) break;
+    }
+  }
+  _compressedDataPos = input.pos;
+}
+
+/**
+ * Points the streaming decoder at target, keeping what is decoded when target is among the
+ * buffered frames (from the shown one up to the decoder).
+ */
+- (void)moveStreamTo:(NSInteger)target
+{
+  if (_isUncompressedStreaming) {
+    if (!_useCompressedFormat && _decodedRgbaCache) {
+      // Decode blocks in flight read and advance the position, so reset it between them
+      dispatch_sync(_astcDecodeQueue, ^{
+        @synchronized(self->_decodedRgbaCache) {
+          [self->_decodedRgbaCache removeAllObjects];
+        }
+        self->_uncompressedDecoderPosition = target;
+        self->_decoderLoopIteration = 0;
+      });
+    }
+  } else if (_dstream) {
+    BOOL samePass = _decoderLoopIteration % 2 == _playbackLoopIteration % 2;
+    if (samePass && target >= self.currentFrame && target < _decoderPosition) return;
+    if (samePass && target >= _decoderPosition) {
+      [self skipDecodedBytes:(uint64_t)(target - _decoderPosition) * _streamBytesPerLayer];
+    } else {
+      ZSTD_initDStream(_dstream);
+      _compressedDataPos = 0;
+      [_frameAccumulator setLength:0];
+      _streamHeaderSkipped = NO;
+      [self skipDecodedBytes:(uint64_t)target * _streamBytesPerLayer];
+    }
+    _decoderPosition = target;
+    _decoderLoopIteration = 0;
+    [_frameCache removeAllObjects];
+  }
+  _playbackLoopIteration = 0;
+  for (NSUInteger i = 0; i < _ringSlots.count; i++) {
+    _ringSlots[i] = @(-1);
+  }
+}
+
+/** Decodes towards the shown frame; YES once it can be drawn. */
+- (BOOL)prepareShownFrame
+{
+  if (!_streamingRingBufferMode) return YES;
+  NSInteger virtualPos = (_playbackLoopIteration * self.totalFrames + self.currentFrame) % (self.totalFrames * 2);
+  NSInteger gpuSlot = self.currentFrame % _streamingRingBufferSize;
+  if ([_ringSlots[gpuSlot] integerValue] == virtualPos) return YES;
+  if (_isUncompressedStreaming) {
+    // A device uploads straight from the mapping as it draws
+    if (_useCompressedFormat || !_decodedRgbaCache) return YES;
+    [self decodeUncompressedFramesAhead:virtualPos];
+    @synchronized(_decodedRgbaCache) {
+      return _decodedRgbaCache[@(virtualPos)] != nil;
+    }
+  }
+  [self decodeFramesAhead:virtualPos];
+  return _frameCache[@(virtualPos)] != nil || [_ringSlots[gpuSlot] integerValue] == virtualPos;
 }
 
 - (void)uploadFrameToGPU:(const void *)frameData slot:(NSInteger)slot
@@ -2469,7 +2568,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
       [self notifyLoad];
       [self notifyStateChange:@"ready"];
       
-      if (self.autoPlay) {
+      if (self.autoPlay && !self.playbackPaused) {
         [self play];
       }
     });
@@ -2904,7 +3003,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
       [self notifyLoad];
       [self notifyStateChange:@"ready"];
       
-      if (self.autoPlay && self.partTextures.count > 0) {
+      if (self.autoPlay && !self.playbackPaused && self.partTextures.count > 0) {
         [self play];
       }
     });
@@ -2918,12 +3017,12 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   
   if (!self.isPlaying && self.totalFrames > 0) {
     AVG_VLOG(@"Starting playback...");
+    if (_ended) {
+      [self seekToFrame:0];
+    }
     self.isPlaying = YES;
     self.lastFrameTime = CACurrentMediaTime();
-    
-    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
-    self.displayLink.preferredFramesPerSecond = (NSInteger)self.frameRate;
-    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    [self updateDisplayLink];
     
     [self notifyStateChange:@"playing"];
   }
@@ -2933,10 +3032,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 {
   if (self.isPlaying) {
     self.isPlaying = NO;
-    if (self.displayLink) {
-      [self.displayLink invalidate];
-      self.displayLink = nil;
-    }
+    [self updateDisplayLink];
     [self notifyStateChange:@"paused"];
   }
 }
@@ -2944,17 +3040,53 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 - (void)stop
 {
   [self pause];
-  self.currentFrame = 0;
-  [self updateUniforms];
-  [self setNeedsDisplay];
+  [self seekToFrame:0];
   [self notifyStateChange:@"stopped"];
 }
 
 - (void)seekToFrame:(NSInteger)frame
 {
-  self.currentFrame = MAX(0, MIN(frame, self.totalFrames - 1));
+  if (!_isSourceLoaded || self.totalFrames <= 0) return;
+  NSInteger target = MAX(0, MIN(frame, self.totalFrames - 1));
+  _ended = NO;
+  if (_streamingRingBufferMode) {
+    [self moveStreamTo:target];
+  }
+  self.currentFrame = target;
+  self.lastFrameTime = CACurrentMediaTime();
+  _frameOwed = YES;
+  [self drawOwedFrame];
+  [self updateDisplayLink];
+  [self notifyFrameUpdate];
+}
+
+- (void)seekToTime:(NSTimeInterval)seconds
+{
+  double frame = floor(MAX(seconds, 0) * self.frameRate + 1e-6);
+  [self seekToFrame:(NSInteger)MIN(frame, (double)INT32_MAX)];
+}
+
+/** Draws the frame a load or a seek owes, once it is decoded. */
+- (void)drawOwedFrame
+{
+  if (!_frameOwed || ![self prepareShownFrame]) return;
+  _frameOwed = NO;
   [self updateUniforms];
   [self setNeedsDisplay];
+}
+
+/** Runs the display link while playing, or until an owed frame is drawn. */
+- (void)updateDisplayLink
+{
+  BOOL needed = self.isPlaying || _frameOwed;
+  if (needed && !self.displayLink) {
+    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
+    self.displayLink.preferredFramesPerSecond = (NSInteger)self.frameRate;
+    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+  } else if (!needed && self.displayLink) {
+    [self.displayLink invalidate];
+    self.displayLink = nil;
+  }
 }
 
 - (void)setPlaybackSpeed:(CGFloat)speed
@@ -2983,7 +3115,16 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 - (void)updateFrame
 {
-  if (!self.isPlaying) return;
+  if (_frameOwed) {
+    [self drawOwedFrame];
+    if (!_frameOwed) self.lastFrameTime = CACurrentMediaTime();
+    [self updateDisplayLink];
+    return;
+  }
+  if (!self.isPlaying) {
+    [self updateDisplayLink];
+    return;
+  }
   
   CFTimeInterval currentTime = CACurrentMediaTime();
   
@@ -3075,12 +3216,13 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
           [self ensureFrameInGPU:nextVPos];
         }
       } else {
+        // The last frame stays on screen
+        self.currentFrame = self.totalFrames - 1;
+        _ended = YES;
         self.isPlaying = NO;
-        if (self.displayLink) {
-          [self.displayLink invalidate];
-          self.displayLink = nil;
-        }
+        [self updateDisplayLink];
         [self notifyFinished];
+        [self notifyStateChange:@"stopped"];
         return;
       }
     }
@@ -3272,6 +3414,8 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   _isDestroyed = YES;
   _isSourceLoaded = NO;
   _isSourceLoading = NO;
+  _frameOwed = NO;
+  _ended = NO;
   
   // Stop playback
   self.isPlaying = NO;
@@ -3352,7 +3496,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     // View removed from window - pause but don't cleanup yet
     AVG_VLOG(@"didMoveToWindow nil - pausing");
     [self pause];
-  } else if (_source && _isSourceLoaded && self.autoPlay && !self.isPlaying) {
+  } else if (_source && _isSourceLoaded && self.autoPlay && !self.playbackPaused && !self.isPlaying) {
     // View added to window and we have loaded source - resume
     AVG_VLOG(@"didMoveToWindow - resuming playback");
     [self play];

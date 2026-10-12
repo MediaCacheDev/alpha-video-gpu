@@ -3,6 +3,7 @@
 //  React Native view manager for AlphaVideoGpuView
 //
 
+#import <React/RCTUIManager.h>
 #import <React/RCTViewManager.h>
 #import "AlphaVideoGPU.h"
 
@@ -142,5 +143,40 @@ RCT_REMAP_VIEW_PROPERTY(onFrameUpdate, reactOnFrameUpdate, RCTDirectEventBlock)
 RCT_REMAP_VIEW_PROPERTY(onStateChange, reactOnStateChange, RCTDirectEventBlock)
 RCT_REMAP_VIEW_PROPERTY(onFinished, reactOnFinished, RCTDirectEventBlock)
 RCT_REMAP_VIEW_PROPERTY(onError, reactOnError, RCTDirectEventBlock)
+
+// The block's view registry is empty under the new architecture's interop layer, so look the
+// view up by tag instead.
+- (void)withView:(NSNumber *)reactTag run:(void (^)(AlphaVideoGpuView *view))body
+{
+  [self.bridge.uiManager addUIBlock:^(RCTUIManager *uiManager, NSDictionary<NSNumber *, UIView *> *viewRegistry) {
+    UIView *view = [uiManager viewForReactTag:reactTag];
+    if ([view isKindOfClass:[AlphaVideoGpuView class]]) body((AlphaVideoGpuView *)view);
+  }];
+}
+
+RCT_EXPORT_METHOD(play:(nonnull NSNumber *)reactTag)
+{
+  [self withView:reactTag run:^(AlphaVideoGpuView *view) { [view play]; }];
+}
+
+RCT_EXPORT_METHOD(pause:(nonnull NSNumber *)reactTag)
+{
+  [self withView:reactTag run:^(AlphaVideoGpuView *view) { [view pause]; }];
+}
+
+RCT_EXPORT_METHOD(stop:(nonnull NSNumber *)reactTag)
+{
+  [self withView:reactTag run:^(AlphaVideoGpuView *view) { [view stop]; }];
+}
+
+RCT_EXPORT_METHOD(seekToFrame:(nonnull NSNumber *)reactTag frame:(nonnull NSNumber *)frame)
+{
+  [self withView:reactTag run:^(AlphaVideoGpuView *view) { [view seekToFrame:frame.integerValue]; }];
+}
+
+RCT_EXPORT_METHOD(seekToTime:(nonnull NSNumber *)reactTag seconds:(nonnull NSNumber *)seconds)
+{
+  [self withView:reactTag run:^(AlphaVideoGpuView *view) { [view seekToTime:seconds.doubleValue]; }];
+}
 
 @end

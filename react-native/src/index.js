@@ -1,5 +1,7 @@
-import React, { useMemo } from 'react';
-import { View, StyleSheet, Platform } from 'react-native';
+import React, { forwardRef, useImperativeHandle, useMemo, useRef } from 'react';
+import { View, StyleSheet, Platform, UIManager, findNodeHandle } from 'react-native';
+
+const NATIVE_VIEW = 'AlphaVideoGpuView';
 
 // Platform-specific imports
 let NativeAlphaVideoGpuView;
@@ -35,8 +37,10 @@ if (Platform.OS === 'web') {
  * @param {Function} [props.onFinished] - Callback when playback finishes
  * @param {Function} [props.onError] - Callback on error
  * @param {Object} [props.style] - View style
+ *
+ * The ref has play(), pause(), stop(), seekToFrame(frame) and seekToTime(seconds).
  */
-export const AlphaVideoGpuView = React.memo(({
+export const AlphaVideoGpuView = React.memo(forwardRef(({
   source,
   autoPlay = true,
   loop = true,
@@ -48,7 +52,37 @@ export const AlphaVideoGpuView = React.memo(({
   onFinished,
   onError,
   ...otherProps
-}) => {
+}, ref) => {
+  const viewRef = useRef(null);
+
+  useImperativeHandle(ref, () => {
+    if (Platform.OS === 'web') {
+      const call = (name, args) => viewRef.current?.[name]?.(...args);
+      return {
+        play: () => call('play', []),
+        pause: () => call('pause', []),
+        stop: () => call('stop', []),
+        seekToFrame: frame => call('seekToFrame', [frame]),
+        seekToTime: seconds => call('seekToTime', [seconds]),
+      };
+    }
+    const send = (name, args) => {
+      const handle = viewRef.current ? findNodeHandle(viewRef.current) : null;
+      if (handle == null) return;
+      UIManager.dispatchViewManagerCommand(
+        handle,
+        UIManager.getViewManagerConfig(NATIVE_VIEW)?.Commands?.[name] ?? name,
+        args
+      );
+    };
+    return {
+      play: () => send('play', []),
+      pause: () => send('pause', []),
+      stop: () => send('stop', []),
+      seekToFrame: frame => send('seekToFrame', [frame]),
+      seekToTime: seconds => send('seekToTime', [seconds]),
+    };
+  }, []);
   // Normalize source to object format for consistency
   const normalizedSource = useMemo(() => {
     if (!source) return null;
@@ -73,6 +107,7 @@ export const AlphaVideoGpuView = React.memo(({
   if (Platform.OS === 'web') {
     return (
       <WebAlphaVideoGpuView
+        ref={viewRef}
         source={normalizedSource}
         cacheKey={effectiveCacheKey}
         autoPlay={autoPlay}
@@ -90,6 +125,7 @@ export const AlphaVideoGpuView = React.memo(({
 
   return (
     <NativeAlphaVideoGpuView
+      ref={viewRef}
       source={normalizedSource}
       autoPlay={autoPlay}
       loop={loop}
@@ -103,7 +139,7 @@ export const AlphaVideoGpuView = React.memo(({
       {...otherProps}
     />
   );
-});
+}));
 
 AlphaVideoGpuView.displayName = 'AlphaVideoGpuView';
 

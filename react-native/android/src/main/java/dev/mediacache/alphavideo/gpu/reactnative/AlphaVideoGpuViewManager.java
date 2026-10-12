@@ -169,6 +169,11 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
                     view.seekToFrame(args.getInt(0));
                 }
                 break;
+            case "seekToTime":
+                if (args != null && args.size() > 0) {
+                    view.seekToTime(args.getDouble(0));
+                }
+                break;
         }
     }
 

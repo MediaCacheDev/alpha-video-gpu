@@ -48,5 +48,23 @@ export interface AlphaVideoGpuViewProps {
   verbose?: boolean;
 }
 
+/**
+ * Seeks show the frame (clamped to the clip) and keep playing, or stay paused. They are ignored
+ * until `onLoad`. With `stream`, a seek outside the buffered frames decodes the file again from
+ * the start (or onwards from the decoder, for a seek ahead of it).
+ */
+export interface AlphaVideoGpuViewRef {
+  /** Plays from the shown frame, or from the start once a clip that doesn't loop has finished. */
+  play: () => void;
+  pause: () => void;
+  /** Pauses on the first frame. */
+  stop: () => void;
+  seekToFrame: (frame: number) => void;
+  /** Seeks to the frame showing at that time, in seconds. */
+  seekToTime: (seconds: number) => void;
+}
+
 // The actual component is defined in index.js, but we declare the type here
-export declare const AlphaVideoGpuView: React.MemoExoticComponent<React.FC<AlphaVideoGpuViewProps>>;
+export declare const AlphaVideoGpuView: React.MemoExoticComponent<
+  React.ForwardRefExoticComponent<AlphaVideoGpuViewProps & React.RefAttributes<AlphaVideoGpuViewRef>>
+>;

@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Plays KTX2 texture animations (ASTC, or Basis UASTC transcoded on the device) with alpha,
@@ -83,7 +84,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     // The cache key the currently running playback was started for. Compared against
     // mCacheKey to tell a re-signed URL for the same object apart from a new asset.
     private String mPlayingCacheKey;
-    private boolean mSourceLoaded = false;
+    private volatile boolean mSourceLoaded = false;
     
     // Playback settings
     private boolean autoPlay = true;
@@ -94,7 +95,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     
     // Animation state
     private int currentFrame = 0;
-    private int totalFrames = 0;
+    private volatile int totalFrames = 0;
+    // The frame the render loop shows next, set from the main thread; -1 when there is none
+    private final AtomicInteger seekRequest = new AtomicInteger(-1);
+    // A clip that doesn't loop has reached its last frame; playing again starts it over
+    private volatile boolean ended = false;
     private float frameRate = 30.0f;
     private long frameIntervalNanos;
     
@@ -496,31 +501,42 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         this.verbose = verbose;
     }
     
+    /** Plays from the shown frame, or from the start once a clip that doesn't loop has ended. */
     public void play() {
-        if (!isPlaying.get() && textureIds != null && textureIds.length > 0) {
-            isPlaying.set(true);
-            shouldStop.set(false);
+        if (mSourceLoaded && !isPlaying.getAndSet(true)) {
             notifyStateChange("playing");
         }
     }
     
     public void pause() {
-        if (isPlaying.get()) {
-            isPlaying.set(false);
+        if (isPlaying.getAndSet(false)) {
             notifyStateChange("paused");
         }
     }
     
+    /** Pauses on the first frame. */
     public void stop() {
         isPlaying.set(false);
-        shouldStop.set(true);
-        currentFrame = 0;
+        seekToFrame(0);
         notifyStateChange("stopped");
     }
     
+    /**
+     * Shows that frame (clamped to the clip) and keeps playing or stays paused. Ignored until
+     * onLoad. In stream mode the frames before it are decoded again, unless they are buffered.
+     */
     public void seekToFrame(int frame) {
-        currentFrame = Math.max(0, Math.min(frame, totalFrames - 1));
-        notifyFrameUpdate();
+        int frames = totalFrames;
+        if (!mSourceLoaded || frames <= 0) return;
+        int target = Math.max(0, Math.min(frame, frames - 1));
+        seekRequest.set(target);
+        if (playerCallback != null) playerCallback.onFrameUpdate(target, frames);
+    }
+
+    /** Seeks to the frame showing at that time, in seconds. */
+    public void seekToTime(double seconds) {
+        double frame = Math.floor(Math.max(seconds, 0) * frameRate + 1e-6);
+        seekToFrame((int) Math.min(frame, Integer.MAX_VALUE));
     }
     
     /** Stops playback and its threads. Detaching the view from its window does the same. */
@@ -696,71 +712,122 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             return;
         }
         
+        announceLoaded();
+        
+        logD("Starting render loop");
+        
+        FrameClock clock = new FrameClock(frameIntervalNanos());
+        currentFrame = 0;
+        boolean frameOwed = true;
+        boolean wasPlaying = false;
+        try {
+            while (!shouldStop.get() && !isDestroyed.get()) {
+                int seek = takeSeek();
+                if (seek >= 0) {
+                    currentFrame = seek;
+                    frameOwed = true;
+                    wasPlaying = false;
+                }
+                
+                if (!isPlaying.get()) {
+                    if (frameOwed) {
+                        renderFrame();
+                        frameOwed = false;
+                    }
+                    wasPlaying = false;
+                    Thread.sleep(16);
+                    continue;
+                }
+                if (!wasPlaying) {
+                    clock.restart();
+                    wasPlaying = true;
+                }
+                
+                renderFrame();
+                frameOwed = false;
+                if (enableFrameEvents) {
+                    mainHandler.post(() -> notifyFrameUpdate());
+                }
+                clock.awaitNext();
+                
+                if (currentFrame + 1 < totalFrames) {
+                    currentFrame++;
+                } else if (loop) {
+                    currentFrame = 0;
+                } else {
+                    finish();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Reports the load, and starts playing when autoPlay is on and the view isn't paused. */
+    private void announceLoaded() {
+        ended = false;
+        seekRequest.set(-1);
         mSourceLoaded = true;
         mainHandler.post(() -> {
             notifyLoad();
             notifyStateChange("ready");
         });
-        
-        // Start playing if autoPlay
-        if (autoPlay) {
+        if (autoPlay && !isPaused.get()) {
             isPlaying.set(true);
             mainHandler.post(() -> notifyStateChange("playing"));
         }
-        
-        // Render loop
-        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
-        
-        logD("Starting render loop");
-        
-        do {
-            long loopStartTime = System.nanoTime();
-            currentFrame = 0;
-            
-            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
-                if (isPlaying.get()) {
-                    renderFrame();
-                    if (enableFrameEvents) {
-                        mainHandler.post(() -> notifyFrameUpdate());
-                    }
-                    
-                    currentFrame++;
-                    if (currentFrame >= totalFrames) {
-                        if (loop) {
-                            currentFrame = 0;
-                            loopStartTime = System.nanoTime();
-                        } else {
-                            mainHandler.post(() -> {
-                                notifyFinished();
-                                notifyStateChange("stopped");
-                            });
-                            break;
-                        }
-                    }
-                    
-                    long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
-                    long sleepNs = targetTimeNs - System.nanoTime();
-                    
-                    if (sleepNs > 1_000_000) {
-                        try {
-                            Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
-                    }
-                } else {
-                    // Paused - still render current frame but sleep longer
-                    renderFrame();
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                }
+    }
+
+    private long frameIntervalNanos() {
+        return (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
+    }
+
+    /**
+     * The frame a render loop should show next, or -1 to carry on: the requested seek, or
+     * frame 0 when a clip that ended is played again.
+     */
+    private int takeSeek() {
+        int seek = seekRequest.getAndSet(-1);
+        if (seek < 0 && ended && isPlaying.get()) seek = 0;
+        if (seek >= 0) ended = false;
+        return seek;
+    }
+
+    /** Holds the last frame of a clip that doesn't loop. */
+    private void finish() {
+        ended = true;
+        isPlaying.set(false);
+        mainHandler.post(() -> {
+            notifyFinished();
+            notifyStateChange("stopped");
+        });
+    }
+
+    /** Paces frames from the moment playback starts, resumes or seeks. */
+    private static final class FrameClock {
+        private final long intervalNs;
+        private long dueNs;
+
+        FrameClock(long intervalNs) {
+            this.intervalNs = intervalNs;
+        }
+
+        /** The current frame is due now. */
+        void restart() {
+            dueNs = System.nanoTime();
+        }
+
+        /** Sleeps until the next frame is due. */
+        void awaitNext() throws InterruptedException {
+            dueNs += intervalNs;
+            long sleepNs = dueNs - System.nanoTime();
+            if (sleepNs > 1_000_000) {
+                Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
+            } else if (sleepNs < -intervalNs) {
+                // Too far behind to catch up (a slow decode), so pace from now
+                dueNs = System.nanoTime();
             }
-        } while (loop && !shouldStop.get() && !isDestroyed.get());
+        }
     }
     
     /**
@@ -952,7 +1019,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         // Decompression state
         final int[] decodePos = {0};  // Current sequential decode position
-        final int[] bytesToSkip = {(int) level0Offset};
+        // The header, plus the frames before a seek target
+        final long[] bytesToSkip = {level0Offset};
         final boolean[] decompressEnded = {false};
         
         // Pre-allocated direct ByteBuffer for zero-copy decompression
@@ -991,9 +1059,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         // Skip header bytes from already-read data
         byte[] existingData = headerStream.toByteArray();
         if (existingData.length > bytesToSkip[0]) {
-            int dataToWrite = existingData.length - bytesToSkip[0];
+            int dataToWrite = existingData.length - (int) bytesToSkip[0];
             // Both modes use DirectByteBuffer now
-            frameAccumulatorBuffer.put(existingData, bytesToSkip[0], dataToWrite);
+            frameAccumulatorBuffer.put(existingData, (int) bytesToSkip[0], dataToWrite);
             bytesToSkip[0] = 0;
         } else {
             bytesToSkip[0] -= existingData.length;
@@ -1006,16 +1074,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         final int finalGpuCacheSize = textureLayerCount;  // GPU cache size (ring buffer or VRAM cache)
         final long finalLevel0Offset = level0Offset;
         
-        mSourceLoaded = true;
-        mainHandler.post(() -> {
-            notifyLoad();
-            notifyStateChange("ready");
-        });
-        
-        if (autoPlay && !isPaused.get()) {
-            isPlaying.set(true);
-            mainHandler.post(() -> notifyStateChange("playing"));
-        }
+        announceLoaded();
         
         // Track which "loop iteration" the decoder is on (for wrap-around prefetching)
         final int[] decoderLoopIteration = {0};
@@ -1046,7 +1105,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     decodePos[0] = 0;
                     decompressEnded[0] = false;
                     frameAccumulatorBuffer.clear();  // Both modes use DirectByteBuffer now
-                    bytesToSkip[0] = (int) finalLevel0Offset;
+                    bytesToSkip[0] = finalLevel0Offset;
                     AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
                     // Use mmap if available, otherwise fall back to byte array
                     streamId[0] = finalUseMmap
@@ -1071,9 +1130,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     int status = (int)(result >> 32);
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
                     if (bytesWritten >= bytesToSkip[0]) {
-                        decompressBuffer.position(bytesToSkip[0]);
+                        decompressBuffer.position((int) bytesToSkip[0]);
                         decompressBuffer.limit(bytesWritten);
-                        int dataToWrite = bytesWritten - bytesToSkip[0];
+                        int dataToWrite = bytesWritten - (int) bytesToSkip[0];
                         // Zero-copy: transfer directly between ByteBuffers (both modes)
                         ByteBuffer slice = decompressBuffer.slice();
                         slice.limit(dataToWrite);
@@ -1262,31 +1321,54 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         // Note: restartDecompression is now handled inside decodeFrames for wrap-around prefetching
         
-        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
-        long loopStartTime = System.nanoTime();
+        FrameClock clock = new FrameClock(frameIntervalNanos());
+        // Only its parity matters: virtual positions are taken modulo 2 * totalFrames
         int playbackLoopIteration = 0;
+        currentFrame = 0;
+        boolean frameOwed = true;
+        boolean wasPlaying = false;
         
         // Main playback loop - uses virtual frame positions for seamless looping
         // vPosModulus is defined above (2 * totalFrames) to prevent overflow
-        while (!shouldStop.get() && !isDestroyed.get()) {
-            currentFrame = 0;
-            loopStartTime = System.nanoTime();
-            
-            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
-                // Virtual position = bounded position that distinguishes current vs next loop
-                int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
-                
-                // Check paused state
-                if (isPaused.get()) {
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                        return;
+        try {
+            while (!shouldStop.get() && !isDestroyed.get()) {
+                int seek = takeSeek();
+                if (seek >= 0) {
+                    boolean samePass = decoderLoopIteration[0] % 2 == playbackLoopIteration % 2;
+                    // Frames from the shown one up to the decoder are buffered (in the cache or the ring)
+                    boolean buffered = samePass && seek >= currentFrame && seek < decodePos[0];
+                    if (!buffered) {
+                        if (samePass && seek >= decodePos[0] && !decompressEnded[0]) {
+                            skipDecodedBytes(frameAccumulatorBuffer, bytesToSkip,
+                                (long) (seek - decodePos[0]) * finalBytesPerLayer);
+                        } else {
+                            AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
+                            streamId[0] = finalUseMmap
+                                ? openMappedZstdStream(local)
+                                : AlphaVideoGpuNative.nativeStreamingDecompressInit(finalCompressedData);
+                            decompressEnded[0] = streamId[0] == 0;
+                            frameAccumulatorBuffer.clear();
+                            bytesToSkip[0] = finalLevel0Offset + (long) seek * finalBytesPerLayer;
+                        }
+                        decodePos[0] = seek;
+                        decoderLoopIteration[0] = 0;
+                        playbackLoopIteration = 0;
+                        dropStreamedFrames(frameCache, bufferPool, ringSlots, finalBytesPerLayer);
                     }
+                    currentFrame = seek;
+                    frameOwed = true;
+                    wasPlaying = false;
+                }
+                
+                boolean playing = isPlaying.get();
+                if (!playing && !frameOwed) {
+                    wasPlaying = false;
+                    Thread.sleep(16);
                     continue;
                 }
+                
+                // Virtual position = bounded position that distinguishes current vs next loop
+                int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
                 
                 // Decode frames ahead (prefetch with wrap-around)
                 decodeFrames.accept(virtualPlaybackPos);
@@ -1299,84 +1381,97 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 int currentGpuSlot = currentFrame % finalGpuCacheSize;
                 boolean frameInGpu = ringSlots[currentGpuSlot] == virtualPlaybackPos;
                 boolean frameInCpuCache = frameCache.containsKey(virtualPlaybackPos);
-                    
-                if (frameInGpu || frameInCpuCache) {
-                    // Ensure current frame is in GPU (for RAM mode, or delayed VRAM uploads)
-                    ensureFrameInGpu.accept(virtualPlaybackPos);
-                    
-                    // RAM mode only: prefetch next few frames to GPU
-                    // VRAM mode: frames are uploaded during decode, don't prefetch here
-                    // (prefetching here can overwrite unplayed frames in the ring buffer)
-                    if (!useVramStrategy) {
-                        for (int i = 1; i <= 2; i++) {
-                            int nextVirtualPos = virtualPlaybackPos + i;
-                            int nextGpuSlot = ((currentFrame + i) % totalFrames) % finalGpuCacheSize;
-                            boolean nextInGpu = ringSlots[nextGpuSlot] == nextVirtualPos;
-                            if (frameCache.containsKey(nextVirtualPos) || nextInGpu) {
-                                ensureFrameInGpu.accept(nextVirtualPos);
-                            }
-                        }
-                    }
-                    
-                    if (isPlaying.get()) {
-                        renderFrame();
-                        if (enableFrameEvents) {
-                            mainHandler.post(() -> notifyFrameUpdate());
-                        }
-                        
-                        currentFrame++;
-                        if (currentFrame >= totalFrames) {
-                            if (loop) {
-                                break; // Will continue in outer loop with incremented playbackLoopIteration
-                            } else {
-                                mainHandler.post(() -> {
-                                    notifyFinished();
-                                    notifyStateChange("stopped");
-                                });
-                                AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                                return;
-                            }
-                        }
-                        
-                        long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
-                        long sleepNs = targetTimeNs - System.nanoTime();
-                        
-                        if (sleepNs > 1_000_000) {
-                            try {
-                                Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                                return;
-                            }
-                        }
-                    }
-                } else {
+                if (!frameInGpu && !frameInCpuCache) {
                     // Frame not ready yet - wait for decompression
                     Log.w(TAG, "Frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos +
                           ", gpuSlot=" + currentGpuSlot + ", ringSlots[" + currentGpuSlot + "]=" + ringSlots[currentGpuSlot] +
                           ", inCache=" + frameInCpuCache + ", cacheSize=" + frameCache.size() +
                           ", playbackLoop=" + playbackLoopIteration + ", decoderLoop=" + decoderLoopIteration[0]);
-                    try {
-                        Thread.sleep(8);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                        return;
+                    Thread.sleep(8);
+                    continue;
+                }
+                
+                // Ensure current frame is in GPU (for RAM mode, or delayed VRAM uploads)
+                ensureFrameInGpu.accept(virtualPlaybackPos);
+                
+                // RAM mode only: prefetch next few frames to GPU
+                // VRAM mode: frames are uploaded during decode, don't prefetch here
+                // (prefetching here can overwrite unplayed frames in the ring buffer)
+                if (!useVramStrategy) {
+                    for (int i = 1; i <= 2; i++) {
+                        int nextVirtualPos = (virtualPlaybackPos + i) % vPosModulus;
+                        int nextGpuSlot = ((currentFrame + i) % totalFrames) % finalGpuCacheSize;
+                        // Past the loop point a frame can map to the shown frame's slot
+                        if (nextGpuSlot == currentGpuSlot) break;
+                        boolean nextInGpu = ringSlots[nextGpuSlot] == nextVirtualPos;
+                        if (frameCache.containsKey(nextVirtualPos) || nextInGpu) {
+                            ensureFrameInGpu.accept(nextVirtualPos);
+                        }
                     }
                 }
+                
+                renderFrame();
+                frameOwed = false;
+                if (!playing) {
+                    wasPlaying = false;
+                    continue;
+                }
+                if (!wasPlaying) {
+                    clock.restart();
+                    wasPlaying = true;
+                }
+                if (enableFrameEvents) {
+                    mainHandler.post(() -> notifyFrameUpdate());
+                }
+                clock.awaitNext();
+                
+                if (currentFrame + 1 < totalFrames) {
+                    currentFrame++;
+                } else if (loop) {
+                    currentFrame = 0;
+                    playbackLoopIteration = (playbackLoopIteration + 1) % 2;
+                    logI("Loop transition: now on playbackLoop=" + playbackLoopIteration + 
+                          ", decoderLoop=" + decoderLoopIteration[0] + ", decodePos=" + decodePos[0] +
+                          ", cacheSize=" + frameCache.size() + ", ringSlots[0]=" + ringSlots[0]);
+                } else {
+                    finish();
+                }
             }
-            
-            // End of one loop iteration
-            if (!loop) break;
-            playbackLoopIteration++;
-            logI("Loop transition: now on playbackLoop=" + playbackLoopIteration + 
-                  ", decoderLoop=" + decoderLoopIteration[0] + ", decodePos=" + decodePos[0] +
-                  ", cacheSize=" + frameCache.size() + ", ringSlots[0]=" + ringSlots[0]);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
         }
-        
-        AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
         logI("Streaming animation ended");
+    }
+
+    /**
+     * Drops the next {@code bytes} of decompressed data: first what the accumulator holds, then
+     * the rest through {@code bytesToSkip} as the stream is read.
+     */
+    private static void skipDecodedBytes(ByteBuffer accumulator, long[] bytesToSkip, long bytes) {
+        int held = accumulator.position();
+        if (held > bytes) {
+            accumulator.flip();
+            accumulator.position((int) bytes);
+            accumulator.compact();
+        } else {
+            accumulator.clear();
+            bytesToSkip[0] += bytes - held;
+        }
+    }
+
+    /** Forgets every decoded frame after a seek, returning the CPU buffers to the pool. */
+    private static void dropStreamedFrames(java.util.Map<Integer, byte[]> frameCache,
+                                           @Nullable java.util.Queue<byte[]> bufferPool,
+                                           int[] ringSlots, int bytesPerLayer) {
+        if (bufferPool != null) {
+            for (byte[] buffer : frameCache.values()) {
+                if (buffer.length == bytesPerLayer) bufferPool.offer(buffer);
+            }
+        }
+        frameCache.clear();
+        Arrays.fill(ringSlots, -1);
     }
     
     /**
@@ -1616,19 +1711,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             return;
         }
         
-        mSourceLoaded = true;
-        mainHandler.post(() -> {
-            notifyLoad();
-            notifyStateChange("ready");
-        });
-        
-        if (autoPlay) {
-            isPlaying.set(true);
-            mainHandler.post(() -> notifyStateChange("playing"));
-        }
+        totalFrames = layerCount;
+        announceLoaded();
         
         // Frame timing - use metadata frameRate (already parsed)
-        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
+        long frameIntervalNs = frameIntervalNanos();
         logI("Uncompressed streaming timing: frameRate=" + frameRate + ", playbackSpeed=" + playbackSpeed + 
               ", frameIntervalNs=" + frameIntervalNs + " (" + (frameIntervalNs / 1_000_000.0) + "ms)");
         
@@ -1641,21 +1728,26 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         final long finalDataOffset = level0ByteOffset;
         final boolean finalUseAstc = useAstc;
         
-        // Main playback loop - simple and fast for uncompressed data
+        // Main playback loop - simple and fast for uncompressed data. Any frame can be read
+        // straight from the mapping, so a seek only moves the playhead.
         int debugFrameCounter = 0;
-        while (!shouldStop.get() && !isDestroyed.get()) {
-            long loopStartTime = System.nanoTime();
-            currentFrame = 0;
-            
-            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < finalLayerCount) {
-                // Check paused state
-                if (isPaused.get()) {
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
+        FrameClock clock = new FrameClock(frameIntervalNs);
+        currentFrame = 0;
+        boolean frameOwed = true;
+        boolean wasPlaying = false;
+        try {
+            while (!shouldStop.get() && !isDestroyed.get()) {
+                int seek = takeSeek();
+                if (seek >= 0) {
+                    currentFrame = seek;
+                    frameOwed = true;
+                    wasPlaying = false;
+                }
+                
+                boolean playing = isPlaying.get();
+                if (!playing && !frameOwed) {
+                    wasPlaying = false;
+                    Thread.sleep(16);
                     continue;
                 }
                 
@@ -1667,7 +1759,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     // Calculate offset in mmap buffer for this frame
                     long frameOffset = finalDataOffset + (long)currentFrame * finalBytesPerLayer;
                     
-                    // Upload directly from mmap buffer (true zero-copy!)
+                    // Upload directly from mmap buffer (true zero-copy!). The limit goes back
+                    // to the end first, since a frame after the last one read lies past it.
+                    mmapBuffer.clear();
                     mmapBuffer.position((int)frameOffset);
                     mmapBuffer.limit((int)frameOffset + finalBytesPerLayer);
                     ByteBuffer frameSlice = mmapBuffer.slice();
@@ -1691,6 +1785,18 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 
                 // Render (includes eglSwapBuffers)
                 renderTextureArrayFrame();
+                frameOwed = false;
+                if (!playing) {
+                    wasPlaying = false;
+                    continue;
+                }
+                if (!wasPlaying) {
+                    clock.restart();
+                    wasPlaying = true;
+                }
+                if (enableFrameEvents) {
+                    mainHandler.post(() -> notifyFrameUpdate());
+                }
                 
                 // Debug logging every 30 frames
                 if (debugFrameCounter % 30 == 0) {
@@ -1701,29 +1807,19 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 debugFrameCounter++;
                 
                 // Frame timing - wait until next frame time
-                long frameEndTime = loopStartTime + (long)(currentFrame + 1) * frameIntervalNs;
-                long now = System.nanoTime();
-                long sleepNs = frameEndTime - now;
-                if (sleepNs > 0) {
-                    try {
-                        Thread.sleep(sleepNs / 1_000_000, (int)(sleepNs % 1_000_000));
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                }
+                clock.awaitNext();
                 
-                if (isPlaying.get()) {
+                if (currentFrame + 1 < finalLayerCount) {
                     currentFrame++;
+                } else if (loop) {
+                    currentFrame = 0;
+                    logI("Uncompressed streaming loop restart");
+                } else {
+                    finish();
                 }
             }
-            
-            // End of one loop iteration
-            if (!loop) break;
-            
-            // Reset for next loop
-            Arrays.fill(ringSlots, -1);
-            logI("Uncompressed streaming loop restart");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         
         logI("Uncompressed streaming animation ended");
@@ -1836,6 +1932,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         // Decompression state - NO header to skip since we start at level0 data directly
         final int[] decodePos = {0};
         final boolean[] decompressEnded = {false};
+        // The frames before a seek target
+        final long[] bytesToSkip = {0};
         
         // Buffer for decompression
         final int bufferSize = 64 * 1024;
@@ -1872,16 +1970,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         final long finalLevel0Offset = level0Offset;
         final long finalLevel0Length = level0Length;
         
-        mSourceLoaded = true;
-        mainHandler.post(() -> {
-            notifyLoad();
-            notifyStateChange("ready");
-        });
-        
-        if (autoPlay && !isPaused.get()) {
-            isPlaying.set(true);
-            mainHandler.post(() -> notifyStateChange("playing"));
-        }
+        announceLoaded();
         
         // Track loop iterations for wrap-around prefetching
         final int[] decoderLoopIteration = {0};
@@ -1915,6 +2004,24 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     logI("Internal zstd prefetch wrap-around: restarting for loop " + decoderLoopIteration[0]);
                     continue;
                 }
+                
+                while (bytesToSkip[0] > 0 && !decompressEnded[0]) {
+                    decompressBuffer.clear();
+                    long result = AlphaVideoGpuNative.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
+                    if (result == -1) { decompressEnded[0] = true; break; }
+                    int status = (int)(result >> 32);
+                    int bytesWritten = (int)(result & 0xFFFFFFFFL);
+                    if (bytesWritten >= bytesToSkip[0]) {
+                        decompressBuffer.position((int) bytesToSkip[0]);
+                        decompressBuffer.limit(bytesWritten);
+                        frameAccumulatorBuffer.put(decompressBuffer);
+                        bytesToSkip[0] = 0;
+                    } else {
+                        bytesToSkip[0] -= bytesWritten;
+                    }
+                    if (status == 1) { decompressEnded[0] = true; break; }
+                }
+                if (decompressEnded[0]) continue;
                 
                 int accumulatorSize = frameAccumulatorBuffer.position();
                 
@@ -2052,93 +2159,109 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         };
         
         // Main playback loop
-        long frameIntervalNs = (long) (1_000_000_000.0 / (frameRate * playbackSpeed));
-        long loopStartTime = System.nanoTime();
+        FrameClock clock = new FrameClock(frameIntervalNanos());
+        // Only its parity matters: virtual positions are taken modulo 2 * totalFrames
         int playbackLoopIteration = 0;
+        currentFrame = 0;
+        boolean frameOwed = true;
+        boolean wasPlaying = false;
         
-        while (!shouldStop.get() && !isDestroyed.get()) {
-            currentFrame = 0;
-            loopStartTime = System.nanoTime();
-            
-            while (!shouldStop.get() && !isDestroyed.get() && currentFrame < totalFrames) {
-                int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
-                
-                if (isPaused.get()) {
-                    try { Thread.sleep(50); } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                        return;
+        try {
+            while (!shouldStop.get() && !isDestroyed.get()) {
+                int seek = takeSeek();
+                if (seek >= 0) {
+                    boolean samePass = decoderLoopIteration[0] % 2 == playbackLoopIteration % 2;
+                    // Frames from the shown one up to the decoder are buffered (in the cache or the ring)
+                    boolean buffered = samePass && seek >= currentFrame && seek < decodePos[0];
+                    if (!buffered) {
+                        if (samePass && seek >= decodePos[0] && !decompressEnded[0]) {
+                            skipDecodedBytes(frameAccumulatorBuffer, bytesToSkip,
+                                (long) (seek - decodePos[0]) * finalBytesPerLayer);
+                        } else {
+                            AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
+                            try {
+                                streamId[0] = openInternalZstdStream(local, finalLevel0Offset, finalLevel0Length);
+                            } catch (IOException e) {
+                                Log.e(TAG, "Cannot reopen " + local + " to seek: " + e.getMessage());
+                                streamId[0] = 0;
+                            }
+                            decompressEnded[0] = streamId[0] == 0;
+                            frameAccumulatorBuffer.clear();
+                            bytesToSkip[0] = (long) seek * finalBytesPerLayer;
+                        }
+                        decodePos[0] = seek;
+                        decoderLoopIteration[0] = 0;
+                        playbackLoopIteration = 0;
+                        dropStreamedFrames(frameCache, bufferPool, ringSlots, finalBytesPerLayer);
                     }
+                    currentFrame = seek;
+                    frameOwed = true;
+                    wasPlaying = false;
+                }
+                
+                boolean playing = isPlaying.get();
+                if (!playing && !frameOwed) {
+                    wasPlaying = false;
+                    Thread.sleep(16);
                     continue;
                 }
                 
+                int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
                 decodeFrames.accept(virtualPlaybackPos);
                 evictOldFrames.accept(virtualPlaybackPos);
                 
                 int currentGpuSlot = currentFrame % finalGpuCacheSize;
                 boolean frameInGpu = ringSlots[currentGpuSlot] == virtualPlaybackPos;
                 boolean frameInCpuCache = frameCache.containsKey(virtualPlaybackPos);
-                
-                if (frameInGpu || frameInCpuCache) {
-                    ensureFrameInGpu.accept(virtualPlaybackPos);
-                    
-                    if (!useVramStrategy) {
-                        for (int i = 1; i <= 2; i++) {
-                            int nextVirtualPos = virtualPlaybackPos + i;
-                            if (frameCache.containsKey(nextVirtualPos) || ringSlots[((currentFrame + i) % totalFrames) % finalGpuCacheSize] == nextVirtualPos) {
-                                ensureFrameInGpu.accept(nextVirtualPos);
-                            }
-                        }
-                    }
-                    
-                    if (isPlaying.get()) {
-                        renderFrame();
-                        if (enableFrameEvents) {
-                            mainHandler.post(() -> notifyFrameUpdate());
-                        }
-                        
-                        currentFrame++;
-                        if (currentFrame >= totalFrames) {
-                            if (loop) {
-                                break;
-                            } else {
-                                mainHandler.post(() -> {
-                                    notifyFinished();
-                                    notifyStateChange("stopped");
-                                });
-                                AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                                return;
-                            }
-                        }
-                        
-                        long targetTimeNs = loopStartTime + (currentFrame * frameIntervalNs);
-                        long sleepNs = targetTimeNs - System.nanoTime();
-                        if (sleepNs > 1_000_000) {
-                            try {
-                                Thread.sleep(sleepNs / 1_000_000, (int) (sleepNs % 1_000_000));
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                                return;
-                            }
-                        }
-                    }
-                } else {
+                if (!frameInGpu && !frameInCpuCache) {
                     Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
-                    try { Thread.sleep(8); } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                        return;
+                    Thread.sleep(8);
+                    continue;
+                }
+                
+                ensureFrameInGpu.accept(virtualPlaybackPos);
+                if (!useVramStrategy) {
+                    for (int i = 1; i <= 2; i++) {
+                        int nextVirtualPos = (virtualPlaybackPos + i) % vPosModulus;
+                        int nextGpuSlot = ((currentFrame + i) % totalFrames) % finalGpuCacheSize;
+                        // Past the loop point a frame can map to the shown frame's slot
+                        if (nextGpuSlot == currentGpuSlot) break;
+                        if (frameCache.containsKey(nextVirtualPos) || ringSlots[nextGpuSlot] == nextVirtualPos) {
+                            ensureFrameInGpu.accept(nextVirtualPos);
+                        }
                     }
                 }
+                
+                renderFrame();
+                frameOwed = false;
+                if (!playing) {
+                    wasPlaying = false;
+                    continue;
+                }
+                if (!wasPlaying) {
+                    clock.restart();
+                    wasPlaying = true;
+                }
+                if (enableFrameEvents) {
+                    mainHandler.post(() -> notifyFrameUpdate());
+                }
+                clock.awaitNext();
+                
+                if (currentFrame + 1 < totalFrames) {
+                    currentFrame++;
+                } else if (loop) {
+                    currentFrame = 0;
+                    playbackLoopIteration = (playbackLoopIteration + 1) % 2;
+                    logI("Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
+                } else {
+                    finish();
+                }
             }
-            
-            if (!loop) break;
-            playbackLoopIteration++;
-            logI("Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
         }
-        
-        AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
         logI("Internal zstd streaming animation ended");
     }
     

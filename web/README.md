@@ -26,8 +26,11 @@ await player.setSource('https://example.com/animation.ktx2');
 player.pause();
 player.resume();
 player.seekToFrame(0);
+player.seekToTime(1.5);
 player.destroy();
 ```
+
+A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before the source loads are ignored. `stop()` pauses on the first frame. `setPaused(paused)` is the `paused` prop: it holds playback, and unpausing plays again when `autoPlay` is on.
 
 `setSource(uri, partUris?, cacheKey?)` also takes the parts of a multi-part animation. Downloads are cached in IndexedDB, under `cacheKey` when given (for URLs that change while the file doesn't). `AlphaVideoGpuCore` is the player class itself, for supplying your own decoders.
 
@@ -46,7 +49,7 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 />
 ```
 
-Props: `src`, `parts`, `cacheKey`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingRingSize`, `streamingCacheSize`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. React 16.8 or later is an optional peer dependency.
+Props: `src`, `parts`, `cacheKey`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingRingSize`, `streamingCacheSize`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. A ref has `play()`, `pause()`, `stop()`, `seekToFrame(frame)` and `seekToTime(seconds)`. React 16.8 or later is an optional peer dependency.
 
 ## Building
 

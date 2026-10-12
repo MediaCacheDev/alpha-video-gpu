@@ -8,7 +8,7 @@
  * The Basis Universal and zstd decoders (JS + WASM) come bundled in alpha-video-gpu-web.
  */
 
-import React, { useRef, useEffect, useMemo } from 'react';
+import React, { forwardRef, useImperativeHandle, useRef, useEffect, useMemo } from 'react';
 import { View, StyleSheet } from 'react-native';
 
 import {
@@ -70,7 +70,15 @@ export interface AlphaVideoGpuViewProps {
 // AlphaVideoGpuView Component — Thin React Native Web wrapper
 // ============================================================================
 
-export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
+export interface AlphaVideoGpuViewRef {
+  play: () => void;
+  pause: () => void;
+  stop: () => void;
+  seekToFrame: (frame: number) => void;
+  seekToTime: (seconds: number) => void;
+}
+
+export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuViewProps>(({
   source,
   parts,
   autoPlay = true,
@@ -90,10 +98,18 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
   memoryStrategy = 'auto',
   stream = false,
   verbose = false,
-}) => {
+}, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const coreRef = useRef<AlphaVideoGpuCore | null>(null);
   const loadedSourceRef = useRef<string | null>(null);
+
+  useImperativeHandle(ref, () => ({
+    play: () => coreRef.current?.play(),
+    pause: () => coreRef.current?.pause(),
+    stop: () => coreRef.current?.stop(),
+    seekToFrame: (frame: number) => coreRef.current?.seekToFrame(frame),
+    seekToTime: (seconds: number) => coreRef.current?.seekToTime(seconds),
+  }), []);
 
   // Normalize source prop to { uri } format
   const normalizedSource = useMemo(() => {
@@ -192,16 +208,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
 
   // Handle paused prop changes
   useEffect(() => {
-    const core = coreRef.current;
-    if (!core) return;
-
-    if (paused) {
-      core.pause();
-    } else {
-      if (core.state === 'paused') {
-        core.resume();
-      }
-    }
+    coreRef.current?.setPaused(paused);
   }, [paused]);
 
   // Get canvas dimensions from style
@@ -223,7 +230,7 @@ export const AlphaVideoGpuView: React.FC<AlphaVideoGpuViewProps> = ({
       />
     </View>
   );
-};
+});
 
 const styles = StyleSheet.create({
   container: {

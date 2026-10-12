@@ -18,7 +18,7 @@
  * No external files or <script> tags needed.
  */
 
-import React, { useRef, useEffect, useMemo } from 'react';
+import React, { forwardRef, useImperativeHandle, useRef, useEffect, useMemo } from 'react';
 import { KTX2PlayerCore } from './KTX2PlayerCore';
 import type { KTX2LoadEvent, PlayerState, MemoryStrategy } from './types';
 import { initBasisTranscoder, ZSTDDecoder } from './bundled-deps';
@@ -63,7 +63,22 @@ export interface AlphaVideoGpuPlayerProps {
   onError?: (error: Error) => void;
 }
 
-export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
+/**
+ * Seeks show the frame (clamped to the clip) and keep playing, or stay paused. They are ignored
+ * until the source has loaded.
+ */
+export interface AlphaVideoGpuPlayerRef {
+  /** Plays from the shown frame, or from the start once a clip that doesn't loop has finished. */
+  play: () => void;
+  pause: () => void;
+  /** Pauses on the first frame. */
+  stop: () => void;
+  seekToFrame: (frame: number) => void;
+  /** Seeks to the frame showing at that time, in seconds. */
+  seekToTime: (seconds: number) => void;
+}
+
+export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideoGpuPlayerProps>(({
   src,
   parts,
   cacheKey,
@@ -86,10 +101,18 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
   onFrameUpdate,
   onFinished,
   onError,
-}) => {
+}, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const coreRef = useRef<KTX2PlayerCore | null>(null);
   const loadedSrcRef = useRef<string | null>(null);
+
+  useImperativeHandle(ref, () => ({
+    play: () => coreRef.current?.play(),
+    pause: () => coreRef.current?.pause(),
+    stop: () => coreRef.current?.stop(),
+    seekToFrame: (frame: number) => coreRef.current?.seekToFrame(frame),
+    seekToTime: (seconds: number) => coreRef.current?.seekToTime(seconds),
+  }), []);
 
   // Create core on mount
   useEffect(() => {
@@ -149,11 +172,7 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
   useEffect(() => { if (coreRef.current) coreRef.current.loop = loop; }, [loop]);
 
   // Paused
-  useEffect(() => {
-    const core = coreRef.current;
-    if (!core) return;
-    if (paused) { core.pause(); } else if (core.state === 'paused') { core.resume(); }
-  }, [paused]);
+  useEffect(() => { coreRef.current?.setPaused(paused); }, [paused]);
 
   const canvasStyle = useMemo<React.CSSProperties>(() => ({
     display: 'block',
@@ -169,4 +188,6 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
       style={canvasStyle}
     />
   );
-};
+});
+
+AlphaVideoGpuPlayer.displayName = 'AlphaVideoGpuPlayer';

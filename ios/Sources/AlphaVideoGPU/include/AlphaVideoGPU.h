@@ -72,10 +72,18 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) void (^onFinished)(void);
 @property (nonatomic, copy, nullable) void (^onError)(NSString *error);
 
+/** Plays from the shown frame, or from the start once a clip that doesn't loop has finished. */
 - (void)play;
 - (void)pause;
+/** Pauses on the first frame. */
 - (void)stop;
+/**
+ * Shows that frame (clamped to the clip) and keeps playing or stays paused. Ignored until onLoad.
+ * With stream, a seek outside the buffered frames decodes the file again.
+ */
 - (void)seekToFrame:(NSInteger)frame;
+/** Seeks to the frame showing at that time, in seconds. */
+- (void)seekToTime:(NSTimeInterval)seconds;
 /** Stops playback and frees the frames. Removing the view from its superview does the same. */
 - (void)cleanup;
 

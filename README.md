@@ -222,7 +222,7 @@ view.setSource("asset://media/animation.ktx2")
 container.addView(view)
 ```
 
-Every `PlayerCallback` method has an empty default; `onStateChange` and `onFrameUpdate` (with `setEnableFrameEvents(true)`) are the others. Callbacks arrive on the main thread. `play()`, `pause()`, `stop()` and `seekToFrame()` control playback; detaching the view, or `destroy()`, frees it. http(s) sources need the `INTERNET` permission in the app's manifest. Needs `minSdk` 24 and OpenGL ES 3.0.
+Every `PlayerCallback` method has an empty default; `onStateChange` and `onFrameUpdate` (with `setEnableFrameEvents(true)`) are the others. Callbacks arrive on the main thread. `play()`, `pause()`, `stop()`, `seekToFrame()` and `seekToTime()` control playback; detaching the view, or `destroy()`, frees it. http(s) sources need the `INTERNET` permission in the app's manifest. Needs `minSdk` 24 and OpenGL ES 3.0.
 
 ### iOS without React Native
 
@@ -261,7 +261,7 @@ view.source = "asset://media/animation.ktx2"
 container.addSubview(view)
 ```
 
-`MTKView` already has `paused` and `delegate`, which the view uses itself: pause playback with `playbackPaused`, and get events through the `onLoad`, `onFrameUpdate`, `onStateChange`, `onFinished` and `onError` blocks, which are called on the main queue. Setting `source` to `nil` stops playback and frees the textures. iOS 13 or later.
+`MTKView` already has `paused` and `delegate`, which the view uses itself: pause playback with `playbackPaused`, control it with `play`, `pause`, `stop`, `seekToFrame:` and `seekToTime:`, and get events through the `onLoad`, `onFrameUpdate`, `onStateChange`, `onFinished` and `onError` blocks, which are called on the main queue. Setting `source` to `nil` stops playback and frees the textures. iOS 13 or later.
 
 ---
 
@@ -276,6 +276,16 @@ import { AlphaVideoGpuView } from 'alpha-video-gpu';
   onStateChange={({ nativeEvent }) => console.log(nativeEvent.state)}
   onError={({ nativeEvent }) => console.error(nativeEvent.error)}
 />
+```
+
+A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first frame), `seekToFrame(frame)` and `seekToTime(seconds)`. A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before `onLoad` are ignored. With `stream`, a seek outside the buffered frames decodes again from the start of the file, or onwards from the decoder for a seek ahead of it. `paused` holds playback (for screen focus and blur); unpausing plays again when `autoPlay` is on. A clip that doesn't loop stops on its last frame, and `play()` starts it over.
+
+```jsx
+const player = useRef(null);
+
+<AlphaVideoGpuView ref={player} source={{ uri: 'asset://media/animation.ktx2' }} />
+
+player.current?.seekToTime(1.5);
 ```
 
 ### Sources
@@ -437,7 +447,8 @@ const player = createAlphaVideoGpuPlayer(document.querySelector('canvas')!, {
   onError: (error) => console.error(error),
 });
 player.setSource('https://example.com/animation.ktx2');
-// player.pause(), player.resume(), player.seekToFrame(n), player.destroy()
+// player.play(), player.pause(), player.resume(), player.stop(), player.seekToFrame(n),
+// player.seekToTime(seconds), player.setPaused(paused), player.destroy()
 ```
 
 ```tsx

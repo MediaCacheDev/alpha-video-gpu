@@ -131,6 +131,16 @@ export class KTX2PlayerCore {
   private _streamingLevel0Offset = 0;
   private _streamingAstcFormat = 0;
   private _streamingIsInternalZstd = false;
+  // Frames decoded before this one are dropped: the decoder is catching up to a seek
+  private _streamingSkipTo = 0;
+  private _decodeFrameId: number | null = null;
+  private _backgroundDecodeRunning = false;
+
+  // A clip that doesn't loop has reached its last frame; playing again starts it over
+  private _ended = false;
+  private _pausedByProp = false;
+  // Polls for a frame a seek owes while not playing, until it is decoded
+  private _owedFrameId: number | null = null;
 
   // -- RAM mode (non-streaming texture arrays with memoryStrategy='ram') --
   private _ramHeavyMode = false;
@@ -174,6 +184,10 @@ export class KTX2PlayerCore {
   get currentTime(): number { return this._currentFrame / this.frameRate; }
   get metadataInfo(): Metadata | null { return this._metadata; }
 
+  /** Whether a source starts playing once loaded. */
+  set autoPlay(v: boolean) { this._autoPlay = v; }
+  get autoPlay(): boolean { return this._autoPlay; }
+
   set loop(v: boolean) { this._loop = v; }
   get loop(): boolean { return this._loop; }
 
@@ -197,9 +211,15 @@ export class KTX2PlayerCore {
     if (cbs.onError !== undefined) this._onError = cbs.onError;
   }
 
+  /** Plays from the shown frame, or from the start once a clip that doesn't loop has ended. */
   play(): void {
-    if (this._state === 'ready' || this._state === 'paused' || this._state === 'stopped') {
+    if (this._state === 'paused') {
+      this.resume();
+    } else if (this._state === 'ready' || this._state === 'stopped') {
+      if (this._ended) this.seekToFrame(0);
+      this._streamingCancelled = false;
       this._setState('playing');
+      this._kickStreamingDecode();
       this._lastFrameTime = performance.now();
       this._startAnimationLoop();
     }
@@ -217,25 +237,52 @@ export class KTX2PlayerCore {
     if (this._state === 'paused') {
       this._streamingCancelled = false;
       this._setState('playing');
-      if (this._streamingMode && this._streamingDecompressState && !this._streamingDecompressState.reachedEnd) {
-        this._continueStreamingDecompression();
-      }
+      this._kickStreamingDecode();
       this._lastFrameTime = performance.now();
       this._startAnimationLoop();
     }
   }
 
+  /**
+   * Holds playback and decoding, keeping the frames (the `paused` prop, for screen focus and
+   * blur). Unpausing plays again only when autoPlay is on; a source loaded while paused waits.
+   */
+  setPaused(paused: boolean): void {
+    this._pausedByProp = paused;
+    if (paused) {
+      this.pause();
+    } else if (this._autoPlay && (this._state === 'paused' || this._state === 'ready')) {
+      this.play();
+    }
+  }
+
+  /** Pauses on the first frame. */
   stop(): void {
     this._setState('stopped');
     this._stopAnimationLoop();
-    this._currentFrame = 0;
+    this.seekToFrame(0);
   }
 
+  /**
+   * Shows that frame (clamped to the clip) and keeps playing or stays paused. Ignored until
+   * the source has loaded. While streaming, a seek outside the buffered frames decodes again.
+   */
   seekToFrame(frame: number): void {
-    if (this._metadata) {
-      this._currentFrame = Math.max(0, Math.min(frame, this._metadata.frameCount - 1));
-      this._render();
-    }
+    const total = this._metadata?.frameCount ?? 0;
+    if (!total || this._state === 'idle' || this._state === 'loading' || this._state === 'error') return;
+    const target = Math.max(0, Math.min(Math.floor(frame) || 0, total - 1));
+    this._ended = false;
+    if (this._streamingMode) this._moveStreamTo(target);
+    this._currentFrame = target;
+    this._lastFrameTime = performance.now();
+    this._onFrameUpdate?.(target, total);
+    // While playing, the animation loop draws it on its next frame
+    if (this._state !== 'playing') this._drawWhenReady();
+  }
+
+  /** Seeks to the frame showing at that time, in seconds. */
+  seekToTime(seconds: number): void {
+    this.seekToFrame(Math.floor((seconds > 0 ? seconds : 0) * this.frameRate + 1e-6));
   }
 
   set verbose(v: boolean) { this._verbose = v; }
@@ -259,7 +306,11 @@ export class KTX2PlayerCore {
       const uri = resolveWebUri(sourceUri);
       partUris = partUris?.map(resolveWebUri);
       this._setState('loading');
+      this._stopAnimationLoop();
       this._streamingCancelled = false;
+      this._currentFrame = 0;
+      this._ended = false;
+      this._streamingSkipTo = 0;
 
       const gl = this._gl || this._initGL();
       if (!gl) return;
@@ -320,6 +371,10 @@ export class KTX2PlayerCore {
   destroy(): void {
     this._streamingCancelled = true;
     this._stopAnimationLoop();
+    if (this._owedFrameId !== null) cancelAnimationFrame(this._owedFrameId);
+    if (this._decodeFrameId !== null) cancelAnimationFrame(this._decodeFrameId);
+    this._owedFrameId = null;
+    this._decodeFrameId = null;
     const gl = this._gl;
     if (gl) {
       this._textures.forEach(tex => gl.deleteTexture(tex));
@@ -356,11 +411,12 @@ export class KTX2PlayerCore {
 
   private _finishLoad(): void {
     this._setState('ready');
-    this._render();
-    if (this._autoPlay) {
+    if (this._autoPlay && !this._pausedByProp) {
       this._setState('playing');
       this._lastFrameTime = performance.now();
       this._startAnimationLoop();
+    } else {
+      this._drawWhenReady();
     }
   }
 
@@ -496,8 +552,10 @@ export class KTX2PlayerCore {
         partWidth = parts[partIndex].columns * frameWidth;
         partHeight = parts[partIndex].rows * frameHeight;
       } else {
+        // A part holds only the rows its frames fill, short of framesPerPart in the last one
+        const framesInPart = Math.min(framesPerPart, frameCount - partIndex * framesPerPart);
         partWidth = framesPerRow * frameWidth;
-        partHeight = Math.ceil(framesPerPart / framesPerRow) * frameHeight;
+        partHeight = Math.ceil(framesInPart / framesPerRow) * frameHeight;
       }
 
       uvs.push({
@@ -1031,6 +1089,8 @@ export class KTX2PlayerCore {
   // ======== Private: Background Decompression (internal zstd) ========
 
   private _startBackgroundDecompression(): void {
+    if (this._backgroundDecodeRunning) return;
+    this._backgroundDecodeRunning = true;
     const decompressLoop = async () => {
       const layerCount = this._streamingLayerCount;
       while (!this._streamingCancelled && this._streamingDecodePos < layerCount) {
@@ -1039,7 +1099,7 @@ export class KTX2PlayerCore {
           const frameData = await this._decodeNextFrame();
           if (frameData) {
             const frameIndex = this._streamingDecodePos;
-            this._streamingFrameCache.set(frameIndex, frameData);
+            if (frameIndex >= this._streamingSkipTo) this._streamingFrameCache.set(frameIndex, frameData);
             this._streamingDecodePos++;
             this._streamingFramesReady = this._streamingDecodePos;
           } else {
@@ -1050,7 +1110,7 @@ export class KTX2PlayerCore {
         }
       }
     };
-    decompressLoop();
+    decompressLoop().finally(() => { this._backgroundDecodeRunning = false; });
   }
 
   // ======== Private: Ensure Frame In Ring Buffer ========
@@ -1134,9 +1194,7 @@ export class KTX2PlayerCore {
     if (decodePos > currentFrame + this._streamingPrefetchAhead) {
       if (!this._streamingDecompressPaused) this._streamingDecompressPaused = true;
       this._evictOldFramesFromCache(currentFrame);
-      if (!this._streamingCancelled) {
-        requestAnimationFrame(() => this._continueStreamingDecompression());
-      }
+      this._scheduleStreamingDecode();
       return;
     }
 
@@ -1224,8 +1282,9 @@ export class KTX2PlayerCore {
       // Extract complete frames
       while (state.frameAccumulatorLength >= bytesPerLayer) {
         if (frameCache.size >= maxCacheSize) break;
-        const frameData = state.frameAccumulator.slice(0, bytesPerLayer);
-        frameCache.set(this._streamingDecodePos, frameData);
+        if (this._streamingDecodePos >= this._streamingSkipTo) {
+          frameCache.set(this._streamingDecodePos, state.frameAccumulator.slice(0, bytesPerLayer));
+        }
         this._streamingDecodePos++;
         this._streamingFramesReady = this._streamingDecodePos;
         const remaining = state.frameAccumulatorLength - bytesPerLayer;
@@ -1239,7 +1298,7 @@ export class KTX2PlayerCore {
     if (!state.reachedEnd && !this._streamingCancelled) {
       const cacheIsFull = frameCache.size >= maxCacheSize;
       if (!cacheIsFull) {
-        requestAnimationFrame(() => this._continueStreamingDecompression());
+        this._scheduleStreamingDecode();
       } else {
         this._streamingDecompressPaused = true;
       }
@@ -1249,12 +1308,64 @@ export class KTX2PlayerCore {
   // ======== Private: Handle Streaming Loop ========
 
   private _handleStreamingLoop(): void {
+    // Uncompressed streaming reads any frame straight from the file
+    if (!this._streamingDecompressState) return;
     this._streamingLoopCount++;
     this._log(`[AlphaVideoGpu] 🔄 Loop #${this._streamingLoopCount} - restarting decompression`);
+    this._restartStreamingDecode(0);
+  }
 
+  /** Starts whichever streaming decoder this source uses, unless it is already running. */
+  private _kickStreamingDecode(): void {
+    const state = this._streamingDecompressState;
+    if (!this._streamingMode || !state || this._streamingCancelled) return;
+    if (this._streamingIsInternalZstd) {
+      this._startBackgroundDecompression();
+    } else if (!state.reachedEnd) {
+      this._streamingDecompressPaused = false;
+      this._continueStreamingDecompression();
+    }
+  }
+
+  private _scheduleStreamingDecode(): void {
+    if (this._decodeFrameId !== null || this._streamingCancelled) return;
+    this._decodeFrameId = requestAnimationFrame(() => {
+      this._decodeFrameId = null;
+      this._continueStreamingDecompression();
+    });
+  }
+
+  /**
+   * Points the streaming decoder at target. Frames from target up to the decoder that are all
+   * still buffered are kept; a target ahead of the decoder is skipped to; otherwise decoding
+   * starts over.
+   */
+  private _moveStreamTo(target: number): void {
+    const state = this._streamingDecompressState;
+    if (!state) return;
+    const decodePos = this._streamingDecodePos;
+    let buffered = target < decodePos;
+    for (let f = target; buffered && f < decodePos; f++) {
+      buffered = this._streamingFrameCache.has(f) || this._streamingRingSlots.includes(f);
+    }
+    if (buffered) return;
+
+    const reachedEnd = this._streamingIsInternalZstd ? decodePos >= this._streamingLayerCount : state.reachedEnd;
+    if (target >= decodePos && !reachedEnd) {
+      this._streamingFrameCache.clear();
+      this._streamingSkipTo = target;
+      this._kickStreamingDecode();
+    } else {
+      this._restartStreamingDecode(target);
+    }
+  }
+
+  /** Decodes from the start again, dropping the frames before skipTo. */
+  private _restartStreamingDecode(skipTo: number): void {
     this._streamingFrameCache.clear();
     this._streamingDecodePos = 0;
     this._streamingFramesReady = 0;
+    this._streamingSkipTo = skipTo;
     this._streamingDecompressPaused = false;
 
     const state = this._streamingDecompressState;
@@ -1288,12 +1399,28 @@ export class KTX2PlayerCore {
         }
       }
 
-      if (this._streamingIsInternalZstd) {
-        this._startBackgroundDecompression();
-      } else {
-        this._continueStreamingDecompression();
-      }
+      this._kickStreamingDecode();
     }
+  }
+
+  /** Draws the shown frame once it is decoded, for a seek while not playing. */
+  private _drawWhenReady(): void {
+    if (this._owedFrameId !== null) cancelAnimationFrame(this._owedFrameId);
+    this._owedFrameId = null;
+    // A paused player decodes only what the seek needs
+    const pauseDecodeAfter = this._state === 'paused';
+    this._streamingCancelled = false;
+    this._kickStreamingDecode();
+    const attempt = () => {
+      this._owedFrameId = null;
+      if (this._state === 'playing') return;
+      if (this._render()) {
+        if (pauseDecodeAfter && this._state === 'paused') this._streamingCancelled = true;
+        return;
+      }
+      this._owedFrameId = requestAnimationFrame(attempt);
+    };
+    attempt();
   }
 
   // ======== Private: Load Streaming Texture Array (.ktx2.zst) ========
@@ -1421,29 +1548,31 @@ export class KTX2PlayerCore {
 
   // ======== Private: Render Frame ========
 
-  private _render(): void {
+  /** Draws the current frame; false when it isn't decoded yet, leaving the last one showing. */
+  private _render(): boolean {
     const gl = this._gl;
     const program = this._program;
     const frameUVs = this._frameUVs;
     const textures = this._textures;
     const metadata = this._metadata;
 
-    if (!gl || !frameUVs.length || !metadata) return;
+    if (!gl || !frameUVs.length || !metadata) return false;
 
     const currentFrame = this._currentFrame;
     const frameUV = frameUVs[currentFrame];
-    if (!frameUV) return;
+    if (!frameUV) return false;
 
-    // If using shared GL context, ensure shared canvas is large enough and set viewport
-    if (this._usingSharedGL && getSharedGLResources()) {
-      const frameWidth = metadata.frameWidth;
-      const frameHeight = metadata.frameHeight;
-      ensureSharedCanvasSize(frameWidth, frameHeight);
-      gl.viewport(0, 0, frameWidth, frameHeight);
-    }
-
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    const prepareTarget = () => {
+      // If using shared GL context, ensure shared canvas is large enough and set viewport
+      if (this._usingSharedGL && getSharedGLResources()) {
+        const frameWidth = metadata.frameWidth;
+        const frameHeight = metadata.frameHeight;
+        ensureSharedCanvasSize(frameWidth, frameHeight);
+        gl.viewport(0, 0, frameWidth, frameHeight);
+      }
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    };
 
     // Texture array rendering (WebGL2)
     if (this._useTextureArray && this._arrayProgram && this._textureArray) {
@@ -1454,21 +1583,10 @@ export class KTX2PlayerCore {
 
       if (this._streamingMode) {
         // Check if frame is ready
-        if (currentFrame >= this._streamingFramesReady) {
-          if (this._streamingDecompressPaused) {
-            this._streamingDecompressPaused = false;
-            this._continueStreamingDecompression();
-          }
-          return;
-        }
-
-        const slot = this._ensureFrameInRingBuffer(currentFrame);
+        const slot = currentFrame < this._streamingFramesReady ? this._ensureFrameInRingBuffer(currentFrame) : -1;
         if (slot === -1) {
-          if (this._streamingDecompressPaused) {
-            this._streamingDecompressPaused = false;
-            this._continueStreamingDecompression();
-          }
-          return;
+          if (this._streamingDecompressPaused) this._kickStreamingDecode();
+          return false;
         }
         layerIndex = slot;
 
@@ -1483,8 +1601,7 @@ export class KTX2PlayerCore {
         // Resume decompression if paused and cache has room
         const maxCacheSize = this._useVramStrategy ? 5 : this._streamingCacheSize;
         if (this._streamingDecompressPaused && this._streamingFrameCache.size < maxCacheSize) {
-          this._streamingDecompressPaused = false;
-          this._continueStreamingDecompression();
+          this._kickStreamingDecode();
         }
       } else if (this._ramHeavyMode && this._ramFrameData) {
         // Non-streaming RAM mode: upload current frame on demand
@@ -1510,6 +1627,7 @@ export class KTX2PlayerCore {
         layerIndex = frameUV.layer !== undefined ? frameUV.layer : currentFrame;
       }
 
+      prepareTarget();
       gl2.useProgram(arrayProgram);
       gl2.activeTexture(gl2.TEXTURE0);
       gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, this._textureArray);
@@ -1529,12 +1647,13 @@ export class KTX2PlayerCore {
       gl2.drawArrays(gl2.TRIANGLES, 0, 6);
     } else {
       // Standard 2D texture rendering (atlas mode)
-      if (!program || !textures.length) return;
+      if (!program || !textures.length) return false;
 
       const framesPerPart = metadata.framesPerPart || metadata.framesPerStrip || metadata.frameCount;
       const partIndex = Math.floor(currentFrame / framesPerPart);
       const texture = textures[partIndex] || textures[0];
 
+      prepareTarget();
       gl.useProgram(program);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -1575,6 +1694,7 @@ export class KTX2PlayerCore {
         );
       }
     }
+    return true;
   }
 
   // ======== Private: Animation Loop ========
@@ -1588,29 +1708,29 @@ export class KTX2PlayerCore {
     const frameInterval = 1000 / metadata.frameRate;
 
     const animate = (timestamp: number) => {
+      this._animationFrameId = null;
       if (this._state !== 'playing') return;
 
       const elapsed = timestamp - this._lastFrameTime;
 
-      if (elapsed >= frameInterval / this._playbackSpeed) {
+      // A frame that isn't decoded yet holds playback rather than being skipped
+      if (elapsed >= frameInterval / this._playbackSpeed && this._render()) {
         this._lastFrameTime = timestamp - (elapsed % (frameInterval / this._playbackSpeed));
-
-        this._render();
         this._onFrameUpdate?.(this._currentFrame, metadata.frameCount);
 
-        this._currentFrame++;
-
-        if (this._currentFrame >= metadata.frameCount) {
-          if (this._loop) {
-            this._currentFrame = 0;
-            if (this._streamingMode && this._streamingFrameCache) {
-              this._handleStreamingLoop();
-            }
-          } else {
-            this._setState('stopped');
-            this._onFinished?.();
-            return;
+        if (this._currentFrame + 1 < metadata.frameCount) {
+          this._currentFrame++;
+        } else if (this._loop) {
+          this._currentFrame = 0;
+          if (this._streamingMode && this._streamingFrameCache) {
+            this._handleStreamingLoop();
           }
+        } else {
+          // The last frame stays on screen
+          this._ended = true;
+          this._setState('stopped');
+          this._onFinished?.();
+          return;
         }
       }
 
