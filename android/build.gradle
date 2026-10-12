@@ -35,7 +35,9 @@ android {
             cmake {
                 cppFlags '-std=c++14 -fexceptions'
                 abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
-                arguments '-DANDROID_STL=c++_shared'
+                // One .so with only a JNI surface, so the runtime is linked in and the AAR ships no
+                // libc++_shared.so to collide with other libraries' copies
+                arguments '-DANDROID_STL=c++_static'
             }
         }
     }
@@ -50,10 +52,6 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
-    }
-
-    packagingOptions {
-        pickFirst 'lib/*/libc++_shared.so'
     }
 
     publishing {
