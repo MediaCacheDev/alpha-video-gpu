@@ -51,6 +51,23 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 
 Props: `src`, `parts`, `cacheKey`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingRingSize`, `streamingCacheSize`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. A ref has `play()`, `pause()`, `stop()`, `seekToFrame(frame)` and `seekToTime(seconds)`. React 16.8 or later is an optional peer dependency.
 
+## Errors
+
+`onError` gets an `Error`. The ones a page may want to handle are an `AlphaVideoGpuError` with a `code`:
+
+- `'ASTC_UNSUPPORTED'`: the file holds native ASTC frames and the browser lacks `WEBGL_compressed_texture_astc`, as most desktop browsers on Windows and Linux do. There is no software fallback; serve a UASTC file instead.
+- `'WEBGL_UNSUPPORTED'`: no WebGL context could be created.
+
+```ts
+import type { AlphaVideoGpuError } from 'alpha-video-gpu-web';
+
+onError: (error) => {
+  if ((error as AlphaVideoGpuError).code === 'ASTC_UNSUPPORTED') {
+    player.setSource('/animation-uastc.ktx2');
+  }
+},
+```
+
 ## Building
 
 `npm run build` inlines `libs/basis_transcoder.{js,wasm}` into `src/basis-transcoder.ts` and builds `dist/` (ESM, CommonJS and type declarations) with tsup.

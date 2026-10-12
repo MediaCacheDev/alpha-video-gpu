@@ -175,7 +175,7 @@ See the encoder's README for every option, video input and the memory-efficient 
 
 ## Emulator / Fallback Behavior
 
-On devices without hardware ASTC support (iOS Simulator, Android Emulator, some browsers), the player automatically decodes ASTC textures to RGBA in software.
+On devices without hardware ASTC support (iOS Simulator, Android Emulator), the player automatically decodes ASTC textures to RGBA in software. Browsers have no software fallback (see [Web Texture Format Support](#web-texture-format-support)).
 
 | Platform | Hardware Support | Fallback |
 |----------|------------------|----------|
@@ -183,7 +183,7 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator, some 
 | iOS Simulator | None | Software ASTC→RGBA decode |
 | Android Device | ASTC or ETC2 | ETC2 or software decode |
 | Android Emulator | Usually none | Software ASTC→RGBA decode |
-| Web (desktop) | Varies (ASTC/BC7/ETC2) | Error if ASTC unsupported |
+| Web (desktop) | Varies (ASTC/BC7/ETC2) | UASTC transcodes; native ASTC fails with `ASTC_UNSUPPORTED` |
 
 **Important:** Both ASTC and UASTC modes fall back to uncompressed RGBA on emulators. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices.
 
@@ -467,7 +467,7 @@ The zstd decoder and the Basis transcoder (JS and WebAssembly) are bundled inlin
 | **UASTC** | All (transcoded) | Transcodes to BC7/ETC2/RGBA at runtime |
 | **Zstd compression** | All | Bundled WASM decoder |
 
-Native ASTC files need `WEBGL_compressed_texture_astc`, which most desktop browsers on Windows and Linux lack; there is no software fallback on the web, so the player reports an error. Encode with `--uastc` if desktop browsers matter.
+Native ASTC files need `WEBGL_compressed_texture_astc`, which most desktop browsers on Windows and Linux lack; there is no software fallback on the web, so `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component). Encode with `--uastc` if desktop browsers matter.
 
 ---
 
@@ -525,11 +525,13 @@ Streaming works with **texture arrays** (`--mode array`, the encoder default) of
 - the file is a whole-file zstd wrapper (`--outer-compression`, usually `.ktx2.zst`). These always stream.
 - `stream` is set and the file uses KTX2-internal zstd (the encoder default) or no compression (`--zstd 0`).
 
+The `streamMode` metadata key that older encoders wrote is ignored; only `stream` turns streaming on.
+
 ```jsx
 <AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation.ktx2' }}
   stream
-  memoryStrategy="vram"
+  memoryStrategy="ram"
   streamingRingSize={16}
   streamingCacheSize={60}
   streamingPrefetchAhead={30}
@@ -541,27 +543,27 @@ Streaming works with **texture arrays** (`--mode array`, the encoder default) of
 | Prop | Default | Description |
 |------|---------|-------------|
 | `stream` | `false` | Stream a texture array instead of loading every frame |
-| `memoryStrategy` | `"auto"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM) |
-| `streamingRingSize` | `16` | GPU texture slots in the ring buffer (4–64) |
-| `streamingCacheSize` | `60` | (RAM mode only) decoded frames kept in CPU memory |
+| `memoryStrategy` | `"auto"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM). `"auto"` streams in RAM mode |
+| `streamingRingSize` | `16` | RAM mode: GPU texture slots that frames are uploaded into (4–64). Unused in VRAM mode |
+| `streamingCacheSize` | `60` | Frames kept decoded (10–200): in CPU memory in RAM mode, and as the GPU ring's slots in VRAM mode |
 | `streamingPrefetchAhead` | `30` | Frames decoded ahead of the playback position (5–100) |
 
 #### VRAM Streaming
 
-Frames are decoded directly into a GPU texture ring buffer. Minimal CPU RAM usage - only the ring buffer exists in VRAM.
+Frames are decoded directly into a GPU texture ring buffer of `streamingCacheSize` slots. Minimal CPU RAM usage - only the ring buffer exists in VRAM.
 
 ```
-[GPU Ring Buffer: 16 slots]
+[GPU Ring Buffer: 60 slots]
 Slot 0: Frame 100  ← Currently displaying
 Slot 1: Frame 101
 Slot 2: Frame 102
 ...
-Slot 15: Frame 115 ← Prefetched ahead
+Slot 59: Frame 159 ← Prefetched ahead
 ```
 
 #### RAM Streaming
 
-Frames are first decoded to a CPU RAM cache, then uploaded to a smaller GPU ring buffer on demand. Minimizes VRAM usage while providing a larger decode-ahead buffer.
+Frames are first decoded to a CPU RAM cache of `streamingCacheSize` frames, then uploaded to a smaller GPU ring buffer of `streamingRingSize` slots on demand. Minimizes VRAM usage while providing a larger decode-ahead buffer.
 
 ```
 [CPU Cache: 60 frames] → [GPU Ring Buffer: 16 slots]
@@ -616,7 +618,7 @@ texenc --input ./frames --output animation_uncompressed.ktx2 --fps 30 --zstd 0
 <AlphaVideoGpuView
   source={{ uri: 'https://example.com/animation_uncompressed.ktx2' }}
   stream
-  memoryStrategy="vram"
+  memoryStrategy="ram"
   streamingRingSize={16}
 />
 ```
@@ -625,7 +627,7 @@ texenc --input ./frames --output animation_uncompressed.ktx2 --fps 30 --zstd 0
 
 1. **Memory-mapped file access** - The KTX2 file is mmap'd, allowing the OS to page frames in/out efficiently
 2. **Direct GPU upload** - ASTC blocks are copied directly to GPU texture memory (no Zstd decompression needed)
-3. **Ring buffer playback** - Only `streamingRingSize` frames are in GPU memory at once
+3. **Ring buffer playback** - Only `streamingRingSize` frames (`streamingCacheSize` with `memoryStrategy="vram"`) are in GPU memory at once
 4. **Zero CPU decode** - On real devices with ASTC hardware, CPU usage approaches zero during playback
 
 ### Trade-offs
@@ -689,8 +691,8 @@ Not ideal for:
 | `parts` | `Array<{ uri: string, cacheKey?: string }>` | — | Every part of a multi-part animation, when they can't be found next to `source` |
 | `memoryStrategy` | `"auto"` \| `"vram"` \| `"ram"` | `"auto"` | Where frames are kept |
 | `stream` | `boolean` | `false` | Stream a texture array with a ring buffer |
-| `streamingRingSize` | `number` | `16` | GPU texture slots for streaming |
-| `streamingCacheSize` | `number` | `60` | CPU cache size for RAM streaming |
+| `streamingRingSize` | `number` | `16` | GPU texture slots for RAM-mode streaming |
+| `streamingCacheSize` | `number` | `60` | Frames kept decoded while streaming: in CPU memory in RAM mode, in the GPU ring in VRAM mode |
 | `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead |
 | `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every frame played, not only after seeks |
 | `verbose` | `boolean` | `false` | Log info traces (Logcat, Xcode console, browser console); warnings and errors always log |
@@ -698,7 +700,7 @@ Not ideal for:
 | `onStateChange` | `({ nativeEvent: { state } }) => void` | — | `state` is `"loading"`, `"ready"`, `"playing"`, `"paused"` or `"stopped"` |
 | `onFrameUpdate` | `({ nativeEvent: { frame, totalFrames } }) => void` | — | After a seek, and for every frame with `enableFrameEvents` |
 | `onFinished` | `() => void` | — | A non-looping animation reached its last frame |
-| `onError` | `({ nativeEvent: { error } }) => void` | — | Loading or playback failed |
+| `onError` | `({ nativeEvent: { error, code? } }) => void` | — | Loading or playback failed. `code` is set on web only: `'ASTC_UNSUPPORTED'` or `'WEBGL_UNSUPPORTED'` |
 
 The events have the same shape on Android, iOS and web. Playback is controlled with props (`paused`, `autoPlay`, a new `source`) and with the ref (see [Usage](#usage)).
 
@@ -714,6 +716,14 @@ The events have the same shape on Android, iOS and web. Playback is controlled w
 | `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
 | `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there inlines the decoders and builds `dist/` | npm `alpha-video-gpu-web` |
 | `scripts/publish-android.sh` | `local` publishes the Android library to `~/.m2`; `central` signs it and uploads it to the Maven Central Portal (see the script for the variables) | |
+
+A clone builds with no setup step, since the transcoders are in the repo (`third_party/` for the native libraries, `web/libs/` for the web package):
+
+```bash
+cd web && npm ci && npm run build                     # web: dist/
+cd android && ./gradlew assembleRelease               # Android: the AAR (needs the Android SDK and NDK)
+xcodebuild -scheme AlphaVideoGPU -destination 'generic/platform=iOS Simulator' build   # iOS, from the repo root
+```
 
 A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `alpha-video-gpu`, which depends on it.
 

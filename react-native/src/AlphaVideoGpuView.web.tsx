@@ -15,10 +15,12 @@ import {
   AlphaVideoGpuCore,
   initBasisTranscoder,
   ZSTDDecoder,
+  type AlphaVideoGpuError,
+  type AlphaVideoGpuErrorCode,
   type AlphaVideoGpuLoadEvent,
 } from 'alpha-video-gpu-web';
 
-export type { AlphaVideoGpuLoadEvent, PlayerState } from 'alpha-video-gpu-web';
+export type { AlphaVideoGpuErrorCode, AlphaVideoGpuLoadEvent, PlayerState } from 'alpha-video-gpu-web';
 
 /**
  * Where to load from (on web, `asset://` and http(s) URLs apply):
@@ -50,14 +52,15 @@ export interface AlphaVideoGpuViewProps {
   onStateChange?: (event: { nativeEvent: { state: string } }) => void;
   onFrameUpdate?: (event: { nativeEvent: { frame: number; totalFrames: number } }) => void;
   onFinished?: (event: { nativeEvent: {} }) => void;
-  onError?: (event: { nativeEvent: { error: string } }) => void;
+  /** `code` is set for the errors a page may want to handle, such as 'ASTC_UNSUPPORTED' */
+  onError?: (event: { nativeEvent: { error: string; code?: AlphaVideoGpuErrorCode } }) => void;
   /** Send onFrameUpdate for every frame played; seeks always send it. Default: false */
   enableFrameEvents?: boolean;
 
   // Streaming parameters (for .ktx2.zst files)
-  /** GPU ring buffer slots (VRAM). Default: 16 */
+  /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
   streamingRingSize?: number;
-  /** CPU frame cache size (RAM). Default: 60 */
+  /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */
   streamingCacheSize?: number;
   /** Frames to decode ahead of playback. Default: 30 */
   streamingPrefetchAhead?: number;
@@ -147,7 +150,10 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
       onFrameUpdate: (frame, totalFrames) =>
         callbacksRef.current.onFrameUpdate?.({ nativeEvent: { frame, totalFrames } }),
       onFinished: () => callbacksRef.current.onFinished?.({ nativeEvent: {} }),
-      onError: error => callbacksRef.current.onError?.({ nativeEvent: { error: error.message } }),
+      onError: error => {
+        const { code } = error as AlphaVideoGpuError;
+        callbacksRef.current.onError?.({ nativeEvent: code ? { error: error.message, code } : { error: error.message } });
+      },
     });
 
     return () => {

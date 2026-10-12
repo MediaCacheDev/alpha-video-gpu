@@ -888,8 +888,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
       return;
     }
     
-    // Check for uncompressed streaming mode (.ktx2 files with streamMode:true)
-    // This avoids loading the entire file into memory
+    // With stream, an uncompressed texture array is mmap-streamed rather than loaded into memory
     if ([self checkAndPlayUncompressedStreaming:path]) {
       AVG_VLOG(@"Using uncompressed streaming mode");
       return;
@@ -1622,8 +1621,11 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 #pragma mark - Uncompressed Streaming (mmap)
 
+// With the stream prop, plays an uncompressed KTX2 texture array by mmap streaming, reading only
+// the header and metadata so the file is never loaded into memory.
 - (BOOL)checkAndPlayUncompressedStreaming:(NSString *)filePath
 {
+  if (!self.stream) return NO;
   AVG_VLOG(@"checkAndPlayUncompressedStreaming: %@", filePath);
   
   // Open file
@@ -1685,18 +1687,16 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     return NO;
   }
   
-  // Check for streamMode
-  if (![metadataJson containsString:@"\"streamMode\":true"] && 
-      ![metadataJson containsString:@"\"streamMode\": true"]) {
-    close(fd);
-    return NO;
-  }
-  
   // Parse metadata
   NSError *jsonError = nil;
   NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:[metadataJson dataUsingEncoding:NSUTF8StringEncoding]
                                                            options:0 error:&jsonError];
-  if (jsonError || !metadata) {
+  if (jsonError || ![metadata isKindOfClass:[NSDictionary class]]) {
+    close(fd);
+    return NO;
+  }
+  // Only texture arrays stream
+  if (![metadata[@"packingMode"] isEqual:@"array"]) {
     close(fd);
     return NO;
   }
@@ -3087,6 +3087,22 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     [self.displayLink invalidate];
     self.displayLink = nil;
   }
+}
+
+// Same ranges as Android; a size of 0 would leave the ring with no slots.
+- (void)setStreamingRingSize:(NSInteger)size
+{
+  _streamingRingSize = MAX(4, MIN(64, size));
+}
+
+- (void)setStreamingCacheSize:(NSInteger)size
+{
+  _streamingCacheSize = MAX(10, MIN(200, size));
+}
+
+- (void)setStreamingPrefetchAhead:(NSInteger)frames
+{
+  _streamingPrefetchAhead = MAX(5, MIN(100, frames));
 }
 
 - (void)setPlaybackSpeed:(CGFloat)speed

@@ -159,9 +159,6 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     private int astcBlockHeight = 4;
     private int astcGlFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
     
-    // Stream mode flag from metadata (for internal KTX2 streaming)
-    private boolean metadataStreamMode = false;
-    
     // Texture array mode (for packingMode: 'array')
     private boolean useTextureArray = false;
     private int textureArrayId = 0;
@@ -1475,11 +1472,12 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     }
     
     /**
-     * Check if file is uncompressed streaming KTX2 and play it if so.
-     * Reads only the header (~1KB) to detect streaming mode - avoids loading entire file into RAM.
+     * With the stream prop, plays an uncompressed KTX2 texture array by mmap streaming.
+     * Reads only the header and metadata, so the file is never loaded into RAM.
      * @return true if handled as uncompressed streaming, false otherwise
      */
     private boolean checkAndPlayUncompressedStreaming(AlphaVideoGpuSource local) {
+        if (!streamProp) return false;
         logD("checkAndPlayUncompressedStreaming: checking " + local);
         try {
             // Read just the header (first 256 bytes is enough for KTX2 header + basic metadata check)
@@ -1528,13 +1526,6 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 return false;
             }
             
-            // Check for streamMode in metadata
-            boolean hasStreamMode = metadataJson.contains("\"streamMode\":true") || metadataJson.contains("\"streamMode\": true");
-            logD("checkAndPlayUncompressedStreaming: hasStreamMode=" + hasStreamMode);
-            if (!hasStreamMode) {
-                return false; // Not streaming mode
-            }
-            
             // Parse metadata to set up isNativeASTC, frameRate, etc.
             try {
                 parseMetadata(metadataJson);
@@ -1543,9 +1534,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 Log.e(TAG, "Failed to parse metadata for uncompressed streaming: " + e.getMessage());
                 return false;
             }
+            if (!useTextureArray) {
+                return false; // Only texture arrays stream
+            }
             
-            // All checks passed - this is uncompressed streaming mode
-            logI("Detected uncompressed streaming KTX2 (supercompression=0, streamMode=true) - using mmap streaming");
+            logI("Uncompressed texture array with stream=true - using mmap streaming");
             playUncompressedStreamingAnimation(local);
             return true;
             
@@ -2643,13 +2636,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         useTextureArray = "array".equals(packingMode);
         textureArrayLayerCount = metadata.optInt("layerCount", totalFrames);
         
-        // Check for stream mode (internal streaming flag in metadata)
-        metadataStreamMode = metadata.optBoolean("streamMode", false);
-        
         logI("Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
                 ", " + frameRate + " fps, " + partCount + " parts");
-        logI("Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode + 
-                ", streamMode=" + metadataStreamMode);
+        logI("Mode: '" + mode + "', isNativeASTC=" + isNativeASTC + ", packingMode=" + packingMode);
     }
     
     /**

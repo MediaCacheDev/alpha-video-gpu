@@ -41,6 +41,9 @@ export {
 
 export { getCachedFile, setCachedFile } from './cache';
 
+export { AlphaVideoGpuError } from './errors';
+export type { AlphaVideoGpuErrorCode } from './errors';
+
 export { initBasisTranscoder, ZSTDDecoder };
 
 /** A player on `canvas` with the bundled decoders. */

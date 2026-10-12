@@ -35,6 +35,7 @@ import {
 } from './ktx2-parser';
 
 import { getCachedFile, setCachedFile } from './cache';
+import { AlphaVideoGpuError, requireASTC } from './errors';
 
 // Re-export types for convenience
 export type {
@@ -54,6 +55,10 @@ let basisModule: any = null;
 /** asset://path names the app's bundled media; on the web it is served from the site root. */
 function resolveWebUri(uri: string): string {
   return uri.startsWith('asset://') ? '/' + uri.slice('asset://'.length).replace(/^\/+/, '') : uri;
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.round(value)));
 }
 
 // ============================================================================
@@ -161,9 +166,10 @@ export class KTX2PlayerCore {
     this._loop = options.loop ?? true;
     this._playbackSpeed = options.playbackSpeed ?? 1.0;
     this._stream = options.stream ?? false;
-    this._streamingRingSize = options.streamingRingSize ?? 16;
-    this._streamingCacheSize = options.streamingCacheSize ?? 60;
-    this._streamingPrefetchAhead = options.streamingPrefetchAhead ?? 30;
+    // Same ranges as Android and iOS; a size of 0 would leave the ring with no slots.
+    this._streamingRingSize = clampInt(options.streamingRingSize ?? 16, 4, 64);
+    this._streamingCacheSize = clampInt(options.streamingCacheSize ?? 60, 10, 200);
+    this._streamingPrefetchAhead = clampInt(options.streamingPrefetchAhead ?? 30, 5, 100);
     this._memoryStrategy = options.memoryStrategy ?? 'auto';
     this._verbose = options.verbose ?? false;
     this._basisTranscoderInit = options.basisTranscoderInit ?? null;
@@ -449,7 +455,7 @@ export class KTX2PlayerCore {
     // Fallback: dedicated context
     const dedicated = createDedicatedGL(this._canvas);
     if (!dedicated) {
-      this._onError?.(new Error('WebGL not supported'));
+      this._onError?.(new AlphaVideoGpuError('WEBGL_UNSUPPORTED', 'WebGL is not supported'));
       return null;
     }
 
@@ -581,8 +587,7 @@ export class KTX2PlayerCore {
   private async _loadNativeASTCKTX2(
     gl: WebGLRenderingContext, data: Uint8Array
   ): Promise<WebGLTexture | null> {
-    const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
-    if (!astcExt) throw new Error('ASTC not supported');
+    requireASTC(gl);
 
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const vkFormat = view.getUint32(12, true);
@@ -795,8 +800,7 @@ export class KTX2PlayerCore {
         compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
       }
 
-      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
-      if (!astcExt) throw new Error('ASTC texture compression not supported. Texture arrays require ASTC support.');
+      requireASTC(gl);
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
@@ -850,6 +854,7 @@ export class KTX2PlayerCore {
       this._log(`[AlphaVideoGpu] ✓ Texture array loaded: ${width}x${height}, ${layerCount} layers`);
       return true;
     } catch (error) {
+      if (error instanceof AlphaVideoGpuError) throw error;
       console.error('[AlphaVideoGpu] Failed to load texture array:', error);
       return false;
     }
@@ -913,8 +918,7 @@ export class KTX2PlayerCore {
 
       this._log(`[AlphaVideoGpu] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
 
-      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
-      if (!astcExt) throw new Error('ASTC texture compression not supported');
+      requireASTC(gl);
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
@@ -964,6 +968,7 @@ export class KTX2PlayerCore {
       this._log(`[AlphaVideoGpu] ✓ Uncompressed streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
       return true;
     } catch (error) {
+      if (error instanceof AlphaVideoGpuError) throw error;
       console.error('[AlphaVideoGpu] Uncompressed streaming load failed:', error);
       return false;
     }
@@ -990,8 +995,7 @@ export class KTX2PlayerCore {
 
       this._log(`[AlphaVideoGpu] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
 
-      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
-      if (!astcExt) throw new Error('ASTC texture compression not supported');
+      requireASTC(gl);
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
@@ -1047,6 +1051,7 @@ export class KTX2PlayerCore {
       this._log(`[AlphaVideoGpu] ✓ Internal zstd streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
       return true;
     } catch (error) {
+      if (error instanceof AlphaVideoGpuError) throw error;
       console.error('[AlphaVideoGpu] Internal zstd streaming load failed:', error);
       return false;
     }
@@ -1503,8 +1508,7 @@ export class KTX2PlayerCore {
       this._streamingLayerCount = layerCount;
       this._streamingLevel0Offset = level0Offset;
 
-      const astcExt = gl.getExtension('WEBGL_compressed_texture_astc');
-      if (!astcExt) throw new Error('ASTC texture compression not supported');
+      requireASTC(gl);
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
 
@@ -1544,6 +1548,7 @@ export class KTX2PlayerCore {
       this._log(`[AlphaVideoGpu] ✓ Streaming initialized: ${width}x${height}, ring=${this._streamingRingActualSize}, cache=${this._streamingCacheSize}`);
       return true;
     } catch (error) {
+      if (error instanceof AlphaVideoGpuError) throw error;
       console.error('[AlphaVideoGpu] Streaming load failed:', error);
       return false;
     }

@@ -32,8 +32,8 @@ export interface AlphaVideoGpuViewProps {
   onFrameUpdate?: (event: { nativeEvent: { frame: number; totalFrames: number } }) => void;
   /** Callback when playback finishes */
   onFinished?: (event: { nativeEvent: {} }) => void;
-  /** Callback on error */
-  onError?: (event: { nativeEvent: { error: string } }) => void;
+  /** Callback on error. `code` is set on web only: 'ASTC_UNSUPPORTED' or 'WEBGL_UNSUPPORTED' */
+  onError?: (event: { nativeEvent: { error: string; code?: 'ASTC_UNSUPPORTED' | 'WEBGL_UNSUPPORTED' } }) => void;
   /** Callback when loaded */
   onLoad?: (event: { nativeEvent: { width: number; height: number; frameCount: number; frameRate: number; duration: number } }) => void;
   
