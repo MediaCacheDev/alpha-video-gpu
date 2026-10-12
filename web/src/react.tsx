@@ -170,9 +170,3 @@ export const AlphaVideoGpuPlayer: React.FC<AlphaVideoGpuPlayerProps> = ({
     />
   );
 };
-
-// Legacy aliases
-export const KTX2Player = AlphaVideoGpuPlayer;
-export type KTX2PlayerProps = AlphaVideoGpuPlayerProps;
-
-export default AlphaVideoGpuPlayer;
