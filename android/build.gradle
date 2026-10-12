@@ -1,79 +1,78 @@
+// dev.mediacache:alpha-video-gpu, the Android library on its own (no React Native).
+// The React Native package builds these same sources from react-native/android/build.gradle.
+
 buildscript {
-    ext.kotlin_version = '1.7.20'
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath 'com.android.tools.build:gradle:7.3.0'
-        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    // Only when this directory is built on its own; inside an app, the app's plugin is used.
+    if (project == rootProject) {
+        repositories {
+            google()
+            mavenCentral()
+        }
+        dependencies {
+            classpath 'com.android.tools.build:gradle:8.12.0'
+        }
     }
 }
 
 apply plugin: 'com.android.library'
-apply plugin: 'kotlin-android'
 
-def getExtOrDefault(name, defaultValue) {
-    return rootProject.ext.has(name) ? rootProject.ext.get(name) : defaultValue
+def safeExtGet(name, fallback) {
+    return rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback
 }
 
+group = 'dev.mediacache'
+version = '1.0.0'
+
 android {
-    namespace "com.alphavideo.gpu"
-    compileSdkVersion getExtOrDefault('compileSdkVersion', 36)
-    
+    namespace 'dev.mediacache.alphavideo.gpu'
+    compileSdk safeExtGet('compileSdkVersion', 36)
+    ndkVersion safeExtGet('ndkVersion', '27.1.12297006')
+
     defaultConfig {
-        minSdkVersion getExtOrDefault('minSdkVersion', 24)
-        targetSdkVersion getExtOrDefault('targetSdkVersion', 36)
-        versionCode 1
-        versionName "1.0"
-        
-        ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
-        }
-        
+        minSdk safeExtGet('minSdkVersion', 24)
+
         externalNativeBuild {
             cmake {
-                cppFlags "-std=c++14 -fexceptions"
-                arguments "-DANDROID_STL=c++_shared"
+                cppFlags '-std=c++14 -fexceptions'
+                abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+                arguments '-DANDROID_STL=c++_shared'
             }
         }
     }
-    
-    buildTypes {
-        release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-        }
-    }
-    
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
-    }
-    
-    kotlinOptions {
-        jvmTarget = '1.8'
-    }
-    
+
     externalNativeBuild {
         cmake {
-            path "src/main/cpp/CMakeLists.txt"
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
         }
     }
-    
-    ndkVersion getExtOrDefault('ndkVersion', '27.1.12297006')
-    
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
     packagingOptions {
         pickFirst 'lib/*/libc++_shared.so'
+    }
+
+    publishing {
+        singleVariant('release') {
+            withSourcesJar()
+            withJavadocJar()
+        }
     }
 }
 
 repositories {
+    google()
     mavenCentral()
 }
 
 dependencies {
-    implementation 'com.facebook.react:react-native:+'
-    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
-    implementation 'androidx.appcompat:appcompat:1.5.4'
+    implementation 'androidx.annotation:annotation:1.9.1'
+}
+
+if (project == rootProject) {
+    apply from: 'publish.gradle'
 }

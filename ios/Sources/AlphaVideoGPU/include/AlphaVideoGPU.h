@@ -1,0 +1,86 @@
+/**
+ * AlphaVideoGPU.h
+ * Transparent animations for iOS from KTX2 texture arrays (ASTC, or Basis UASTC transcoded on the
+ * device), drawn with Metal.
+ */
+
+#import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
+#import <UIKit/UIKit.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+/**
+ * Plays a KTX2 animation with alpha. Set the properties, then `source`; loading starts at once.
+ *
+ * It is an MTKView that draws on demand, so leave the inherited `paused`, `delegate` and
+ * `enableSetNeedsDisplay` alone; use `playbackPaused` to pause. Use it from the main thread;
+ * the blocks are called there too.
+ */
+@interface AlphaVideoGpuView : MTKView
+
+/**
+ * What to play, or nil: https:// or http:// (downloaded once into Caches, see cacheKey), file://
+ * or an absolute path, or asset://path inside the app bundle.
+ */
+@property (nonatomic, copy, nullable) NSString *source;
+/**
+ * The file name for a download inside Caches, for URLs that change while the file doesn't
+ * (presigned URLs). A source with the same cacheKey as the one playing keeps playing. Set it
+ * before source. Default: a hash of the URL, under Caches/alpha-video-gpu.
+ */
+@property (nonatomic, copy, nullable) NSString *cacheKey;
+/**
+ * Multi-part animations whose parts can't be found next to source: every part's URI, the first
+ * holding the metadata. Optional cache keys by index, NSNull or @"" where there is none.
+ */
+@property (nonatomic, copy, nullable) NSArray<NSString *> *partURIs;
+@property (nonatomic, copy, nullable) NSArray *partCacheKeys;
+
+@property (nonatomic, assign) BOOL autoPlay;           // Default YES
+@property (nonatomic, assign) BOOL loop;               // Default YES
+@property (nonatomic, assign) CGFloat playbackSpeed;   // Default 1.0
+/** Pauses or resumes playback, keeping the loaded frames (for screen focus and blur). */
+@property (nonatomic, assign) BOOL playbackPaused;
+/** Calls onFrameUpdate for every frame shown. Default NO. */
+@property (nonatomic, assign) BOOL enableFrameEvents;
+/** The frame index is worked out in the shader from elapsed time (experimental). Default NO. */
+@property (nonatomic, assign) BOOL gpuPlayback;
+
+/** Streams texture-array files through a ring of GPU slots instead of loading every frame. */
+@property (nonatomic, assign) BOOL stream;
+@property (nonatomic, assign) NSInteger streamingRingSize;      // GPU ring slots (VRAM). Default 16
+@property (nonatomic, assign) NSInteger streamingCacheSize;     // Decoded frames kept in RAM. Default 60
+@property (nonatomic, assign) NSInteger streamingPrefetchAhead; // Frames decoded ahead. Default 30
+/** "auto" (the default), "vram" (every frame on the GPU) or "ram" (decoded frames in RAM). */
+@property (nonatomic, copy) NSString *memoryStrategy;
+/** Logs info traces. Warnings and errors always log. Default NO. */
+@property (nonatomic, assign) BOOL verbose;
+
+@property (nonatomic, readonly) NSInteger currentFrame;
+@property (nonatomic, readonly) NSInteger totalFrames;
+@property (nonatomic, readonly) CGFloat frameRate;
+@property (nonatomic, readonly) BOOL isPlaying;
+@property (nonatomic, readonly) NSInteger frameWidth;
+@property (nonatomic, readonly) NSInteger frameHeight;
+
+/** The animation is loaded: frame size in pixels, frame count and frames per second. */
+@property (nonatomic, copy, nullable) void (^onLoad)(NSInteger width, NSInteger height, NSInteger frameCount, CGFloat frameRate);
+/** The shown frame changed, after seekToFrame:, and every frame when enableFrameEvents is on. */
+@property (nonatomic, copy, nullable) void (^onFrameUpdate)(NSInteger frame, NSInteger totalFrames);
+/** "loading", "ready", "playing", "paused" or "stopped". */
+@property (nonatomic, copy, nullable) void (^onStateChange)(NSString *state);
+/** Playback reached the last frame with loop off. */
+@property (nonatomic, copy, nullable) void (^onFinished)(void);
+@property (nonatomic, copy, nullable) void (^onError)(NSString *error);
+
+- (void)play;
+- (void)pause;
+- (void)stop;
+- (void)seekToFrame:(NSInteger)frame;
+/** Stops playback and frees the frames. Removing the view from its superview does the same. */
+- (void)cleanup;
+
+@end
+
+NS_ASSUME_NONNULL_END

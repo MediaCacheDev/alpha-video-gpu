@@ -1,0 +1,69 @@
+{
+  "name": "alpha-video-gpu-web",
+  "version": "1.0.0",
+  "description": "Transparent (alpha) KTX2 texture animations in a <canvas> with WebGL, for plain JS/TS and React. Basis Universal and zstd decoders are bundled inline.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "bundle-basis": "node scripts/bundle-basis.js",
+    "build": "npm run bundle-basis && tsup",
+    "typecheck": "npm run bundle-basis && tsc --noEmit",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "ktx2",
+    "basis-universal",
+    "webgl",
+    "alpha",
+    "transparent",
+    "animation",
+    "react"
+  ],
+  "author": "danielkpl2",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danielkpl2/alpha-video-gpu.git",
+    "directory": "web"
+  },
+  "homepage": "https://github.com/danielkpl2/alpha-video-gpu#readme",
+  "bugs": {
+    "url": "https://github.com/danielkpl2/alpha-video-gpu/issues"
+  },
+  "peerDependencies": {
+    "react": ">=16.8"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.31",
+    "react": "^18.3.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
+}

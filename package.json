@@ -1,86 +1,58 @@
 {
   "name": "alpha-video-gpu",
   "version": "1.0.0",
-  "description": "GPU-accelerated transparent alpha video player for iOS, Android, and Web using texture compression",
-  "main": "index.js",
-  "types": "src/index.ts",
-  "scripts": {
-    "setup": "bash scripts/setup.sh",
-    "bundle-basis": "node scripts/bundle-basis.js",
-    "prepublishOnly": "npm run setup && npm run bundle-basis",
-    "clean": "rm -rf vendor ios/vendor android/src/main/cpp/basis_universal",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [
-    "alpha-video",
-    "transparent-video",
-    "video-player",
-    "gpu-texture",
+  "description": "Transparent (alpha) animations for React Native as GPU-compressed KTX2 textures (ASTC / Basis Universal), drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web.",
+  "main": "react-native/src/index.js",
+  "types": "react-native/src/index.d.ts",
+  "files": [
     "react-native",
-    "react-native-web",
-    "ios",
-    "android",
-    "webgl",
-    "astc",
-    "ktx2",
-    "metal",
-    "opengl"
+    "ios/Sources",
+    "android/src",
+    "third_party",
+    "react-native.config.js",
+    "react-native-alpha-video-gpu.podspec",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "!react-native/android/build",
+    "!react-native/android/.gradle",
+    "!react-native/android/.cxx",
+    "!.DS_Store"
   ],
-  "author": "Daniel Kasprowicz",
-  "license": "MIT",
-  "homepage": "https://github.com/danielkpl2/alpha-video-gpu#readme",
+  "scripts": {
+    "publish:android:local": "scripts/publish-android.sh local"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danielkpl2/alpha-video-gpu.git"
+    "url": "https://github.com/danielkpl2/alpha-video-gpu"
   },
+  "homepage": "https://github.com/danielkpl2/alpha-video-gpu#readme",
   "bugs": {
     "url": "https://github.com/danielkpl2/alpha-video-gpu/issues"
   },
-  "exports": {
-    ".": {
-      "types": "./src/index.ts",
-      "default": "./index.js"
-    },
-    "./web": {
-      "types": "./src/web/index.ts",
-      "default": "./src/web/index.ts"
-    },
-    "./standalone": {
-      "types": "./standalone/index.ts",
-      "default": "./standalone/index.ts"
-    },
-    "./standalone/react": {
-      "types": "./standalone/react.tsx",
-      "default": "./standalone/react.tsx"
-    }
-  },
-  "files": [
-    "android/src/",
-    "android/build.gradle",
-    "ios/",
-    "src/",
-    "standalone/",
-    "scripts/",
-    "index.js",
-    "react-native.config.js",
-    "AlphaVideoGpu.podspec",
-    "README.md",
-    "LICENSE"
+  "keywords": [
+    "react-native",
+    "react-native-web",
+    "alpha",
+    "transparent-video",
+    "transparency",
+    "animation",
+    "ktx2",
+    "astc",
+    "basis-universal",
+    "metal",
+    "opengl",
+    "webgl",
+    "ios",
+    "android"
   ],
+  "author": "Daniel Kasprowicz",
+  "license": "MIT",
+  "dependencies": {
+    "alpha-video-gpu-web": "^1.0.0"
+  },
   "peerDependencies": {
-    "react": ">=16.8.0",
-    "react-native": ">=0.60.0"
-  },
-  "peerDependenciesMeta": {
-    "react-native-web": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@types/react": "^18.0.0",
-    "react": "^18.0.0",
-    "react-native": "^0.72.0",
-    "react-native-web": "^0.19.0",
-    "typescript": "^5.0.0"
+    "react": ">=17.0.0",
+    "react-native": ">=0.71.0"
   }
 }

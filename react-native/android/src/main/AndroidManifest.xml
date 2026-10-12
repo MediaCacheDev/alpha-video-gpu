@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- OpenGL ES 3.0, for texture arrays and ETC2/ASTC texture compression -->
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="true" />
+
+</manifest>

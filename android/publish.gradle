@@ -1,0 +1,78 @@
+// Maven publication for dev.mediacache:alpha-video-gpu. Run it through scripts/publish-android.sh.
+//
+// Signing reads ORG_GRADLE_PROJECT_signingInMemoryKey (armored secret key), …KeyPassword and
+// optionally …KeyId. Without a key the artifacts are left unsigned, which is enough for
+// publishToMavenLocal.
+
+apply plugin: 'maven-publish'
+apply plugin: 'signing'
+
+def repoUrl = 'https://github.com/danielkpl2/alpha-video-gpu'
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                artifactId = 'alpha-video-gpu'
+
+                pom {
+                    name = 'alpha-video-gpu'
+                    description = 'Transparent animations for Android from KTX2 texture arrays (ASTC or Basis UASTC), drawn into a TextureView with OpenGL ES 3.0.'
+                    url = repoUrl
+                    inceptionYear = '2026'
+                    licenses {
+                        license {
+                            name = 'MIT'
+                            url = 'https://opensource.org/licenses/MIT'
+                            distribution = 'repo'
+                        }
+                        license {
+                            name = 'Apache-2.0 (Basis Universal transcoder, ASTC decoder)'
+                            url = 'https://www.apache.org/licenses/LICENSE-2.0'
+                            distribution = 'repo'
+                        }
+                        license {
+                            name = 'BSD-3-Clause (zstd)'
+                            url = 'https://opensource.org/licenses/BSD-3-Clause'
+                            distribution = 'repo'
+                        }
+                    }
+                    developers {
+                        developer {
+                            id = 'danielkpl2'
+                            name = 'Daniel Kasprowicz'
+                            email = '9932671+danielkpl2@users.noreply.github.com'
+                            url = 'https://github.com/danielkpl2'
+                        }
+                    }
+                    scm {
+                        connection = "scm:git:${repoUrl}.git"
+                        developerConnection = "scm:git:${repoUrl}.git"
+                        url = repoUrl
+                    }
+                }
+            }
+        }
+        repositories {
+            maven {
+                name = 'staging'
+                url = layout.buildDirectory.dir('staging-repo')
+            }
+        }
+    }
+
+    def signingKey = findProperty('signingInMemoryKey')
+    if (signingKey) {
+        signing {
+            def keyId = findProperty('signingInMemoryKeyId')
+            def password = findProperty('signingInMemoryKeyPassword')
+            if (keyId) {
+                useInMemoryPgpKeys(keyId, signingKey, password)
+            } else {
+                useInMemoryPgpKeys(signingKey, password)
+            }
+            sign publishing.publications.release
+        }
+    }
+}

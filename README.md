@@ -1,6 +1,13 @@
 # alpha-video-gpu
 
-GPU-accelerated transparent alpha video player for React Native (iOS, Android, Web). Uses texture compression (ASTC) for efficient playback with low CPU/battery usage.
+Plays transparent (alpha) animations stored as GPU-compressed KTX2 textures (ASTC, or Basis Universal UASTC), drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
+
+| Platform | Package | View |
+|---|---|---|
+| React Native (Android, iOS, web) | npm `alpha-video-gpu` | `AlphaVideoGpuView` |
+| Android | Maven `dev.mediacache:alpha-video-gpu` | `dev.mediacache.alphavideo.gpu.AlphaVideoGpuView` |
+| iOS | Swift Package Manager, product `AlphaVideoGPU`; CocoaPods `alpha-video-gpu` | `AlphaVideoGpuView` |
+| Web (plain JS/TS, React) | npm `alpha-video-gpu-web` | `createAlphaVideoGpuPlayer`, `AlphaVideoGpuPlayer` |
 
 > **Looking for codec-based playback?** See [alpha-video](https://github.com/danielkpl2/alpha-video) for WebM VP9/AV1 with smaller file sizes.
 
@@ -184,14 +191,77 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator, some 
 
 ## Installation
 
+### React Native
+
 ```bash
 npm install alpha-video-gpu
-
-# iOS
 cd ios && pod install
 ```
 
-Basis Universal transcoder is bundled. No additional native dependencies required.
+The Basis Universal transcoder and zstd are compiled in from `third_party/`; there are no other native dependencies. On the web the component uses [`alpha-video-gpu-web`](#web-support), which is installed with it.
+
+### Android without React Native
+
+```gradle
+dependencies {
+    implementation 'dev.mediacache:alpha-video-gpu:1.0.0'
+}
+```
+
+`AlphaVideoGpuView` is a `TextureView` in `dev.mediacache.alphavideo.gpu`. It takes the same sources and options as the React Native component, through setters:
+
+```kotlin
+val view = AlphaVideoGpuView(context)
+view.setStream(true)
+view.setPlayerCallback(object : AlphaVideoGpuView.PlayerCallback {
+    override fun onLoad(width: Int, height: Int, frameCount: Int, frameRate: Double) {}
+    override fun onError(error: String) {}
+    override fun onFinished() {}
+})
+view.setSource("asset://media/animation.ktx2")
+container.addView(view)
+```
+
+Every `PlayerCallback` method has an empty default; `onStateChange` and `onFrameUpdate` (with `setEnableFrameEvents(true)`) are the others. Callbacks arrive on the main thread. `play()`, `pause()`, `stop()` and `seekToFrame()` control playback; detaching the view, or `destroy()`, frees it. http(s) sources need the `INTERNET` permission in the app's manifest. Needs `minSdk` 24 and OpenGL ES 3.0.
+
+### iOS without React Native
+
+In Xcode, add the package `https://github.com/danielkpl2/alpha-video-gpu` (File → Add Package Dependencies), or in `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/danielkpl2/alpha-video-gpu", exact: "1.0.0"),
+],
+targets: [
+    .target(name: "MyApp", dependencies: [
+        .product(name: "AlphaVideoGPU", package: "alpha-video-gpu"),
+    ]),
+]
+```
+
+Or with CocoaPods:
+
+```ruby
+pod 'alpha-video-gpu', '1.0.0'
+```
+
+CocoaPods trunk is read-only from 2 December 2026, so later versions are used through the podspec at their tag: `pod 'alpha-video-gpu', :podspec => 'https://raw.githubusercontent.com/danielkpl2/alpha-video-gpu/v<version>/alpha-video-gpu.podspec'`. The module is `AlphaVideoGPU` either way.
+
+`AlphaVideoGpuView` is an Objective-C `MTKView`, so it works from Swift and Objective-C:
+
+```swift
+import AlphaVideoGPU
+
+let view = AlphaVideoGpuView(frame: CGRect(x: 0, y: 0, width: 200, height: 200))
+view.stream = true
+view.onLoad = { width, height, frameCount, frameRate in }
+view.onError = { error in }
+view.onFinished = { }
+view.source = "asset://media/animation.ktx2"
+container.addSubview(view)
+```
+
+`MTKView` already has `paused` and `delegate`, which the view uses itself: pause playback with `playbackPaused`, and get events through the `onLoad`, `onFrameUpdate`, `onStateChange`, `onFinished` and `onError` blocks, which are called on the main queue. Setting `source` to `nil` stops playback and frees the textures. iOS 13 or later.
 
 ---
 
@@ -351,7 +421,32 @@ For separate KTX2 files (using `--no-glb` encoder flag), metadata is embedded in
 
 ## Web Support
 
-Works with React Native Web, and without React Native through `alpha-video-gpu/standalone` (a framework-free `KTX2PlayerCore`) and `alpha-video-gpu/standalone/react`. The zstd decoder and the Basis transcoder are bundled; no extra scripts or files need to be served.
+On React Native Web, `AlphaVideoGpuView` draws with the WebGL player from [`alpha-video-gpu-web`](web). Without React Native, install that package on its own:
+
+```bash
+npm install alpha-video-gpu-web
+```
+
+```ts
+import { createAlphaVideoGpuPlayer } from 'alpha-video-gpu-web';
+
+const player = createAlphaVideoGpuPlayer(document.querySelector('canvas')!, {
+  autoPlay: true,
+  loop: true,
+  onLoad: ({ width, height, frameCount, frameRate }) => {},
+  onError: (error) => console.error(error),
+});
+player.setSource('https://example.com/animation.ktx2');
+// player.pause(), player.resume(), player.seekToFrame(n), player.destroy()
+```
+
+```tsx
+import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
+
+<AlphaVideoGpuPlayer src="/animation.ktx2" width={300} height={300} autoPlay loop />
+```
+
+The zstd decoder and the Basis transcoder (JS and WebAssembly) are bundled inline, so no extra scripts or files need to be served. React is an optional peer dependency, needed only for `alpha-video-gpu-web/react`.
 
 ### Web Texture Format Support
 
@@ -599,6 +694,28 @@ Playback is controlled with props (`paused`, `autoPlay`, a new `source`); there 
 
 ---
 
+## Repository layout
+
+| Path | What | Package |
+|---|---|---|
+| `android/` | The Android library: `AlphaVideoGpuView`, source loading, and the JNI transcoder (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
+| `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++), with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
+| `third_party/basis_universal/` | The Basis Universal 1.16.4 transcoder and zstd, compiled into both native libraries | |
+| `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
+| `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there inlines the decoders and builds `dist/` | npm `alpha-video-gpu-web` |
+| `scripts/publish-android.sh` | `local` publishes the Android library to `~/.m2`; `central` signs it and uploads it to the Maven Central Portal (see the script for the variables) | |
+
+A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `alpha-video-gpu`, which depends on it.
+
+## Requirements
+
+- React Native 0.71+
+- Android: minSdkVersion 24, OpenGL ES 3.0; compileSdkVersion comes from the app (default 36)
+- iOS: iOS 13.0+, Metal
+- Web: WebGL 2 (falls back to WebGL 1)
+
+---
+
 ## License
 
-MIT
+The code in this repository is MIT. The Basis Universal transcoder and the ASTC decoder are Apache-2.0, and zstd is BSD-3-Clause; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

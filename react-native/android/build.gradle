@@ -1,0 +1,60 @@
+// The React Native package's Android module. It compiles the standalone library's sources
+// (../../android) together with the React Native glue, because autolinking adds only this one
+// Gradle project to the app.
+
+apply plugin: 'com.android.library'
+
+def safeExtGet(name, fallback) {
+    return rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback
+}
+
+def coreDir = file('../../android')
+
+android {
+    namespace 'dev.mediacache.alphavideo.gpu.reactnative'
+    compileSdk safeExtGet('compileSdkVersion', 36)
+    ndkVersion safeExtGet('ndkVersion', '27.1.12297006')
+
+    defaultConfig {
+        minSdk safeExtGet('minSdkVersion', 24)
+
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++14 -fexceptions'
+                abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+                arguments '-DANDROID_STL=c++_shared'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "${coreDir}/src/main/cpp/CMakeLists.txt"
+            version '3.22.1'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        pickFirst 'lib/*/libc++_shared.so'
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java', "${coreDir}/src/main/java"]
+        }
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.facebook.react:react-android'
+}

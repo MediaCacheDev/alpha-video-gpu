@@ -2,8 +2,8 @@ module.exports = {
   dependency: {
     platforms: {
       android: {
-        sourceDir: './android',
-        packageImportPath: 'import com.alphavideo.gpu.AlphaVideoGpuPackage;',
+        sourceDir: './react-native/android',
+        packageImportPath: 'import dev.mediacache.alphavideo.gpu.reactnative.AlphaVideoGpuPackage;',
         packageInstance: 'new AlphaVideoGpuPackage()',
       },
       ios: {},

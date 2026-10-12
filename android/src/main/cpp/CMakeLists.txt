@@ -6,8 +6,8 @@ project("alphavideogpu")
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Add Basis Universal transcoder
-set(BASIS_UNIVERSAL_DIR ${CMAKE_SOURCE_DIR}/basis_universal)
+# Basis Universal transcoder and zstd, shared with iOS (third_party/ at the repository root)
+set(BASIS_UNIVERSAL_DIR ${CMAKE_SOURCE_DIR}/../../../../third_party/basis_universal)
 
 # Compile Basis transcoder as a static library
 add_library(basis_transcoder STATIC
@@ -31,6 +31,7 @@ add_library(alphavideogpu SHARED
 
 target_include_directories(alphavideogpu PRIVATE
     ${CMAKE_SOURCE_DIR}
+    ${BASIS_UNIVERSAL_DIR}/..
     ${BASIS_UNIVERSAL_DIR}/transcoder
 )
 
