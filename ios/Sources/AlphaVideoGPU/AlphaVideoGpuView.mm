@@ -222,10 +222,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   BOOL _isGLBContainer;
   NSArray<NSData *> *_glbKtx2Parts;
   
-  // GPU playback support
-  CFTimeInterval _gpuPlaybackStartTime;
-  float _gpuElapsedTime;
-  
   // Texture array support (for packingMode: 'array')
   BOOL _useTextureArray;
   id<MTLTexture> _textureArray;
@@ -580,7 +576,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
                                   "  return out;\n"
                                   "}";
   
-  // Create fragment shader with grid support and GPU playback (must include VertexOut struct since shaders compile separately)
+  // Create fragment shader (must include VertexOut struct since shaders compile separately)
   NSString *fragmentShaderSource = @"#include <metal_stdlib>\n"
                                     "using namespace metal;\n"
                                     "struct VertexOut {\n"
@@ -589,35 +585,12 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
                                     "};\n"
                                     "struct Uniforms {\n"
                                     "  float4 frameUV;\n"
-                                    "  float elapsedTime;\n"
-                                    "  float fps;\n"
-                                    "  float totalFrames;\n"
-                                    "  float framesPerRow;\n"
-                                    "  float framesPerPart;\n"
-                                    "  float frameWidth;\n"
-                                    "  float frameHeight;\n"
-                                    "  float textureWidth;\n"
-                                    "  float textureHeight;\n"
-                                    "  int gpuPlayback;\n"
                                     "};\n"
                                     "fragment float4 fragment_main(VertexOut in [[stage_in]],\n"
                                     "                             texture2d<float> tex [[texture(0)]],\n"
                                     "                             sampler s [[sampler(0)]],\n"
                                     "                             constant Uniforms &uniforms [[buffer(0)]]) {\n"
-                                    "  float2 uv;\n"
-                                    "  if (uniforms.gpuPlayback == 1) {\n"
-                                    "    float frameIndex = floor(fmod(uniforms.elapsedTime * uniforms.fps, uniforms.totalFrames));\n"
-                                    "    float frameInPart = floor(fmod(frameIndex, uniforms.framesPerPart));\n"
-                                    "    float col = floor(fmod(frameInPart, uniforms.framesPerRow));\n"
-                                    "    float row = floor(frameInPart / uniforms.framesPerRow);\n"
-                                    "    float minU = (col * uniforms.frameWidth) / uniforms.textureWidth;\n"
-                                    "    float maxU = ((col + 1.0) * uniforms.frameWidth) / uniforms.textureWidth;\n"
-                                    "    float minV = (row * uniforms.frameHeight) / uniforms.textureHeight;\n"
-                                    "    float maxV = ((row + 1.0) * uniforms.frameHeight) / uniforms.textureHeight;\n"
-                                    "    uv = float2(mix(minU, maxU, in.texCoord.x), mix(minV, maxV, in.texCoord.y));\n"
-                                    "  } else {\n"
-                                    "    uv = mix(uniforms.frameUV.xy, uniforms.frameUV.zw, in.texCoord);\n"
-                                    "  }\n"
+                                    "  float2 uv = mix(uniforms.frameUV.xy, uniforms.frameUV.zw, in.texCoord);\n"
                                     "  return tex.sample(s, uv);\n"
                                     "}";
   
@@ -720,9 +693,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 - (void)setupVertexData
 {
-  // Create uniform buffer for frame UVs and GPU playback parameters
+  // Create uniform buffer for the frame UV rectangle
   // Uniforms struct: float4 frameUV (16 bytes) + 9 floats (36 bytes) + 1 int (4 bytes) = 56 bytes, aligned to 64
-  self.uniformBuffer = [self.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+  self.uniformBuffer = [self.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
   
   // Create sampler state
   MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
@@ -2940,21 +2913,16 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 - (void)play
 {
-  AVG_VLOG(@"play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu, gpuPlayback=%d", 
-        self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count, self.gpuPlayback);
+  AVG_VLOG(@"play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu", 
+        self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count);
   
   if (!self.isPlaying && self.totalFrames > 0) {
     AVG_VLOG(@"Starting playback...");
     self.isPlaying = YES;
     self.lastFrameTime = CACurrentMediaTime();
     
-    // Initialize GPU playback timing
-    _gpuPlaybackStartTime = CACurrentMediaTime();
-    _gpuElapsedTime = 0.0f;
-    
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
-    // For GPU playback, use 60fps render rate (GPU handles frame timing)
-    self.displayLink.preferredFramesPerSecond = self.gpuPlayback ? 60 : (NSInteger)self.frameRate;
+    self.displayLink.preferredFramesPerSecond = (NSInteger)self.frameRate;
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     
     [self notifyStateChange:@"playing"];
@@ -3019,130 +2987,109 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   
   CFTimeInterval currentTime = CACurrentMediaTime();
   
-  if (self.gpuPlayback) {
-    // GPU playback mode: update elapsed time, GPU calculates frame in shader
-    _gpuElapsedTime = (float)(currentTime - _gpuPlaybackStartTime);
+  CFTimeInterval elapsed = currentTime - self.lastFrameTime;
+  
+  if (elapsed >= self.frameInterval / self.playbackSpeed) {
+    self.lastFrameTime = currentTime - fmod(elapsed, self.frameInterval / self.playbackSpeed);
     
-    // Handle non-looping end condition
-    float animDuration = self.totalFrames / (self.frameRate * self.playbackSpeed);
-    if (!self.loop && _gpuElapsedTime >= animDuration) {
-      self.isPlaying = NO;
-      if (self.displayLink) {
-        [self.displayLink invalidate];
-        self.displayLink = nil;
-      }
-      [self notifyFinished];
-      return;
-    }
-    
-    [self updateUniforms];
-    [self setNeedsDisplay];
-  } else {
-    // CPU playback mode: original frame-by-frame logic
-    CFTimeInterval elapsed = currentTime - self.lastFrameTime;
-    
-    if (elapsed >= self.frameInterval / self.playbackSpeed) {
-      self.lastFrameTime = currentTime - fmod(elapsed, self.frameInterval / self.playbackSpeed);
+    // For streaming ring buffer mode, handle on-demand decoding/upload
+    if (_streamingRingBufferMode) {
+      NSInteger vPosModulus = self.totalFrames * 2;
+      NSInteger virtualPos = (_playbackLoopIteration * self.totalFrames + self.currentFrame) % vPosModulus;
+      NSInteger gpuSlot = self.currentFrame % _streamingRingBufferSize;
       
-      // For streaming ring buffer mode, handle on-demand decoding/upload
-      if (_streamingRingBufferMode) {
-        NSInteger vPosModulus = self.totalFrames * 2;
-        NSInteger virtualPos = (_playbackLoopIteration * self.totalFrames + self.currentFrame) % vPosModulus;
-        NSInteger gpuSlot = self.currentFrame % _streamingRingBufferSize;
-        
-        if (_isUncompressedStreaming) {
-          // Uncompressed streaming
-          if (!_useCompressedFormat && _decodedRgbaCache) {
-            // Simulator: use background-decoded RGBA cache
-            [self decodeUncompressedFramesAhead:virtualPos];
-            [self evictOldDecodedFrames:virtualPos];
-            
-            NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
-            if (slotVPos != virtualPos) {
-              NSData *rgbaData;
-              @synchronized(_decodedRgbaCache) {
-                rgbaData = _decodedRgbaCache[@(virtualPos)];
-              }
-              if (rgbaData) {
-                [self uploadDecodedFrameToGPU:virtualPos slot:gpuSlot];
-                _ringSlots[gpuSlot] = @(virtualPos);
-              } else {
-                // Frame not decoded yet - skip this update
-                return;
-              }
+      if (_isUncompressedStreaming) {
+        // Uncompressed streaming
+        if (!_useCompressedFormat && _decodedRgbaCache) {
+          // Simulator: use background-decoded RGBA cache
+          [self decodeUncompressedFramesAhead:virtualPos];
+          [self evictOldDecodedFrames:virtualPos];
+          
+          NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+          if (slotVPos != virtualPos) {
+            NSData *rgbaData;
+            @synchronized(_decodedRgbaCache) {
+              rgbaData = _decodedRgbaCache[@(virtualPos)];
             }
-          } else {
-            // Real device: upload directly from mmap (fast, native ASTC)
-            NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
-            if (slotVPos != virtualPos) {
-              [self uploadUncompressedFrame:self.currentFrame toSlot:gpuSlot];
+            if (rgbaData) {
+              [self uploadDecodedFrameToGPU:virtualPos slot:gpuSlot];
               _ringSlots[gpuSlot] = @(virtualPos);
+            } else {
+              // Frame not decoded yet - skip this update
+              return;
             }
           }
         } else {
-          // Zstd streaming: decode frames ahead
-          [self decodeFramesAhead:virtualPos];
-          
-          // Evict old frames from CPU cache
-          [self evictOldFrames:virtualPos];
-          
-          // Ensure current frame is in GPU
-          [self ensureFrameInGPU:virtualPos];
-          
-          // Check if frame is ready
+          // Real device: upload directly from mmap (fast, native ASTC)
           NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
-          
-          if (slotVPos != virtualPos && !_frameCache[@(virtualPos)]) {
-            // Frame not ready yet - skip this update
-            static int notReadyCount = 0;
-            if (notReadyCount++ < 20) {
-              AVG_VLOG(@"Frame not ready - frame=%ld, vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu, decoderPos=%ld",
-                    (long)self.currentFrame, (long)virtualPos, (long)gpuSlot, (long)slotVPos, 
-                    (unsigned long)_frameCache.count, (long)_decoderPosition);
-            }
-            return;
+          if (slotVPos != virtualPos) {
+            [self uploadUncompressedFrame:self.currentFrame toSlot:gpuSlot];
+            _ringSlots[gpuSlot] = @(virtualPos);
           }
         }
-      }
-      
-      self.currentFrame++;
-      
-      if (self.currentFrame >= self.totalFrames) {
-        if (self.loop) {
-          self.currentFrame = 0;
-          if (_streamingRingBufferMode) {
-            _playbackLoopIteration++;
-            NSInteger nextVPos = (_playbackLoopIteration * self.totalFrames) % (self.totalFrames * 2);
-            AVG_VLOG(@"Playback loop wrap-around: iteration %ld, nextVPos=%ld, decoderLoop=%ld, decoderPos=%ld, cacheSize=%lu",
-                  (long)_playbackLoopIteration, (long)nextVPos, (long)_decoderLoopIteration, (long)_decoderPosition, (unsigned long)_frameCache.count);
-            // Log first few slot states
-            for (int i = 0; self.verbose && i < MIN(4, _streamingRingBufferSize); i++) {
-              AVG_VLOG(@"  slot[%d] = vPos %ld", i, (long)[_ringSlots[i] integerValue]);
-            }
-            // Log if next frame is in cache
-            AVG_VLOG(@"  cache has nextVPos=%ld: %@", (long)nextVPos, _frameCache[@(nextVPos)] ? @"YES" : @"NO");
-            
-            // CRITICAL: Immediately upload frame 0 of new loop to GPU before next render
-            // This prevents showing stale frame from previous loop
-            [self ensureFrameInGPU:nextVPos];
+      } else {
+        // Zstd streaming: decode frames ahead
+        [self decodeFramesAhead:virtualPos];
+        
+        // Evict old frames from CPU cache
+        [self evictOldFrames:virtualPos];
+        
+        // Ensure current frame is in GPU
+        [self ensureFrameInGPU:virtualPos];
+        
+        // Check if frame is ready
+        NSInteger slotVPos = [_ringSlots[gpuSlot] integerValue];
+        
+        if (slotVPos != virtualPos && !_frameCache[@(virtualPos)]) {
+          // Frame not ready yet - skip this update
+          static int notReadyCount = 0;
+          if (notReadyCount++ < 20) {
+            AVG_VLOG(@"Frame not ready - frame=%ld, vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu, decoderPos=%ld",
+                  (long)self.currentFrame, (long)virtualPos, (long)gpuSlot, (long)slotVPos, 
+                  (unsigned long)_frameCache.count, (long)_decoderPosition);
           }
-        } else {
-          self.isPlaying = NO;
-          if (self.displayLink) {
-            [self.displayLink invalidate];
-            self.displayLink = nil;
-          }
-          [self notifyFinished];
           return;
         }
       }
-      
-      if (self.enableFrameEvents) {
-        [self notifyFrameUpdate];
-      }
-      [self updateUniforms];
-      [self setNeedsDisplay];
     }
+    
+    self.currentFrame++;
+    
+    if (self.currentFrame >= self.totalFrames) {
+      if (self.loop) {
+        self.currentFrame = 0;
+        if (_streamingRingBufferMode) {
+          _playbackLoopIteration++;
+          NSInteger nextVPos = (_playbackLoopIteration * self.totalFrames) % (self.totalFrames * 2);
+          AVG_VLOG(@"Playback loop wrap-around: iteration %ld, nextVPos=%ld, decoderLoop=%ld, decoderPos=%ld, cacheSize=%lu",
+                (long)_playbackLoopIteration, (long)nextVPos, (long)_decoderLoopIteration, (long)_decoderPosition, (unsigned long)_frameCache.count);
+          // Log first few slot states
+          for (int i = 0; self.verbose && i < MIN(4, _streamingRingBufferSize); i++) {
+            AVG_VLOG(@"  slot[%d] = vPos %ld", i, (long)[_ringSlots[i] integerValue]);
+          }
+          // Log if next frame is in cache
+          AVG_VLOG(@"  cache has nextVPos=%ld: %@", (long)nextVPos, _frameCache[@(nextVPos)] ? @"YES" : @"NO");
+          
+          // CRITICAL: Immediately upload frame 0 of new loop to GPU before next render
+          // This prevents showing stale frame from previous loop
+          [self ensureFrameInGPU:nextVPos];
+        }
+      } else {
+        self.isPlaying = NO;
+        if (self.displayLink) {
+          [self.displayLink invalidate];
+          self.displayLink = nil;
+        }
+        [self notifyFinished];
+        return;
+      }
+    }
+    
+    if (self.enableFrameEvents) {
+      [self notifyFrameUpdate];
+    }
+    [self updateUniforms];
+    [self setNeedsDisplay];
   }
 }
 
@@ -3151,12 +3098,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   // Calculate frame UV based on 2D grid layout
   NSInteger partIndex = self.framesPerPart > 0 ? self.currentFrame / self.framesPerPart : 0;
   NSInteger frameToRender = self.currentFrame;
-  
-  // For GPU playback, calculate part index from elapsed time
-  if (self.gpuPlayback) {
-    NSInteger frameIndex = (NSInteger)(_gpuElapsedTime * self.frameRate * self.playbackSpeed) % self.totalFrames;
-    partIndex = self.framesPerPart > 0 ? frameIndex / self.framesPerPart : 0;
-  }
   
   partIndex = MIN(partIndex, (NSInteger)self.partTextures.count - 1);
   NSInteger frameInPart = self.framesPerPart > 0 ? frameToRender % self.framesPerPart : frameToRender;
@@ -3194,30 +3135,12 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   float minV = (row * self.frameHeight) / (float)partHeight;
   float maxV = ((row + 1) * self.frameHeight) / (float)partHeight;
   
-  // Uniform buffer layout (must match Metal shader struct):
-  // float4 frameUV (16 bytes)
-  // float elapsedTime, fps, totalFrames, framesPerRow, framesPerPart (20 bytes)
-  // float frameWidth, frameHeight, textureWidth, textureHeight (16 bytes)
-  // int gpuPlayback (4 bytes)
+  // Uniform buffer layout (must match the Metal shader's Uniforms): float4 frameUV
   float *uniforms = (float *)[self.uniformBuffer contents];
   uniforms[0] = minU;
   uniforms[1] = minV;
   uniforms[2] = maxU;
   uniforms[3] = maxV;
-  
-  // GPU playback uniforms
-  uniforms[4] = _gpuElapsedTime;                           // elapsedTime
-  uniforms[5] = (float)(self.frameRate * self.playbackSpeed); // fps
-  uniforms[6] = (float)self.totalFrames;                   // totalFrames
-  uniforms[7] = (float)self.framesPerRow;                  // framesPerRow
-  uniforms[8] = (float)self.framesPerPart;                 // framesPerPart
-  uniforms[9] = (float)self.frameWidth;                    // frameWidth
-  uniforms[10] = (float)self.frameHeight;                  // frameHeight
-  uniforms[11] = (float)partWidth;                         // textureWidth
-  uniforms[12] = (float)partHeight;                        // textureHeight
-  
-  int *gpuPlaybackFlag = (int *)&uniforms[13];
-  *gpuPlaybackFlag = self.gpuPlayback ? 1 : 0;
   
   // Update current texture based on part index
   if (partIndex < (NSInteger)self.partTextures.count) {

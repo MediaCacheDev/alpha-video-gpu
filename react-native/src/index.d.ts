@@ -42,7 +42,6 @@ export interface AlphaVideoGpuViewProps {
   streamingPrefetchAhead?: number;
   memoryStrategy?: 'auto' | 'vram' | 'ram';
   stream?: boolean;
-  gpuPlayback?: boolean;
   /** Send onFrameUpdate for every rendered frame (native). Default: false */
   enableFrameEvents?: boolean;
   /** Log info traces. Warnings and errors always log. Default: false */

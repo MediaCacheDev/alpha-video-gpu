@@ -44,8 +44,6 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL playbackPaused;
 /** Calls onFrameUpdate for every frame shown. Default NO. */
 @property (nonatomic, assign) BOOL enableFrameEvents;
-/** The frame index is worked out in the shader from elapsed time (experimental). Default NO. */
-@property (nonatomic, assign) BOOL gpuPlayback;
 
 /** Streams texture-array files through a ring of GPU slots instead of loading every frame. */
 @property (nonatomic, assign) BOOL stream;

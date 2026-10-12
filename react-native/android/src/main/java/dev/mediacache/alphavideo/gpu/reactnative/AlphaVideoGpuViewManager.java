@@ -79,11 +79,6 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
         view.setEnableFrameEvents(enable);
     }
     
-    @ReactProp(name = "gpuPlayback", defaultBoolean = false)
-    public void setGpuPlayback(AlphaVideoGpuView view, boolean gpuPlayback) {
-        view.setGpuPlayback(gpuPlayback);
-    }
-    
     @ReactProp(name = "paused", defaultBoolean = false)
     public void setPaused(AlphaVideoGpuView view, boolean paused) {
         view.setPaused(paused);

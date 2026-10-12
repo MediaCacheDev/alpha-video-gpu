@@ -681,7 +681,6 @@ Not ideal for:
 | `streamingRingSize` | `number` | `16` | GPU texture slots for streaming |
 | `streamingCacheSize` | `number` | `60` | CPU cache size for RAM streaming |
 | `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead |
-| `gpuPlayback` | `boolean` | `false` | Experimental: compute the frame index in the shader |
 | `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every rendered frame (native) |
 | `verbose` | `boolean` | `false` | Log info traces (Logcat, Xcode console, browser console); warnings and errors always log |
 | `onLoad` | `({ nativeEvent: { width, height, frameCount, frameRate, duration } }) => void` | — | Metadata is known |
