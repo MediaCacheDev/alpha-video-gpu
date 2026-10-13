@@ -200,6 +200,8 @@ cd ios && pod install
 
 The Basis Universal transcoder and zstd are compiled in from `third_party/`; there are no other native dependencies. On the web the component uses [`alpha-video-gpu-web`](#web-support), which is installed with it.
 
+The view works on both React Native architectures: the new one (Fabric, the default since 0.76) and the old one (`newArchEnabled=false`, up to 0.81). It is tested on 0.83, and on 0.81 with the new architecture turned off.
+
 ### Android without React Native
 
 ```gradle

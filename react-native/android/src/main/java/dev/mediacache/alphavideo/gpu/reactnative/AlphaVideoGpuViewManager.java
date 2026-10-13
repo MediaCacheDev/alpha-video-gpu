@@ -5,7 +5,6 @@ import androidx.annotation.Nullable;
 
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
-import com.facebook.react.uimanager.SimpleViewManager;
 import com.facebook.react.uimanager.ThemedReactContext;
 import com.facebook.react.uimanager.annotations.ReactProp;
 
@@ -14,7 +13,7 @@ import dev.mediacache.alphavideo.gpu.AlphaVideoGpuView;
 import java.util.Map;
 
 /** React Native view manager for {@link AlphaVideoGpuView}. */
-public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuView> {
+public class AlphaVideoGpuViewManager extends AlphaVideoGpuViewManagerSpec<AlphaVideoGpuView> {
 
     public static final String REACT_CLASS = "AlphaVideoGpuView";
 
@@ -33,6 +32,7 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
     }
 
     @ReactProp(name = "source")
+    @Override
     public void setSource(AlphaVideoGpuView view, @Nullable ReadableMap source) {
         String sourceUri = null;
         if (source != null && source.hasKey("uri") && !source.isNull("uri")) {
@@ -54,47 +54,56 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
     }
 
     @ReactProp(name = "autoPlay", defaultBoolean = true)
+    @Override
     public void setAutoPlay(AlphaVideoGpuView view, boolean autoPlay) {
         view.setAutoPlay(autoPlay);
     }
 
     @ReactProp(name = "loop", defaultBoolean = true)
+    @Override
     public void setLoop(AlphaVideoGpuView view, boolean loop) {
         view.setLoop(loop);
     }
 
     @ReactProp(name = "playbackSpeed", defaultFloat = 1.0f)
+    @Override
     public void setPlaybackSpeed(AlphaVideoGpuView view, float speed) {
         view.setPlaybackSpeed(speed);
     }
     
     @ReactProp(name = "cacheKey")
+    @Override
     public void setCacheKey(AlphaVideoGpuView view, @Nullable String cacheKey) {
         // Pass cacheKey directly to the View so it can use it for downloads
         view.setCacheKey(cacheKey);
     }
     
     @ReactProp(name = "enableFrameEvents", defaultBoolean = false)
+    @Override
     public void setEnableFrameEvents(AlphaVideoGpuView view, boolean enable) {
         view.setEnableFrameEvents(enable);
     }
     
     @ReactProp(name = "paused", defaultBoolean = false)
+    @Override
     public void setPaused(AlphaVideoGpuView view, boolean paused) {
         view.setPaused(paused);
     }
     
     @ReactProp(name = "streamingRingSize", defaultInt = 16)
+    @Override
     public void setStreamingRingSize(AlphaVideoGpuView view, int size) {
         view.setStreamingRingSize(size);
     }
     
     @ReactProp(name = "streamingCacheSize", defaultInt = 60)
+    @Override
     public void setStreamingCacheSize(AlphaVideoGpuView view, int size) {
         view.setStreamingCacheSize(size);
     }
     
     @ReactProp(name = "streamingPrefetchAhead", defaultInt = 30)
+    @Override
     public void setStreamingPrefetchAhead(AlphaVideoGpuView view, int frames) {
         view.setStreamingPrefetchAhead(frames);
     }
@@ -106,6 +115,7 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
      * - "ram": Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
      */
     @ReactProp(name = "memoryStrategy")
+    @Override
     public void setMemoryStrategy(AlphaVideoGpuView view, @Nullable String strategy) {
         view.setMemoryStrategy(strategy != null ? strategy : "auto");
     }
@@ -116,6 +126,7 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
      * When false (default): Load all frames at once.
      */
     @ReactProp(name = "stream", defaultBoolean = false)
+    @Override
     public void setStream(AlphaVideoGpuView view, boolean stream) {
         view.setStream(stream);
     }
@@ -125,6 +136,7 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
      * found from the source URI (res/raw, content://, presigned URLs).
      */
     @ReactProp(name = "parts")
+    @Override
     public void setParts(AlphaVideoGpuView view, @Nullable ReadableArray parts) {
         if (parts == null || parts.size() == 0) {
             view.setParts(null, null);
@@ -143,6 +155,7 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
     }
 
     @ReactProp(name = "verbose", defaultBoolean = false)
+    @Override
     public void setVerbose(AlphaVideoGpuView view, boolean verbose) {
         view.setVerbose(verbose);
     }
@@ -153,28 +166,28 @@ public class AlphaVideoGpuViewManager extends SimpleViewManager<AlphaVideoGpuVie
     }
 
     @Override
-    public void receiveCommand(@NonNull AlphaVideoGpuView view, String commandId, @Nullable ReadableArray args) {
-        switch (commandId) {
-            case "play":
-                view.play();
-                break;
-            case "pause":
-                view.pause();
-                break;
-            case "stop":
-                view.stop();
-                break;
-            case "seekToFrame":
-                if (args != null && args.size() > 0) {
-                    view.seekToFrame(args.getInt(0));
-                }
-                break;
-            case "seekToTime":
-                if (args != null && args.size() > 0) {
-                    view.seekToTime(args.getDouble(0));
-                }
-                break;
-        }
+    public void play(AlphaVideoGpuView view) {
+        view.play();
+    }
+
+    @Override
+    public void pause(AlphaVideoGpuView view) {
+        view.pause();
+    }
+
+    @Override
+    public void stop(AlphaVideoGpuView view) {
+        view.stop();
+    }
+
+    @Override
+    public void seekToFrame(AlphaVideoGpuView view, int frame) {
+        view.seekToFrame(frame);
+    }
+
+    @Override
+    public void seekToTime(AlphaVideoGpuView view, double seconds) {
+        view.seekToTime(seconds);
     }
 
     @Override

@@ -1,5 +1,14 @@
-import type { ViewProps, HostComponent } from 'react-native';
-import { requireNativeComponent } from 'react-native';
+import type * as React from 'react';
+import type { HostComponent, ViewProps } from 'react-native';
+import type {
+  DirectEventHandler,
+  Double,
+  Float,
+  Int32,
+  WithDefault,
+} from 'react-native/Libraries/Types/CodegenTypes';
+import codegenNativeCommands from 'react-native/Libraries/Utilities/codegenNativeCommands';
+import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';
 
 /**
  * Where to load from:
@@ -22,52 +31,94 @@ export interface AlphaVideoGpuLoadEvent {
   duration: number;
 }
 
+type NativeSource = Readonly<{
+  uri?: string;
+  cacheKey?: string;
+}>;
+
+type LoadEvent = Readonly<{
+  width: Int32;
+  height: Int32;
+  frameCount: Int32;
+  frameRate: Double;
+  duration: Double;
+}>;
+
+type FrameUpdateEvent = Readonly<{
+  frame: Int32;
+  totalFrames: Int32;
+}>;
+
+type StateChangeEvent = Readonly<{
+  state: string;
+}>;
+
+type ErrorEvent = Readonly<{
+  error: string;
+}>;
+
 export interface NativeProps extends ViewProps {
-  source?: SourceType | null;
-  onLoad?: (event: { nativeEvent: AlphaVideoGpuLoadEvent }) => void;
+  source?: NativeSource;
   /**
    * For multi-part animations whose part files can't be found next to `source` (res/raw,
    * content://, presigned URLs): every part's source, first part containing the metadata.
    */
-  parts?: ReadonlyArray<SourceType> | null;
-  autoPlay?: boolean;
-  loop?: boolean;
-  playbackSpeed?: number;
+  parts?: ReadonlyArray<NativeSource>;
+  autoPlay?: WithDefault<boolean, true>;
+  loop?: WithDefault<boolean, true>;
+  playbackSpeed?: WithDefault<Float, 1.0>;
   /** Pause playback and decompression (useful for screen focus/blur) */
-  paused?: boolean;
+  paused?: WithDefault<boolean, false>;
   cacheKey?: string;
-  
+
   // Streaming parameters (for .ktx2.zst files)
   /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
-  streamingRingSize?: number;
+  streamingRingSize?: WithDefault<Int32, 16>;
   /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */
-  streamingCacheSize?: number;
+  streamingCacheSize?: WithDefault<Int32, 60>;
   /** Frames to decode ahead of playback. Default: 30 */
-  streamingPrefetchAhead?: number;
-  
+  streamingPrefetchAhead?: WithDefault<Int32, 30>;
+
   /**
    * Memory strategy for frame storage.
    * - 'auto': Default behavior (VRAM for non-stream, RAM for stream)
    * - 'vram': Store all frames in GPU VRAM (texture array). Best for many simultaneous players.
    * - 'ram': Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
-   * Default: 'auto'
    */
-  memoryStrategy?: 'auto' | 'vram' | 'ram';
-  
+  memoryStrategy?: WithDefault<'auto' | 'vram' | 'ram', 'auto'>;
+
   /**
    * Enable streaming mode for texture array playback.
    * When true: Use streaming decompression with ring buffer (constant memory usage).
    * When false (default): Load all frames at once.
    * Only applies to packingMode='array' files.
    */
-  stream?: boolean;
+  stream?: WithDefault<boolean, false>;
 
   /** Send onFrameUpdate for every rendered frame. Default: false */
-  enableFrameEvents?: boolean;
+  enableFrameEvents?: WithDefault<boolean, false>;
   /** Log info traces (Logcat / Xcode console). Warnings and errors always log. Default: false */
-  verbose?: boolean;
+  verbose?: WithDefault<boolean, false>;
+
+  onLoad?: DirectEventHandler<LoadEvent>;
+  onFrameUpdate?: DirectEventHandler<FrameUpdateEvent>;
+  onStateChange?: DirectEventHandler<StateChangeEvent>;
+  onFinished?: DirectEventHandler<Readonly<{}>>;
+  onError?: DirectEventHandler<ErrorEvent>;
 }
 
-export default requireNativeComponent<NativeProps>(
-  'AlphaVideoGpuView'
-) as HostComponent<NativeProps>;
+type NativeComponentType = HostComponent<NativeProps>;
+
+interface NativeCommands {
+  play: (viewRef: React.ElementRef<NativeComponentType>) => void;
+  pause: (viewRef: React.ElementRef<NativeComponentType>) => void;
+  stop: (viewRef: React.ElementRef<NativeComponentType>) => void;
+  seekToFrame: (viewRef: React.ElementRef<NativeComponentType>, frame: Int32) => void;
+  seekToTime: (viewRef: React.ElementRef<NativeComponentType>, seconds: Double) => void;
+}
+
+export const Commands: NativeCommands = codegenNativeCommands<NativeCommands>({
+  supportedCommands: ['play', 'pause', 'stop', 'seekToFrame', 'seekToTime'],
+});
+
+export default codegenNativeComponent<NativeProps>('AlphaVideoGpuView') as NativeComponentType;

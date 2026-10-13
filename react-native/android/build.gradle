@@ -2,13 +2,34 @@
 // (../../android) together with the React Native glue, because autolinking adds only this one
 // Gradle project to the app.
 
+def isNewArchitectureEnabled() {
+    // Set by the app's gradle.properties, and always "true" from React Native 0.82
+    return project.findProperty('newArchEnabled')?.toString() == 'true'
+}
+
 apply plugin: 'com.android.library'
+if (isNewArchitectureEnabled()) {
+    apply plugin: 'com.facebook.react'
+}
 
 def safeExtGet(name, fallback) {
     return rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback
 }
 
 def coreDir = file('../../android')
+def packageRoot = file('../..')
+
+if (isNewArchitectureEnabled()) {
+    // The codegen tasks look for package.json and the spec next to this folder; both are two
+    // levels up, in the package root.
+    tasks.named('generateCodegenSchemaFromJavaScript').configure {
+        jsRootDir.set(file("${packageRoot}/react-native/src"))
+        jsInputFiles.set(fileTree("${packageRoot}/react-native/src") { include '**/*.ts', '**/*.tsx', '**/*.js' })
+    }
+    tasks.named('generateCodegenArtifactsFromSchema').configure {
+        packageJsonFile.set(file("${packageRoot}/package.json"))
+    }
+}
 
 android {
     namespace 'dev.mediacache.alphavideo.gpu.reactnative'
@@ -45,7 +66,11 @@ android {
 
     sourceSets {
         main {
-            java.srcDirs = ['src/main/java', "${coreDir}/src/main/java"]
+            java.srcDirs = [
+                'src/main/java',
+                "${coreDir}/src/main/java",
+                isNewArchitectureEnabled() ? 'src/newarch/java' : 'src/oldarch/java',
+            ]
         }
     }
 }

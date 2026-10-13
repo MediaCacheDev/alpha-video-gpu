@@ -1,7 +1,10 @@
 //
 //  RNAlphaVideoGpuViewManager.mm
-//  React Native view manager for AlphaVideoGpuView
+//  React Native view manager for AlphaVideoGpuView (old architecture; the new one uses
+//  RNAlphaVideoGpuViewComponentView.mm)
 //
+
+#ifndef RCT_NEW_ARCH_ENABLED
 
 #import <React/RCTUIManager.h>
 #import <React/RCTViewManager.h>
@@ -180,3 +183,5 @@ RCT_EXPORT_METHOD(seekToTime:(nonnull NSNumber *)reactTag seconds:(nonnull NSNum
 }
 
 @end
+
+#endif

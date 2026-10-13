@@ -22,6 +22,19 @@
   "scripts": {
     "publish:android:local": "scripts/publish-android.sh local"
   },
+  "codegenConfig": {
+    "name": "RNAlphaVideoGpuSpec",
+    "type": "components",
+    "jsSrcsDir": "react-native/src",
+    "android": {
+      "javaPackageName": "dev.mediacache.alphavideo.gpu.reactnative"
+    },
+    "ios": {
+      "componentProvider": {
+        "AlphaVideoGpuView": "RNAlphaVideoGpuViewComponentView"
+      }
+    }
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/danielkpl2/alpha-video-gpu"

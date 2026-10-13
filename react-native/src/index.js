@@ -1,19 +1,19 @@
 import React, { forwardRef, useImperativeHandle, useMemo, useRef } from 'react';
-import { View, StyleSheet, Platform, UIManager, findNodeHandle } from 'react-native';
-
-const NATIVE_VIEW = 'AlphaVideoGpuView';
+import { View, StyleSheet, Platform } from 'react-native';
 
 // Platform-specific imports
 let NativeAlphaVideoGpuView;
+let NativeCommands;
 let WebAlphaVideoGpuView;
 
 if (Platform.OS === 'web') {
   // Resolves to AlphaVideoGpuView.web.tsx; native bundles get the empty AlphaVideoGpuView.js
   WebAlphaVideoGpuView = require('./AlphaVideoGpuView').default;
 } else {
-  // Native implementation using codegenNativeComponent
-  // This supports both New Architecture (Fabric) and Legacy Architecture (auto-fallback)
-  NativeAlphaVideoGpuView = require('./AlphaVideoGpuViewNativeComponent').default;
+  // Codegen spec: a Fabric component on the new architecture, a view manager on the old one
+  const nativeComponent = require('./AlphaVideoGpuViewNativeComponent');
+  NativeAlphaVideoGpuView = nativeComponent.default;
+  NativeCommands = nativeComponent.Commands;
 }
 
 /**
@@ -66,21 +66,15 @@ export const AlphaVideoGpuView = React.memo(forwardRef(({
         seekToTime: seconds => call('seekToTime', [seconds]),
       };
     }
-    const send = (name, args) => {
-      const handle = viewRef.current ? findNodeHandle(viewRef.current) : null;
-      if (handle == null) return;
-      UIManager.dispatchViewManagerCommand(
-        handle,
-        UIManager.getViewManagerConfig(NATIVE_VIEW)?.Commands?.[name] ?? name,
-        args
-      );
+    const send = (name, ...args) => {
+      if (viewRef.current) NativeCommands[name](viewRef.current, ...args);
     };
     return {
-      play: () => send('play', []),
-      pause: () => send('pause', []),
-      stop: () => send('stop', []),
-      seekToFrame: frame => send('seekToFrame', [frame]),
-      seekToTime: seconds => send('seekToTime', [seconds]),
+      play: () => send('play'),
+      pause: () => send('pause'),
+      stop: () => send('stop'),
+      seekToFrame: frame => send('seekToFrame', frame),
+      seekToTime: seconds => send('seekToTime', seconds),
     };
   }, []);
   // Normalize source to object format for consistency
