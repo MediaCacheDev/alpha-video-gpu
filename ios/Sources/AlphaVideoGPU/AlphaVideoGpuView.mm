@@ -373,7 +373,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     if ([self.device supportsFamily:MTLGPUFamilyApple2]) {
       AVG_VLOG(@"Using ASTC 4x4 format");
       _targetFormat = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
-      _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
+      _metalPixelFormat = MTLPixelFormatASTC_4x4_LDR;
       _useCompressedFormat = YES;
       return;
     }
@@ -396,7 +396,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 - (BOOL)configureASTCFormatFromVkFormat:(uint32_t)vkFormat
 {
   // All ASTC VkFormats come in UNORM/SRGB pairs.
-  // We use the sRGB MTLPixelFormat for both (matches visual output).
+  // Both map to the LDR MTLPixelFormat, as on Android and web: the encoder stores premultiplied
+  // sRGB-encoded bytes that must reach the drawable unchanged, and an _sRGB format would
+  // linearise them on sampling with nothing converting back.
   struct ASTCFormatInfo {
     uint32_t vkFormatUnorm;
     uint32_t vkFormatSrgb;
@@ -406,20 +408,20 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   };
   
   static const ASTCFormatInfo formats[] = {
-    { 157, 158, MTLPixelFormatASTC_4x4_sRGB,   4,  4 },
-    { 159, 160, MTLPixelFormatASTC_5x4_sRGB,   5,  4 },
-    { 161, 162, MTLPixelFormatASTC_5x5_sRGB,   5,  5 },
-    { 163, 164, MTLPixelFormatASTC_6x5_sRGB,   6,  5 },
-    { 165, 166, MTLPixelFormatASTC_6x6_sRGB,   6,  6 },
-    { 167, 168, MTLPixelFormatASTC_8x5_sRGB,   8,  5 },
-    { 169, 170, MTLPixelFormatASTC_8x6_sRGB,   8,  6 },
-    { 171, 172, MTLPixelFormatASTC_8x8_sRGB,   8,  8 },
-    { 173, 174, MTLPixelFormatASTC_10x5_sRGB,  10, 5 },
-    { 175, 176, MTLPixelFormatASTC_10x6_sRGB,  10, 6 },
-    { 177, 178, MTLPixelFormatASTC_10x8_sRGB,  10, 8 },
-    { 179, 180, MTLPixelFormatASTC_10x10_sRGB, 10, 10 },
-    { 181, 182, MTLPixelFormatASTC_12x10_sRGB, 12, 10 },
-    { 183, 184, MTLPixelFormatASTC_12x12_sRGB, 12, 12 },
+    { 157, 158, MTLPixelFormatASTC_4x4_LDR,   4,  4 },
+    { 159, 160, MTLPixelFormatASTC_5x4_LDR,   5,  4 },
+    { 161, 162, MTLPixelFormatASTC_5x5_LDR,   5,  5 },
+    { 163, 164, MTLPixelFormatASTC_6x5_LDR,   6,  5 },
+    { 165, 166, MTLPixelFormatASTC_6x6_LDR,   6,  6 },
+    { 167, 168, MTLPixelFormatASTC_8x5_LDR,   8,  5 },
+    { 169, 170, MTLPixelFormatASTC_8x6_LDR,   8,  6 },
+    { 171, 172, MTLPixelFormatASTC_8x8_LDR,   8,  8 },
+    { 173, 174, MTLPixelFormatASTC_10x5_LDR,  10, 5 },
+    { 175, 176, MTLPixelFormatASTC_10x6_LDR,  10, 6 },
+    { 177, 178, MTLPixelFormatASTC_10x8_LDR,  10, 8 },
+    { 179, 180, MTLPixelFormatASTC_10x10_LDR, 10, 10 },
+    { 181, 182, MTLPixelFormatASTC_12x10_LDR, 12, 10 },
+    { 183, 184, MTLPixelFormatASTC_12x12_LDR, 12, 12 },
   };
   
   for (const auto &fmt : formats) {
@@ -441,7 +443,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   
   AVG_VLOG(@"Unknown ASTC VkFormat: %u, falling back to 4x4", vkFormat);
 #if !TARGET_OS_SIMULATOR
-  _metalPixelFormat = MTLPixelFormatASTC_4x4_sRGB;
+  _metalPixelFormat = MTLPixelFormatASTC_4x4_LDR;
 #endif
   _astcBlockWidth = 4;
   _astcBlockHeight = 4;

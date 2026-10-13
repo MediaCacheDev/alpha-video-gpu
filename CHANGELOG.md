@@ -13,6 +13,7 @@ First public release.
 - Playback control: `play`, `pause`, `stop`, `seekToFrame` and `seekToTime` on every platform, plus `paused`, `autoPlay`, `loop` and `playbackSpeed`.
 - Events: `onLoad`, `onFrameUpdate` (with `enableFrameEvents`), `onStateChange`, `onFinished` and `onError`. On the web, `onError` reports `ASTC_UNSUPPORTED` or `WEBGL_UNSUPPORTED` in `code`.
 - A software RGBA fallback for emulators and devices without ASTC.
+- Colours reach the screen exactly as encoded on every platform. iOS devices sample ASTC as plain (LDR) data, like Android and the web; before 1.0.0 they sampled it as sRGB, which darkened mid-tones by about half and gave semi-transparent edges dark fringes.
 - React Native: one `AlphaVideoGpuView` for Android, iOS and react-native-web, on both the new architecture (Fabric) and the old one.
 - Standalone Android and iOS libraries with no React Native dependency, and `alpha-video-gpu-web` for plain JS/TS and React.
 - Android libraries are linked for 16 KB pages.
