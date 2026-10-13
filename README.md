@@ -4,7 +4,7 @@ Plays transparent (alpha) animations stored as GPU-compressed KTX2 textures (AST
 
 | Platform | Package | View |
 |---|---|---|
-| React Native (Android, iOS, web) | npm `alpha-video-gpu` | `AlphaVideoGpuView` |
+| React Native (Android, iOS, web) | npm `react-native-alpha-video-gpu` | `AlphaVideoGpuView` |
 | Android | Maven `dev.mediacache:alpha-video-gpu` | `dev.mediacache.alphavideo.gpu.AlphaVideoGpuView` |
 | iOS | Swift Package Manager, product `AlphaVideoGPU`; CocoaPods `alpha-video-gpu` | `AlphaVideoGpuView` |
 | Web (plain JS/TS, React) | npm `alpha-video-gpu-web` | `createAlphaVideoGpuPlayer`, `AlphaVideoGpuPlayer` |
@@ -194,7 +194,7 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator), the 
 ### React Native
 
 ```bash
-npm install alpha-video-gpu
+npm install react-native-alpha-video-gpu
 cd ios && pod install
 ```
 
@@ -270,7 +270,7 @@ container.addSubview(view)
 ## Usage
 
 ```jsx
-import { AlphaVideoGpuView } from 'alpha-video-gpu';
+import { AlphaVideoGpuView } from 'react-native-alpha-video-gpu';
 
 <AlphaVideoGpuView
   style={{ width: 400, height: 400 }}
@@ -715,7 +715,7 @@ The events have the same shape on Android, iOS and web. Playback is controlled w
 | `android/` | The Android library: `AlphaVideoGpuView`, source loading, and the JNI transcoder (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
 | `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++), with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
 | `third_party/basis_universal/` | The Basis Universal 1.16.4 transcoder and zstd, compiled into both native libraries | |
-| `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
+| `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `react-native-alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
 | `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there inlines the decoders and builds `dist/` | npm `alpha-video-gpu-web` |
 | `scripts/publish-android.sh` | `local` publishes the Android library to `~/.m2`; `central` signs it and uploads it to the Maven Central Portal (see the script for the variables) | |
 
@@ -727,7 +727,7 @@ cd android && ./gradlew assembleRelease               # Android: the AAR (needs 
 xcodebuild -scheme AlphaVideoGPU -destination 'generic/platform=iOS Simulator' build   # iOS, from the repo root
 ```
 
-A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `alpha-video-gpu`, which depends on it.
+A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
 
 ## Requirements
 
