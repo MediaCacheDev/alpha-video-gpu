@@ -30,6 +30,7 @@
     "bundle-basis": "node scripts/bundle-basis.js",
     "build": "npm run bundle-basis && tsup",
     "typecheck": "npm run bundle-basis && tsc --noEmit",
+    "test": "vitest run",
     "prepack": "npm run build"
   },
   "keywords": [
@@ -64,6 +65,7 @@
     "@types/react": "^18.3.31",
     "react": "^18.3.1",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
   }
 }
