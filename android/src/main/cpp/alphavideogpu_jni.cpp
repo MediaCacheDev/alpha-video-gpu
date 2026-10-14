@@ -131,9 +131,15 @@ struct PBOContext {
     }
 };
 
-// Map texture array ID to its PBO context
-static std::map<GLuint, PBOContext> g_pbo_contexts;
+// Each view has its own EGL context, and texture and buffer names are per context, so two views
+// can hold the same texture ID. PBOs are keyed by the context that is current when they're made.
+using PBOKey = std::pair<EGLContext, GLuint>;
+static std::map<PBOKey, PBOContext> g_pbo_contexts;
 static std::mutex g_pbo_mutex;
+
+static PBOKey pboKey(GLuint texId) {
+    return {eglGetCurrentContext(), texId};
+}
 
 // Decode ASTC texture to RGBA using proper decoder (supports all block sizes)
 static bool decode_astc_to_rgba(const uint8_t* astc_data, size_t astc_size,
@@ -845,9 +851,11 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeInitPBOs(JNIEnv *en
     std::lock_guard<std::mutex> lock(g_pbo_mutex);
     
     GLuint texId = (GLuint)texture_id;
+    PBOKey key = pboKey(texId);
     
     // Check if already initialized
-    if (g_pbo_contexts.find(texId) != g_pbo_contexts.end() && g_pbo_contexts[texId].initialized) {
+    auto existing = g_pbo_contexts.find(key);
+    if (existing != g_pbo_contexts.end() && existing->second.initialized) {
         LOGI("PBOs already initialized for texture %u", texId);
         return JNI_TRUE;
     }
@@ -880,7 +888,7 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeInitPBOs(JNIEnv *en
     
     ctx.current_pbo = 0;
     ctx.initialized = true;
-    g_pbo_contexts[texId] = ctx;
+    g_pbo_contexts[key] = ctx;
     
     LOGI("Initialized PBOs for texture %u: size=%d bytes each", texId, buffer_size);
     return JNI_TRUE;
@@ -895,7 +903,7 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeCleanupPBOs(JNIEnv 
     std::lock_guard<std::mutex> lock(g_pbo_mutex);
     
     GLuint texId = (GLuint)texture_id;
-    auto it = g_pbo_contexts.find(texId);
+    auto it = g_pbo_contexts.find(pboKey(texId));
     if (it == g_pbo_contexts.end()) {
         return;
     }
@@ -949,7 +957,7 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeUploadTextureArrayL
     PBOContext* ctx = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_pbo_mutex);
-        auto it = g_pbo_contexts.find(texId);
+        auto it = g_pbo_contexts.find(pboKey(texId));
         if (it == g_pbo_contexts.end() || !it->second.initialized) {
             LOGW("PBOs not initialized for texture %u, falling back to regular upload", texId);
             return Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeUploadTextureArrayLayerFromBuffer(

@@ -1983,13 +1983,13 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     
     private void cleanupGL() {
         if (eglDisplay != null && eglDisplay != EGL14.EGL_NO_DISPLAY) {
-            EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
-            
-            // Cleanup PBOs before deleting textures
+            // The native side finds this view's PBOs by the current context
             if (pbosInitialized && textureArrayId != 0) {
                 AlphaVideoGpuNative.nativeCleanupPBOs(textureArrayId);
                 pbosInitialized = false;
             }
+            
+            EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
             
             // Destroying the context below frees the texture array and program
             textureArrayId = 0;
