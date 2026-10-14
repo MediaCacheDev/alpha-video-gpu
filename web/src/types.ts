@@ -25,7 +25,7 @@ export interface KTX2LoadEvent {
 
 export type PlayerState = 'idle' | 'loading' | 'ready' | 'playing' | 'paused' | 'stopped' | 'error';
 
-export type MemoryStrategy = 'auto' | 'vram' | 'ram';
+export type MemoryStrategy = 'vram' | 'ram';
 
 /**
  * Options for KTX2PlayerCore constructor.
@@ -38,7 +38,7 @@ export interface KTX2PlayerCoreOptions {
   loop?: boolean;
   /** Playback speed multiplier (default: 1.0) */
   playbackSpeed?: number;
-  /** Enable streaming mode for texture array playback (default: false) */
+  /** Enable streaming mode for texture array playback (default: true) */
   stream?: boolean;
 
   // Streaming parameters
@@ -48,7 +48,7 @@ export interface KTX2PlayerCoreOptions {
   streamingCacheSize?: number;
   /** Frames to decode ahead of playback. Default: 30 */
   streamingPrefetchAhead?: number;
-  /** Memory strategy: 'auto' | 'vram' | 'ram'. Default: 'auto' */
+  /** Memory strategy: 'vram' | 'ram'. Default: 'vram' */
   memoryStrategy?: MemoryStrategy;
   /** Log info traces to the console (warnings and errors always log). Default: false */
   verbose?: boolean;

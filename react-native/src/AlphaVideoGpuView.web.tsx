@@ -61,9 +61,9 @@ export interface AlphaVideoGpuViewProps {
   streamingCacheSize?: number;
   /** Frames to decode ahead of playback. Default: 30 */
   streamingPrefetchAhead?: number;
-  /** Memory strategy: 'auto' | 'vram' | 'ram'. Default: 'auto' */
-  memoryStrategy?: 'auto' | 'vram' | 'ram';
-  /** Enable streaming mode for texture array playback. Default: false */
+  /** Memory strategy: 'vram' | 'ram'. Default: 'vram' */
+  memoryStrategy?: 'vram' | 'ram';
+  /** Enable streaming mode for texture array playback. Default: true */
   stream?: boolean;
   /** Log info traces to the console. Default: false */
   verbose?: boolean;
@@ -97,8 +97,8 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   streamingRingSize = 16,
   streamingCacheSize = 60,
   streamingPrefetchAhead = 30,
-  memoryStrategy = 'auto',
-  stream = false,
+  memoryStrategy = 'vram',
+  stream = true,
   enableFrameEvents = false,
   verbose = false,
 }, ref) => {

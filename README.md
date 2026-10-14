@@ -1,6 +1,6 @@
 # alpha-video-gpu
 
-Plays transparent (alpha) animations stored as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
+Plays transparent (alpha) videos stored as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
 
 | Platform | Package | View |
 |---|---|---|
@@ -9,18 +9,37 @@ Plays transparent (alpha) animations stored as ASTC texture arrays in KTX2 files
 | iOS | Swift Package Manager, product `AlphaVideoGPU`; CocoaPods `alpha-video-gpu` | `AlphaVideoGpuView` |
 | Web (plain JS/TS, React) | npm `alpha-video-gpu-web` | `createAlphaVideoGpuPlayer`, `AlphaVideoGpuPlayer` |
 
-> **Looking for codec-based playback?** See [alpha-video](https://github.com/danielkpl2/alpha-video) for WebM VP9/AV1 with smaller file sizes.
+See it next to the other formats in the [demo app](#demo-and-related-packages).
+
+## alpha-video-gpu or alpha-video?
+
+alpha-video-gpu doesn't depend on a video codec. There's nothing to decode, so it uses almost no CPU, needs no hardware video decoder, and runs wherever the GPU supports ASTC textures, which covers more devices than VP9 or AV1 hardware decoding. [alpha-video](https://github.com/danielkpl2/alpha-video) plays WebM VP9 and AV1 instead, for when file size matters more.
+
+| | [alpha-video](https://github.com/danielkpl2/alpha-video) | alpha-video-gpu (this package) |
+|---|---|---|
+| **Format** | WebM: VP9 with alpha, or dual-stream VP9/AV1 | KTX2: an ASTC texture array, one layer per frame |
+| **Made with** | ffmpeg, or any tool that exports alpha WebM | [alpha-video-gpu-encoder](https://github.com/danielkpl2/alpha-video-gpu-encoder) (`texenc`) |
+| **Decoding** | Every frame: libvpx or dav1d on the CPU, or MediaCodec on Android | None |
+| **CPU and battery** | A decode per frame, or one pass up front with `mode="preload"` | Near zero |
+| **What the device needs** | Nothing for software decoding. Hardware decoding needs a VP9 or AV1 decoder (Android only), and each player takes 2 of its few instances | ASTC texture support: every iPhone and iPad since the A8 (2014), nearly every Android GPU, Apple silicon Macs and mobile browsers |
+| **Many players at once** | Limited by the CPU, or by the hardware decoder's instances | Dozens: each one is just a texture |
+| **File size** | Smallest | Several times larger |
+| **Seeking** | Decodes from the previous keyframe | Any frame directly |
+| **Web** | `<video>` in Chrome and Firefox | WebGL where the browser has ASTC |
+| **Best for** | Long or large clips, downloads where size matters, files from standard video tools | UI effects, stickers and glows, many simultaneous loops, short to medium videos |
+
+[Video Codecs vs GPU Texture Streaming](#video-codecs-vs-gpu-texture-streaming) below goes through the trade-offs in detail. [alpha-video-ffmpegkit](https://github.com/danielkpl2/alpha-video-ffmpegkit) was the first attempt at transparent WebM, on FFmpegKit, and stays as a reference; use alpha-video for WebM.
 
 ## Overview
 
-This library renders animations from KTX2 files that hold an ASTC texture array, one frame per layer. The ASTC blocks go to the GPU as they are, and the GPU decodes them while sampling.
+This library renders videos from KTX2 files that hold an ASTC texture array, one frame per layer. The ASTC blocks go to the GPU as they are, and the GPU decodes them while sampling.
 
 **Key characteristics:**
 - No per-frame decoding: frames are uploaded as compressed ASTC blocks
 - Hardware texture compression on iOS, Android and the mobile web
 - Software ASTC decoding on emulators and devices without ASTC
 - Metadata embedded in the KTX2 file by the encoder
-- **Streaming playback** for long animations with minimal memory footprint
+- **Streaming playback** for long videos with minimal memory footprint
 - **Uncompressed ASTC streaming** for many concurrent players
 
 ---
@@ -97,7 +116,7 @@ KTX2 File → Zstd Decompress → ASTC Data → Direct GPU Upload → Render
 - Device has hardware video decoder
 
 **Use GPU textures (alpha-video-gpu) when:**
-- Many simultaneous animations (UI effects, particles, stickers)
+- Many simultaneous videos (UI effects, particles, stickers)
 - Battery/CPU usage is critical
 - Low latency is required
 - Content is short-to-medium (seconds to ~1 minute)
@@ -105,7 +124,7 @@ KTX2 File → Zstd Decompress → ASTC Data → Direct GPU Upload → Render
 
 ### The Math
 
-For a 30fps, 400×400 animation with alpha:
+For a 30fps, 400×400 video with alpha:
 
 **Video codec (VP9 YUVA):**
 - File: ~50KB/sec of video
@@ -139,10 +158,10 @@ Files are made with the separate [`alpha-video-gpu-encoder`](https://github.com/
 npm install -g alpha-video-gpu-encoder
 
 # ASTC texture array, KTX2-internal zstd (the default; streams with `stream`)
-texenc --input ./frames --output animation.ktx2 --fps 30 --astc-quality exhaustive --astc-perceptual
+texenc --input ./frames --output video.ktx2 --fps 30 --astc-quality exhaustive --astc-perceptual
 
 # Uncompressed ASTC (largest file, no decompression; mmap streaming)
-texenc --input ./frames --output animation.ktx2 --fps 30 --zstd 0
+texenc --input ./frames --output video.ktx2 --fps 30 --zstd 0
 ```
 
 See the encoder's README for every option, video input and the memory-efficient stream encoder.
@@ -160,7 +179,7 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator), the 
 | Android Device | ASTC (nearly all) | Software ASTC→RGBA decode |
 | Android Emulator | Usually none | Software ASTC→RGBA decode |
 | Web (mobile) | ASTC | — |
-| Web (desktop) | Usually none | None: fails with `ASTC_UNSUPPORTED` |
+| Web (desktop) | ASTC where the browser has `WEBGL_compressed_texture_astc` | None: fails with `ASTC_UNSUPPORTED` |
 
 **Important:** On emulators frames are decoded to uncompressed RGBA. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices.
 
@@ -170,16 +189,45 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator), the 
 
 ### React Native
 
+**npm**, package `react-native-alpha-video-gpu`:
+
 ```bash
 npm install react-native-alpha-video-gpu
 cd ios && pod install
 ```
 
-zstd is compiled in from `third_party/`; there are no other native dependencies. On the web the component uses [`alpha-video-gpu-web`](#web-support), which is installed with it.
+```tsx
+import { AlphaVideoGpuView } from 'react-native-alpha-video-gpu';
+
+<AlphaVideoGpuView
+  source={{ uri: 'https://example.com/video.ktx2', cacheKey: 'intro.ktx2' }} // cacheKey: http(s) only
+  style={{ width: 300, height: 300 }}
+  autoPlay={true}             // the default; false waits for play()
+  loop={true}                 // the default; false plays once, then calls onFinished
+  paused={false}              // a hold, for example while the screen is hidden
+  playbackSpeed={1.0}
+  stream={true}               // decodes a window of frames while playing (default); false loads every frame
+  memoryStrategy="vram"       // frames on the GPU (default), or 'ram'; see Options
+  streamingRingSize={16}      // stream with 'ram': GPU slots, 4 to 64
+  streamingCacheSize={60}     // stream: frames kept decoded, 10 to 200
+  streamingPrefetchAhead={30} // stream: frames decoded ahead, 5 to 100
+  enableFrameEvents={false}   // true calls onFrameUpdate for every frame
+  verbose={false}             // true logs info traces; warnings and errors always log
+  onLoad={({ nativeEvent }) => console.log(nativeEvent.frameCount, nativeEvent.frameRate)}
+  onStateChange={({ nativeEvent }) => console.log(nativeEvent.state)}
+  onFrameUpdate={({ nativeEvent }) => console.log(nativeEvent.frame, nativeEvent.totalFrames)}
+  onFinished={() => console.log('played once')}
+  onError={({ nativeEvent }) => console.error(nativeEvent.error, nativeEvent.code)}
+/>
+```
+
+The example sets every option; [Options](#options) says when each one takes effect. zstd is compiled in from `third_party/`; there are no other native dependencies. On the web the component uses [`alpha-video-gpu-web`](#web-support), which is installed with it.
 
 The view works on both React Native architectures: the new one (Fabric, the default since 0.76) and the old one (`newArchEnabled=false`, up to 0.81). It is tested on 0.83, and on 0.81 with the new architecture turned off.
 
-### Android without React Native
+### Android
+
+**Maven Central**, artifact `dev.mediacache:alpha-video-gpu`:
 
 ```gradle
 dependencies {
@@ -191,40 +239,48 @@ dependencies {
 
 ```kotlin
 val view = AlphaVideoGpuView(context)
-view.setStream(true)
+view.setCacheKey("intro.ktx2")         // http(s) only: the download's name; default, a hash of the URL
+view.setAutoPlay(true)                 // the default; false waits for play()
+view.setLoop(true)                     // the default; false plays once, then calls onFinished
+view.setPaused(false)                  // a hold, for example while the screen is hidden
+view.setPlaybackSpeed(1.0f)
+view.setStream(true)                   // decodes a window of frames while playing (default); false loads every frame
+view.setMemoryStrategy("vram")         // frames on the GPU (default), or "ram"; see Options
+view.setStreamingRingSize(16)          // stream with "ram": GPU slots, 4 to 64
+view.setStreamingCacheSize(60)         // stream: frames kept decoded, 10 to 200
+view.setStreamingPrefetchAhead(30)     // stream: frames decoded ahead, 5 to 100
+view.setEnableFrameEvents(false)       // true calls onFrameUpdate for every frame
+view.setVerbose(false)                 // true logs info traces to Logcat
 view.setPlayerCallback(object : AlphaVideoGpuView.PlayerCallback {
     override fun onLoad(width: Int, height: Int, frameCount: Int, frameRate: Double) {}
-    override fun onError(error: String) {}
+    override fun onStateChange(state: String) {}
+    override fun onFrameUpdate(frame: Int, totalFrames: Int) {}
     override fun onFinished() {}
+    override fun onError(error: String) {}
 })
-view.setSource("asset://media/animation.ktx2")
+view.setSource("https://example.com/video.ktx2")
 container.addView(view)
 ```
 
-Every `PlayerCallback` method has an empty default; `onStateChange` and `onFrameUpdate` (with `setEnableFrameEvents(true)`) are the others. Callbacks arrive on the main thread. `play()`, `pause()`, `stop()`, `seekToFrame()` and `seekToTime()` control playback; detaching the view, or `destroy()`, frees it. http(s) sources need the `INTERNET` permission in the app's manifest. Needs `minSdk` 24 and OpenGL ES 3.0.
+Every `PlayerCallback` method has an empty default; `onStateChange` and `onFrameUpdate` (with `setEnableFrameEvents(true)`) are the others. Callbacks arrive on the main thread. `play()`, `pause()`, `stop()`, `seekToFrame()` and `seekToTime()` control playback, and `setPaused()` holds it as described under [Usage](#usage); detaching the view, or `destroy()`, frees it. http(s) sources need the `INTERNET` permission in the app's manifest. Needs `minSdk` 24 and OpenGL ES 3.0.
 
-### iOS without React Native
+### iOS
 
-In Xcode, add the package `https://github.com/danielkpl2/alpha-video-gpu` (File → Add Package Dependencies), or in `Package.swift`:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/danielkpl2/alpha-video-gpu", exact: "1.0.0"),
-],
-targets: [
-    .target(name: "MyApp", dependencies: [
-        .product(name: "AlphaVideoGPU", package: "alpha-video-gpu"),
-    ]),
-]
-```
-
-Or with CocoaPods:
+**CocoaPods**, pod `alpha-video-gpu`:
 
 ```ruby
 pod 'alpha-video-gpu', '1.0.0'
 ```
 
-CocoaPods trunk is read-only from 2 December 2026, so later versions are used through the podspec at their tag: `pod 'alpha-video-gpu', :podspec => 'https://raw.githubusercontent.com/danielkpl2/alpha-video-gpu/v<version>/alpha-video-gpu.podspec'`. The module is `AlphaVideoGPU` either way.
+**Swift Package Manager**, package `alpha-video-gpu`, product `AlphaVideoGPU`:
+
+```swift
+.package(url: "https://github.com/danielkpl2/alpha-video-gpu", from: "1.0.0")
+// in the target's dependencies:
+.product(name: "AlphaVideoGPU", package: "alpha-video-gpu")
+```
+
+The module is `AlphaVideoGPU` either way.
 
 `AlphaVideoGpuView` is an Objective-C `MTKView`, so it works from Swift and Objective-C:
 
@@ -232,11 +288,24 @@ CocoaPods trunk is read-only from 2 December 2026, so later versions are used th
 import AlphaVideoGPU
 
 let view = AlphaVideoGpuView(frame: CGRect(x: 0, y: 0, width: 200, height: 200))
-view.stream = true
+view.cacheKey = "intro.ktx2"           // http(s) only: the download's name; default, a hash of the URL
+view.autoPlay = true                   // the default; false waits for play
+view.loop = true                       // the default; false plays once, then calls onFinished
+view.playbackPaused = false            // a hold; MTKView's own `paused` is used by the view
+view.playbackSpeed = 1.0
+view.stream = true                     // decodes a window of frames while playing (default); false loads every frame
+view.memoryStrategy = "vram"           // frames on the GPU (default), or "ram"; see Options
+view.streamingRingSize = 16            // stream with "ram": GPU slots, 4 to 64
+view.streamingCacheSize = 60           // stream: frames kept decoded, 10 to 200
+view.streamingPrefetchAhead = 30       // stream: frames decoded ahead, 5 to 100
+view.enableFrameEvents = false         // true calls onFrameUpdate for every frame
+view.verbose = false                   // true logs info traces to the Xcode console
 view.onLoad = { width, height, frameCount, frameRate in }
-view.onError = { error in }
+view.onStateChange = { state in }
+view.onFrameUpdate = { frame, totalFrames in }
 view.onFinished = { }
-view.source = "asset://media/animation.ktx2"
+view.onError = { error in }
+view.source = "https://example.com/video.ktx2"  // set last: loading starts at once
 container.addSubview(view)
 ```
 
@@ -247,25 +316,52 @@ container.addSubview(view)
 ## Usage
 
 ```jsx
+import { useRef } from 'react';
 import { AlphaVideoGpuView } from 'react-native-alpha-video-gpu';
 
-<AlphaVideoGpuView
-  style={{ width: 400, height: 400 }}
-  source={{ uri: 'https://example.com/animation.ktx2' }}
-  onStateChange={({ nativeEvent }) => console.log(nativeEvent.state)}
-  onError={({ nativeEvent }) => console.error(nativeEvent.error)}
-/>
+function MyComponent() {
+  const player = useRef(null);  // player.current?.seekToTime(1.5), play(), pause(), stop(), seekToFrame(n)
+  return (
+    <AlphaVideoGpuView
+      ref={player}
+      source={{ uri: 'https://example.com/video.ktx2', cacheKey: 'intro.ktx2' }} // cacheKey: http(s) only
+      style={{ width: 300, height: 300 }}
+      autoPlay={true}             // the default; false waits for play()
+      loop={true}                 // the default; false plays once, then calls onFinished
+      paused={false}              // a hold, for example while the screen is hidden
+      playbackSpeed={1.0}
+      stream={true}               // decodes a window of frames while playing (default); false loads every frame
+      memoryStrategy="vram"       // frames on the GPU (default), or 'ram'; see Options
+      streamingRingSize={16}      // stream with 'ram': GPU slots, 4 to 64
+      streamingCacheSize={60}     // stream: frames kept decoded, 10 to 200
+      streamingPrefetchAhead={30} // stream: frames decoded ahead, 5 to 100
+      enableFrameEvents={false}   // true calls onFrameUpdate for every frame
+      verbose={false}             // true logs info traces; warnings and errors always log
+      onLoad={({ nativeEvent }) => console.log(nativeEvent.frameCount, nativeEvent.frameRate)}
+      onStateChange={({ nativeEvent }) => console.log(nativeEvent.state)}
+      onFrameUpdate={({ nativeEvent }) => console.log(nativeEvent.frame, nativeEvent.totalFrames)}
+      onFinished={() => console.log('played once')}
+      onError={({ nativeEvent }) => console.error(nativeEvent.error, nativeEvent.code)}
+    />
+  );
+}
 ```
 
-A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first frame), `seekToFrame(frame)` and `seekToTime(seconds)`. A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before `onLoad` are ignored. With `stream`, a seek outside the buffered frames decodes again from the start of the file, or onwards from the decoder for a seek ahead of it. `paused` holds playback (for screen focus and blur); unpausing plays again when `autoPlay` is on. A clip that doesn't loop stops on its last frame, and `play()` starts it over.
+A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first frame), `seekToFrame(frame)` and `seekToTime(seconds)`. A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before `onLoad` are ignored. With `stream`, a seek outside the buffered frames decodes again from the start of the file, or onwards from the decoder for a seek ahead of it. `autoPlay` sets how a video starts: off, it waits for `play()`. `paused` is a hold to turn on and off, for example while the screen is hidden; unpausing plays again when `autoPlay` is on, and with `autoPlay` off it takes `play()`. A clip that doesn't loop stops on its last frame, and `play()` starts it over.
 
-```jsx
-const player = useRef(null);
 
-<AlphaVideoGpuView ref={player} source={{ uri: 'asset://media/animation.ktx2' }} />
+### Options
 
-player.current?.seekToTime(1.5);
-```
+The examples under [Installation](#installation), [Usage](#usage) and [Web Support](#web-support) set every option, each to its default. The memory options (`stream`, `memoryStrategy` and the three sizes) are read when a source loads, so set them before the source; on the web, pass them when creating the player. `autoPlay`, `loop`, `paused`, `playbackSpeed`, `enableFrameEvents` and `verbose` can change at any time.
+
+Sizes outside their range are clamped to it. Where the frames live, and which size applies:
+
+| | `stream` off | `stream` on (the default) |
+|---|---|---|
+| `'vram'` (the default) | Every frame in a GPU texture array | A GPU ring of `streamingCacheSize` frames, decoded straight into it |
+| `'ram'` | Every frame in RAM, uploaded to the GPU as it's shown. Android and web; iOS loads every frame into VRAM | `streamingCacheSize` decoded frames in RAM, uploaded into a GPU ring of `streamingRingSize` slots |
+
+`streamingPrefetchAhead` is how far ahead of the playhead the decoder runs, within the cache. See [Playback Modes](#playback-modes) for when to use each.
 
 ### Sources
 
@@ -286,7 +382,7 @@ Nothing is copied: bundled assets, raw resources and local files are read where 
 Downloads are named by `cacheKey` if you give one, otherwise by a hash of the URL. Set `cacheKey` when the URL changes while the file doesn't (presigned URLs), so a new URL still hits the cache and doesn't reload the view:
 
 ```jsx
-<AlphaVideoGpuView source={{ uri: presignedUrl, cacheKey: 'animations/glow.ktx2' }} />
+<AlphaVideoGpuView source={{ uri: presignedUrl, cacheKey: 'videos/glow.ktx2' }} />
 ```
 
 `cacheKey` can also be passed as a top-level prop; it wins over `source.cacheKey`. Native downloads go to the app's cache directory (`<cache>/<cacheKey>`, or `<cache>/alpha-video-gpu/<sha256>`), so the OS may clear them.
@@ -312,16 +408,16 @@ Then resolve the module to a URI:
 ```jsx
 import { Image } from 'react-native';
 
-const animation = Image.resolveAssetSource(require('./assets/animation.ktx2'));
+const video = Image.resolveAssetSource(require('./assets/video.ktx2'));
 
-<AlphaVideoGpuView source={{ uri: animation.uri }} />
+<AlphaVideoGpuView source={{ uri: video.uri }} />
 ```
 
 In debug builds that URI is the Metro dev server (`http://…`, downloaded and cached like any URL). In release builds it's a `file://` path in the iOS bundle, or a `res/raw` name on Android. On web, `Image.resolveAssetSource` doesn't exist; use the module value directly when it's a string, or `expo-asset`'s `Asset.fromModule(module).uri`.
 
 #### Streaming from Android assets and resources
 
-Android compresses APK entries it doesn't recognise, and a compressed entry can't be memory-mapped. Non-streaming playback reads it anyway, but `stream` needs the file stored uncompressed:
+Android compresses APK entries it doesn't recognise, and a compressed entry can't be memory-mapped. Non-streaming playback (`stream={false}`) reads it anyway, but streaming, the default, needs the file stored uncompressed, and reports `onError` otherwise:
 
 ```groovy
 // android/app/build.gradle
@@ -338,7 +434,7 @@ Without it, `stream` on an `asset://` or `res/raw` file fails with an error nami
 
 ## Metadata
 
-Animation metadata is embedded by the encoder in the KTX2 file's key-value data, under the key `BasisPlayerMetadata` (the name is kept so older files still read). The player reads it automatically:
+Video metadata is embedded by the encoder in the KTX2 file's key-value data, under the key `BasisPlayerMetadata` (the name is kept so older files still read). The player reads it automatically:
 
 ```json
 {
@@ -359,7 +455,7 @@ Files from older encoders in other modes (UASTC, atlas packing, GLB containers, 
 
 ## Web Support
 
-On React Native Web, `AlphaVideoGpuView` draws with the WebGL player from [`alpha-video-gpu-web`](web). Without React Native, install that package on its own:
+On React Native Web, `AlphaVideoGpuView` draws with the WebGL player from [`alpha-video-gpu-web`](web). For other web apps, install that package on its own:
 
 ```bash
 npm install alpha-video-gpu-web
@@ -369,20 +465,55 @@ npm install alpha-video-gpu-web
 import { createAlphaVideoGpuPlayer } from 'alpha-video-gpu-web';
 
 const player = createAlphaVideoGpuPlayer(document.querySelector('canvas')!, {
-  autoPlay: true,
-  loop: true,
+  autoPlay: true,              // false waits for play()
+  loop: true,                  // false plays once, then calls onFinished
+  playbackSpeed: 1.0,
+  stream: true,                // decodes a window of frames while playing (default); false loads every frame
+  memoryStrategy: 'vram',      // frames on the GPU (default), or 'ram'; see Options
+  streamingRingSize: 16,       // stream with 'ram': GPU slots, 4 to 64
+  streamingCacheSize: 60,      // stream: frames kept decoded, 10 to 200
+  streamingPrefetchAhead: 30,  // stream: frames decoded ahead, 5 to 100
+  frameEvents: true,           // the web default; false calls onFrameUpdate only after seeks
+  verbose: false,              // true logs info traces to the browser console
   onLoad: ({ width, height, frameCount, frameRate }) => {},
-  onError: (error) => console.error(error),
+  onStateChange: (state) => {},
+  onFrameUpdate: (frame, total) => {},
+  onFinished: () => {},
+  onError: (error) => console.error(error),  // an AlphaVideoGpuError; see its `code`
 });
-player.setSource('https://example.com/animation.ktx2');
+player.setSource('https://example.com/video.ktx2', 'intro.ktx2');  // cacheKey names the IndexedDB entry
+player.setPaused(false);
 // player.play(), player.pause(), player.resume(), player.stop(), player.seekToFrame(n),
-// player.seekToTime(seconds), player.setPaused(paused), player.destroy()
+// player.seekToTime(seconds), player.destroy()
+// Changeable later: player.autoPlay, .loop, .playbackSpeed, .frameEvents, .verbose
 ```
 
 ```tsx
 import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 
-<AlphaVideoGpuPlayer src="/animation.ktx2" width={300} height={300} autoPlay loop />
+<AlphaVideoGpuPlayer
+  src="https://example.com/video.ktx2"
+  cacheKey="intro.ktx2"          // names the IndexedDB entry; default, the URL
+  width={300}
+  height={300}
+  className="video"
+  style={{ display: 'block' }}
+  autoPlay={true}
+  loop={true}
+  paused={false}
+  playbackSpeed={1.0}
+  stream={true}
+  memoryStrategy="vram"
+  streamingRingSize={16}
+  streamingCacheSize={60}
+  streamingPrefetchAhead={30}
+  verbose={false}
+  onLoad={({ frameCount }) => {}}
+  onStateChange={(state) => {}}
+  onFrameUpdate={(frame, total) => {}}
+  onFinished={() => {}}
+  onError={(error) => console.error(error)}
+/>
 ```
 
 The zstd decoder (JS and WebAssembly) is bundled inline, so no extra scripts or files need to be served. React is an optional peer dependency, needed only for `alpha-video-gpu-web/react`.
@@ -394,7 +525,7 @@ The zstd decoder (JS and WebAssembly) is bundled inline, so no extra scripts or 
 | **ASTC** | Mobile browsers, some desktop | Requires `WEBGL_compressed_texture_astc` and WebGL 2 |
 | **Zstd compression** | All | Bundled WASM decoder |
 
-ASTC needs `WEBGL_compressed_texture_astc`, which most desktop browsers on Windows and Linux lack. There is no software fallback on the web, so `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component); show something else in its place.
+ASTC needs `WEBGL_compressed_texture_astc`. There is no software fallback on the web, so `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component); show something else in its place.
 
 ---
 
@@ -408,20 +539,21 @@ The `memoryStrategy` prop controls where the main frame buffer is located. The g
 
 | Strategy | Main Buffer | Behavior | Performance |
 |----------|-------------|----------|-------------|
-| `vram` | GPU VRAM | Maximizes VRAM, minimizes RAM | **Generally preferred** - VRAM is separate from app memory, can use 2GB+ without affecting app performance |
+| `vram` (default) | GPU VRAM | Maximizes VRAM, minimizes RAM | **Generally preferred** - frames are decoded straight into GPU textures, outside the app's heap |
 | `ram` | CPU RAM | Maximizes RAM, minimizes VRAM | Use when VRAM is constrained - but note that high RAM usage (1GB+) can cause app slowdowns |
 
-The default, `auto`, uses VRAM for non-streaming playback and RAM for streaming.
+On iOS, playback without `stream` always keeps every frame in VRAM.
 
-**Recommendation:** Use `vram` mode unless you have a specific reason to minimize GPU memory usage. VRAM is allocated separately from your app's heap and doesn't contribute to memory pressure warnings.
+**Why `vram` is the default:** when streaming, it holds `streamingCacheSize` frames on the GPU and almost nothing in RAM, where `ram` holds the same frames in RAM plus a GPU ring of `streamingRingSize`. So it uses less memory in total and copies each frame once, and on Android the upload runs asynchronously through a pixel buffer. Its frames stay out of the Java heap on Android (whose limit is often 256–512 MB) and the JavaScript heap on the web. Phones share physical memory between CPU and GPU, so on iOS the textures still count toward the app's memory limit, but `vram` still uses less of it. The ring is allocated as one texture array when the source loads; a clip too large for it reports `onError`.
 
-### Non-Streaming (Default)
+### Non-Streaming
 
-All frames are loaded into memory before playback begins. Best for short-to-medium animations.
+With `stream={false}`, all frames are loaded into memory before playback begins. Best for short-to-medium videos.
 
 ```jsx
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/animation.ktx2' }}
+  source={{ uri: 'https://example.com/video.ktx2' }}
+  stream={false}
   autoPlay
   loop
 />
@@ -436,26 +568,27 @@ All frames are loaded into memory before playback begins. Best for short-to-medi
 
 ```jsx
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/animation.ktx2' }}
+  source={{ uri: 'https://example.com/video.ktx2' }}
+  stream={false}
   memoryStrategy="ram"
   autoPlay
   loop
 />
 ```
 
-### Streaming Mode
+### Streaming Mode (Default)
 
-For very long animations or memory-constrained scenarios, streaming mode decodes frames on-demand during playback using a ring buffer. Only a small window of frames is kept in memory at any time, providing **constant and predictable memory usage** regardless of animation length.
+For very long videos or memory-constrained scenarios, streaming mode decodes frames on-demand during playback using a ring buffer. Only a small window of frames is kept in memory at any time, providing **constant and predictable memory usage** regardless of video length.
 
-Streaming is used when `stream` is set, for files with KTX2-internal zstd (the encoder default) or no compression (`--zstd 0`).
+Streaming is on unless `stream` is `false`, for files with KTX2-internal zstd (the encoder default) or no compression (`--zstd 0`).
 
-The `streamMode` metadata key that older encoders wrote is ignored; only `stream` turns streaming on.
+The `streamMode` metadata key that older encoders wrote is ignored; only the `stream` prop decides.
 
 ```jsx
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/animation.ktx2' }}
+  source={{ uri: 'https://example.com/video.ktx2' }}
   stream
-  memoryStrategy="ram"
+  memoryStrategy="vram"
   streamingRingSize={16}
   streamingCacheSize={60}
   streamingPrefetchAhead={30}
@@ -466,13 +599,13 @@ The `streamMode` metadata key that older encoders wrote is ignored; only `stream
 
 | Prop | Default | Description |
 |------|---------|-------------|
-| `stream` | `false` | Stream a texture array instead of loading every frame |
-| `memoryStrategy` | `"auto"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM). `"auto"` streams in RAM mode |
+| `stream` | `true` | Stream a texture array instead of loading every frame |
+| `memoryStrategy` | `"vram"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM) |
 | `streamingRingSize` | `16` | RAM mode: GPU texture slots that frames are uploaded into (4–64). Unused in VRAM mode |
 | `streamingCacheSize` | `60` | Frames kept decoded (10–200): in CPU memory in RAM mode, and as the GPU ring's slots in VRAM mode |
 | `streamingPrefetchAhead` | `30` | Frames decoded ahead of the playback position (5–100) |
 
-#### VRAM Streaming
+#### VRAM Streaming (Default)
 
 Frames are decoded directly into a GPU texture ring buffer of `streamingCacheSize` slots. Minimal CPU RAM usage - only the ring buffer exists in VRAM.
 
@@ -496,8 +629,8 @@ Frames 80-139 cached    Frames 100-119 in GPU
 
 #### Why Streaming?
 
-Streaming enables playback of arbitrarily long animations with **fixed memory footprint**:
-- A 10,000 frame animation uses the same memory as a 100 frame animation
+Streaming enables playback of arbitrarily long videos with **fixed memory footprint**:
+- A 10,000 frame video uses the same memory as a 100 frame video
 - Memory usage is fully configurable via ring buffer and cache size props
 - Ideal for long-form content, digital signage, or memory-constrained devices
 
@@ -531,7 +664,7 @@ For maximum playback performance and massive concurrency, uncompressed ASTC stre
 ### Encoding Uncompressed ASTC
 
 ```bash
-texenc --input ./frames --output animation_uncompressed.ktx2 --fps 30 --zstd 0
+texenc --input ./frames --output video_uncompressed.ktx2 --fps 30 --zstd 0
 ```
 
 `--zstd 0` leaves the ASTC blocks uncompressed, so the player can memory-map the file and upload frames without decompressing them.
@@ -540,7 +673,7 @@ texenc --input ./frames --output animation_uncompressed.ktx2 --fps 30 --zstd 0
 
 ```jsx
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/animation_uncompressed.ktx2' }}
+  source={{ uri: 'https://example.com/video_uncompressed.ktx2' }}
   stream
   memoryStrategy="ram"
   streamingRingSize={16}
@@ -551,7 +684,7 @@ texenc --input ./frames --output animation_uncompressed.ktx2 --fps 30 --zstd 0
 
 1. **Memory-mapped file access** - The KTX2 file is mmap'd, allowing the OS to page frames in/out efficiently
 2. **Direct GPU upload** - ASTC blocks are copied directly to GPU texture memory (no Zstd decompression needed)
-3. **Ring buffer playback** - Only `streamingRingSize` frames (`streamingCacheSize` with `memoryStrategy="vram"`) are in GPU memory at once
+3. **Ring buffer playback** - Only `streamingCacheSize` frames (`streamingRingSize` with `memoryStrategy="ram"`) are in GPU memory at once
 4. **Zero CPU decode** - On real devices with ASTC hardware, CPU usage approaches zero during playback
 
 ### Trade-offs
@@ -581,18 +714,18 @@ On iOS/Android simulators (no hardware ASTC), uncompressed streaming still requi
 
 | Mode | Load Time | Memory | CPU (Playback) | Best For |
 |------|-----------|--------|----------------|----------|
-| Non-streaming VRAM | Slow (all frames) | High VRAM, minimal RAM | Near-zero | Short animations, best performance |
+| Non-streaming VRAM | Slow (all frames) | High VRAM, minimal RAM | Near-zero | Short videos, best performance |
 | Non-streaming RAM | Slow (all frames) | High RAM, minimal VRAM | Low (uploads) | VRAM-constrained devices |
-| Streaming VRAM (Zstd) | Fast (prefetch) | Low VRAM ring buffer | Medium (decode) | Long animations, fixed memory |
-| Streaming RAM (Zstd) | Fast (prefetch) | Medium RAM cache, minimal VRAM | Medium (decode) | Long animations, VRAM-constrained |
+| Streaming VRAM (Zstd) | Fast (prefetch) | Low VRAM ring buffer | Medium (decode) | Long videos, fixed memory |
+| Streaming RAM (Zstd) | Fast (prefetch) | Medium RAM cache, minimal VRAM | Medium (decode) | Long videos, VRAM-constrained |
 | Streaming Uncompressed | Fast (mmap) | Low VRAM ring buffer | Near-zero | Massive concurrency, battery-critical |
 
 Best suited for:
 - Looping UI effects (glows, shimmers, highlights)
 - Transparent overlays
 - Kiosk/always-on displays
-- Any animation where consistent frame timing matters
-- **High-concurrency scenarios** (50-100+ simultaneous animations)
+- Any video where consistent frame timing matters
+- **High-concurrency scenarios** (50-100+ simultaneous videos)
 
 Not ideal for:
 - Long-form video content
@@ -612,17 +745,17 @@ Not ideal for:
 | `paused` | `boolean` | `false` | Pause playback (and streaming decompression) |
 | `playbackSpeed` | `number` | `1.0` | Speed multiplier |
 | `cacheKey` | `string` | — | Cache identity for downloads; overrides `source.cacheKey` |
-| `memoryStrategy` | `"auto"` \| `"vram"` \| `"ram"` | `"auto"` | Where frames are kept |
-| `stream` | `boolean` | `false` | Stream a texture array with a ring buffer |
-| `streamingRingSize` | `number` | `16` | GPU texture slots for RAM-mode streaming |
-| `streamingCacheSize` | `number` | `60` | Frames kept decoded while streaming: in CPU memory in RAM mode, in the GPU ring in VRAM mode |
-| `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead |
+| `memoryStrategy` | `"vram"` \| `"ram"` | `"vram"` | Where frames are kept; see [Options](#options) |
+| `stream` | `boolean` | `true` | Stream a texture array with a ring buffer |
+| `streamingRingSize` | `number` | `16` | GPU texture slots for RAM-mode streaming (4–64) |
+| `streamingCacheSize` | `number` | `60` | Frames kept decoded while streaming (10–200): in CPU memory in RAM mode, in the GPU ring in VRAM mode |
+| `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead (5–100) |
 | `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every frame played, not only after seeks |
 | `verbose` | `boolean` | `false` | Log info traces (Logcat, Xcode console, browser console); warnings and errors always log |
 | `onLoad` | `({ nativeEvent: { width, height, frameCount, frameRate, duration } }) => void` | — | Metadata is known |
 | `onStateChange` | `({ nativeEvent: { state } }) => void` | — | `state` is `"loading"`, `"ready"`, `"playing"`, `"paused"` or `"stopped"` |
 | `onFrameUpdate` | `({ nativeEvent: { frame, totalFrames } }) => void` | — | After a seek, and for every frame with `enableFrameEvents` |
-| `onFinished` | `() => void` | — | A non-looping animation reached its last frame |
+| `onFinished` | `() => void` | — | A non-looping video reached its last frame |
 | `onError` | `({ nativeEvent: { error, code? } }) => void` | — | Loading or playback failed. `code` is set on web only: `'ASTC_UNSUPPORTED'` or `'WEBGL_UNSUPPORTED'` |
 
 The events have the same shape on Android, iOS and web. Playback is controlled with props (`paused`, `autoPlay`, a new `source`) and with the ref (see [Usage](#usage)).
@@ -656,6 +789,16 @@ A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha
 - Android: minSdkVersion 24, OpenGL ES 3.0; compileSdkVersion comes from the app (default 36)
 - iOS: iOS 13.0+, Metal
 - Web: WebGL 2 with `WEBGL_compressed_texture_astc`
+
+## Demo and related packages
+
+[alpha-video-test](https://github.com/danielkpl2/alpha-video-test) is a React Native app (Android, iOS and web) that plays the same video in each of these formats side by side, with FPS, CPU and memory readouts, so you can compare them on your own device.
+
+- [alpha-video-gpu-encoder](https://github.com/danielkpl2/alpha-video-gpu-encoder): makes the KTX2 files for this player (`texenc`).
+- [alpha-video](https://github.com/danielkpl2/alpha-video): WebM VP9 and AV1 with alpha, decoded in software by a shared C++ core or in hardware by MediaCodec on Android. The smallest files.
+- [alpha-video-ffmpegkit](https://github.com/danielkpl2/alpha-video-ffmpegkit): the first attempt at WebM alpha, on FFmpegKit, kept as a reference.
+- [react-native-apng-avif](https://github.com/danielkpl2/react-native-apng-avif): animated APNG and AVIF with alpha.
+- [alpha-glow-button](https://github.com/danielkpl2/alpha-glow-button): buttons whose glow is a transparent video.
 
 ---
 

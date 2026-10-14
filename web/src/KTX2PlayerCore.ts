@@ -145,12 +145,12 @@ export class KTX2PlayerCore {
     this._autoPlay = options.autoPlay ?? true;
     this._loop = options.loop ?? true;
     this._playbackSpeed = options.playbackSpeed ?? 1.0;
-    this._stream = options.stream ?? false;
+    this._stream = options.stream ?? true;
     // Same ranges as Android and iOS; a size of 0 would leave the ring with no slots.
     this._streamingRingSize = clampInt(options.streamingRingSize ?? 16, 4, 64);
     this._streamingCacheSize = clampInt(options.streamingCacheSize ?? 60, 10, 200);
     this._streamingPrefetchAhead = clampInt(options.streamingPrefetchAhead ?? 30, 5, 100);
-    this._memoryStrategy = options.memoryStrategy ?? 'auto';
+    this._memoryStrategy = options.memoryStrategy === 'ram' ? 'ram' : 'vram';
     this._verbose = options.verbose ?? false;
     this._ZSTDDecoderClass = options.ZSTDDecoderClass ?? null;
     this._onStateChange = options.onStateChange ?? null;
@@ -593,7 +593,7 @@ export class KTX2PlayerCore {
     gl: WebGL2RenderingContext, width: number, height: number,
     astcFormat: number, layerCount: number, vkFormat?: number
   ): void {
-    const useVram = this._memoryStrategy === 'vram';
+    const useVram = this._memoryStrategy !== 'ram';
     this._useVramStrategy = useVram;
 
     const gpuCacheSize = useVram ? this._streamingCacheSize : this._streamingRingSize;

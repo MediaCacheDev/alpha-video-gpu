@@ -39,7 +39,9 @@ export interface AlphaVideoGpuViewProps {
   streamingRingSize?: number;
   streamingCacheSize?: number;
   streamingPrefetchAhead?: number;
-  memoryStrategy?: 'auto' | 'vram' | 'ram';
+  /** Where frames are kept: 'vram' (default) or 'ram' */
+  memoryStrategy?: 'vram' | 'ram';
+  /** Stream texture-array files instead of loading every frame. Default: true */
   stream?: boolean;
   /** Send onFrameUpdate for every frame played; seeks always send it. Default: false */
   enableFrameEvents?: boolean;

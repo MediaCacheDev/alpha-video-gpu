@@ -1,6 +1,6 @@
 /**
- * - `ASTC_UNSUPPORTED`: the browser has no `WEBGL_compressed_texture_astc` (most desktop
- *   browsers on Windows and Linux). There is no software fallback on the web.
+ * - `ASTC_UNSUPPORTED`: the browser has no `WEBGL_compressed_texture_astc`. There is no
+ *   software fallback on the web.
  * - `WEBGL_UNSUPPORTED`: no WebGL2 context could be created.
  */
 export type AlphaVideoGpuErrorCode = 'ASTC_UNSUPPORTED' | 'WEBGL_UNSUPPORTED';

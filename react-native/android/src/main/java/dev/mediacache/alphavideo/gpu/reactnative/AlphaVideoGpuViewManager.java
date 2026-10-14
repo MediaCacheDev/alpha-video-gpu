@@ -109,22 +109,21 @@ public class AlphaVideoGpuViewManager extends AlphaVideoGpuViewManagerSpec<Alpha
     
     /**
      * Memory strategy for frame storage.
-     * - "auto": Default behavior (VRAM for non-stream, RAM for stream)
-     * - "vram": Store all frames in GPU VRAM. Best for many simultaneous players.
+     * - "vram" (default): Store frames in GPU VRAM. Best for many simultaneous players.
      * - "ram": Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
      */
     @ReactProp(name = "memoryStrategy")
     @Override
     public void setMemoryStrategy(AlphaVideoGpuView view, @Nullable String strategy) {
-        view.setMemoryStrategy(strategy != null ? strategy : "auto");
+        view.setMemoryStrategy(strategy != null ? strategy : "vram");
     }
     
     /**
      * Enable streaming mode for texture array playback.
-     * When true: Use streaming decompression with ring buffer (constant memory usage).
-     * When false (default): Load all frames at once.
+     * When true (default): Use streaming decompression with ring buffer (constant memory usage).
+     * When false: Load all frames at once.
      */
-    @ReactProp(name = "stream", defaultBoolean = false)
+    @ReactProp(name = "stream", defaultBoolean = true)
     @Override
     public void setStream(AlphaVideoGpuView view, boolean stream) {
         view.setStream(stream);

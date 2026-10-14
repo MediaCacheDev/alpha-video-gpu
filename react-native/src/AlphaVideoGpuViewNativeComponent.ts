@@ -76,19 +76,18 @@ export interface NativeProps extends ViewProps {
 
   /**
    * Memory strategy for frame storage.
-   * - 'auto': Default behavior (VRAM for non-stream, RAM for stream)
-   * - 'vram': Store all frames in GPU VRAM (texture array). Best for many simultaneous players.
+   * - 'vram' (default): Store frames in GPU VRAM (texture array). Best for many simultaneous players.
    * - 'ram': Store decoded frames in RAM, upload per-frame. Lower VRAM usage.
    */
-  memoryStrategy?: WithDefault<'auto' | 'vram' | 'ram', 'auto'>;
+  memoryStrategy?: WithDefault<'vram' | 'ram', 'vram'>;
 
   /**
    * Enable streaming mode for texture array playback.
-   * When true: Use streaming decompression with ring buffer (constant memory usage).
-   * When false (default): Load all frames at once.
+   * When true (default): Use streaming decompression with ring buffer (constant memory usage).
+   * When false: Load all frames at once.
    * Only applies to packingMode='array' files.
    */
-  stream?: WithDefault<boolean, false>;
+  stream?: WithDefault<boolean, true>;
 
   /** Send onFrameUpdate for every rendered frame. Default: false */
   enableFrameEvents?: WithDefault<boolean, false>;

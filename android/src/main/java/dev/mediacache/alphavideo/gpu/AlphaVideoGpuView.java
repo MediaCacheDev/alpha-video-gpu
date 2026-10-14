@@ -140,14 +140,13 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     private int configStreamingCacheSize = 60;     // CPU frame cache size (RAM)
     private int configStreamingPrefetchAhead = 30; // Frames to decode ahead of playback
     
-    // Memory strategy: "auto", "vram", "ram"
-    // - auto: VRAM for non-stream, RAM for stream (default behavior)
-    // - vram: All frames in GPU VRAM (best for many simultaneous players)
+    // Memory strategy: "vram", "ram"
+    // - vram (default): frames in GPU VRAM (best for many simultaneous players)
     // - ram: Decoded frames in RAM, upload per-frame (lower VRAM usage)
-    private String memoryStrategy = "auto";
+    private String memoryStrategy = "vram";
     
     // Stream prop - when true, use streaming decompression for texture arrays
-    private boolean streamProp = false;
+    private boolean streamProp = true;
     
     // Threading
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -371,23 +370,19 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     
     /**
      * Set memory strategy for frame storage.
-     * - "auto": Default behavior (VRAM for non-stream, RAM for stream)
-     * - "vram": All frames in GPU VRAM (best for many simultaneous players)
+     * - "vram" (default): frames in GPU VRAM (best for many simultaneous players)
      * - "ram": Decoded frames in RAM, upload per-frame (lower VRAM usage)
+     * Any other value means "vram".
      */
     public void setMemoryStrategy(String strategy) {
-        if ("vram".equals(strategy) || "ram".equals(strategy)) {
-            this.memoryStrategy = strategy;
-        } else {
-            this.memoryStrategy = "auto";
-        }
+        this.memoryStrategy = "ram".equals(strategy) ? "ram" : "vram";
         logD("setMemoryStrategy: " + this.memoryStrategy);
     }
     
     /**
      * Set streaming mode for texture array playback.
-     * When true: Use streaming decompression with ring buffer (constant memory usage).
-     * When false (default): Load all frames at once.
+     * When true (default): Use streaming decompression with ring buffer (constant memory usage).
+     * When false: Load all frames at once.
      */
     public void setStream(boolean stream) {
         this.streamProp = stream;
@@ -912,7 +907,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
               layerCount + " layers, " + bytesPerLayer + " bytes/layer (ASTC " + astcBlockWidth + "x" + astcBlockHeight + "), data offset=" + level0ByteOffset);
         
         // Determine GPU cache size based on memory strategy
-        boolean useVramStrategy = "vram".equals(memoryStrategy);
+        boolean useVramStrategy = !"ram".equals(memoryStrategy);
         boolean useAstc = astcSupported;
         int gpuCacheSize = useVramStrategy ? 
             Math.min(configStreamingCacheSize, layerCount) : 
@@ -1122,7 +1117,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         boolean useAstc = astcSupported;
         
         // Determine memory strategy
-        final boolean useVramStrategy = "vram".equals(memoryStrategy);
+        final boolean useVramStrategy = !"ram".equals(memoryStrategy);
         final int GPU_CACHE_SIZE = useVramStrategy ? configStreamingCacheSize : configStreamingRingSize;
         final int CPU_CACHE_SIZE = useVramStrategy ? 5 : configStreamingCacheSize;
         final int PREFETCH_AHEAD = configStreamingPrefetchAhead;
@@ -1853,7 +1848,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         // Check memory strategy for non-stream texture array mode
         // "ram" mode: Decode to RAM, upload per-frame (lower VRAM usage)
-        // "auto" or "vram" mode: Upload all to GPU (current behavior)
+        // "vram" mode: Upload all to GPU
         boolean useRamMode = "ram".equals(memoryStrategy);
         
         if (useRamMode) {

@@ -87,7 +87,7 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
   loop = true,
   playbackSpeed = 1.0,
   paused = false,
-  stream = false,
+  stream = true,
   streamingRingSize,
   streamingCacheSize,
   streamingPrefetchAhead,

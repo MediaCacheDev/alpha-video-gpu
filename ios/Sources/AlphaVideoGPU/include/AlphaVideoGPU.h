@@ -39,12 +39,12 @@ NS_ASSUME_NONNULL_BEGIN
 /** Calls onFrameUpdate for every frame shown. Default NO. */
 @property (nonatomic, assign) BOOL enableFrameEvents;
 
-/** Streams texture-array files through a ring of GPU slots instead of loading every frame. */
+/** Streams texture-array files through a ring of GPU slots instead of loading every frame. Default YES */
 @property (nonatomic, assign) BOOL stream;
 @property (nonatomic, assign) NSInteger streamingRingSize;      // RAM-mode streaming: GPU ring slots. Unused in VRAM mode. Default 16
 @property (nonatomic, assign) NSInteger streamingCacheSize;     // Frames kept decoded: in RAM (RAM mode) or as the GPU ring (VRAM mode). Default 60
 @property (nonatomic, assign) NSInteger streamingPrefetchAhead; // Frames decoded ahead. Default 30
-/** "auto" (the default), "vram" (every frame on the GPU) or "ram" (decoded frames in RAM). */
+/** "vram" (the default: frames on the GPU) or "ram" (decoded frames in RAM). Any other value means "vram". */
 @property (nonatomic, copy) NSString *memoryStrategy;
 /** Logs info traces. Warnings and errors always log. Default NO. */
 @property (nonatomic, assign) BOOL verbose;

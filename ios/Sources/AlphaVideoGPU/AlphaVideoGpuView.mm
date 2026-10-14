@@ -262,7 +262,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     self.streamingRingSize = 16;       // GPU ring buffer slots
     self.streamingCacheSize = 60;      // CPU frame cache size
     self.streamingPrefetchAhead = 30;  // Frames to decode ahead
-    self.memoryStrategy = @"auto";     // auto, vram, ram
+    self.memoryStrategy = @"vram";     // vram, ram
     
     // Initialize streaming state
     _streamingRingBufferMode = NO;
@@ -294,6 +294,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     
     // Default values
     self.autoPlay = YES;
+    self.stream = YES;
     
     [self setupMetal];
     [self setupVertexData];
@@ -1231,8 +1232,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
         width, height, layerCount, bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
   
   // Determine GPU cache size
-  BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
-                         [self.memoryStrategy isEqualToString:@"auto"];
+  BOOL useVramStrategy = ![self.memoryStrategy isEqualToString:@"ram"];
   NSInteger gpuCacheSize = useVramStrategy ? 
       MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
       MIN(self.streamingRingSize, (NSInteger)layerCount);
@@ -1983,8 +1983,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
   
   // Determine memory strategy
-  BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
-                         [self.memoryStrategy isEqualToString:@"auto"];
+  BOOL useVramStrategy = ![self.memoryStrategy isEqualToString:@"ram"];
   NSInteger gpuCacheSize = useVramStrategy ? 
       MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
       MIN(self.streamingRingSize, (NSInteger)layerCount);

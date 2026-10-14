@@ -1,6 +1,6 @@
 # alpha-video-gpu-web
 
-Plays transparent (alpha) animations stored as ASTC texture arrays in KTX2 files, in a `<canvas>` with WebGL 2. The browser needs `WEBGL_compressed_texture_astc`, which most mobile browsers have and most desktop browsers on Windows and Linux lack. The zstd decoder (JS and WebAssembly) is bundled inline: there are no files to host and no `<script>` tags.
+Plays transparent (alpha) animations stored as ASTC texture arrays in KTX2 files, in a `<canvas>` with WebGL 2. The browser needs `WEBGL_compressed_texture_astc`. The zstd decoder (JS and WebAssembly) is bundled inline: there are no files to host and no `<script>` tags.
 
 It is the web half of [alpha-video-gpu](https://github.com/danielkpl2/alpha-video-gpu), whose React Native component uses it on React Native Web. Encoding, streaming and the file format are described there.
 
@@ -16,7 +16,7 @@ import { createAlphaVideoGpuPlayer } from 'alpha-video-gpu-web';
 const player = createAlphaVideoGpuPlayer(document.querySelector('canvas')!, {
   autoPlay: true,
   loop: true,
-  stream: false,
+  stream: true,
   onLoad: ({ width, height, frameCount, frameRate, duration }) => {},
   onStateChange: (state) => {},
   onError: (error) => console.error(error),
@@ -55,7 +55,7 @@ Props: `src`, `cacheKey`, `width`, `height`, `className`, `style`, `autoPlay`, `
 
 `onError` gets an `Error`. The ones a page may want to handle are an `AlphaVideoGpuError` with a `code`:
 
-- `'ASTC_UNSUPPORTED'`: the browser lacks `WEBGL_compressed_texture_astc`, as most desktop browsers on Windows and Linux do. There is no software fallback, so show something else in its place.
+- `'ASTC_UNSUPPORTED'`: the browser lacks `WEBGL_compressed_texture_astc`. There is no software fallback, so show something else in its place.
 - `'WEBGL_UNSUPPORTED'`: no WebGL 2 context could be created.
 
 ```ts
