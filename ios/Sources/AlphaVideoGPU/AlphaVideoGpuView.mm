@@ -212,6 +212,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   NSMutableDictionary<NSNumber *, NSData *> *_decodedRgbaCache;
   NSInteger _uncompressedDecoderPosition;
   dispatch_queue_t _astcDecodeQueue;
+  BOOL _uncompressedDecodeQueued;  // main thread only
   
   // ASTC block dimensions (derived from vkFormat, default 4x4)
   uint32_t _astcBlockWidth;
@@ -1333,13 +1334,19 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
           }
           self->_uncompressedDecoderPosition = i + 1;
         }
+        if (self->_uncompressedDecoderPosition >= self.totalFrames) {
+          self->_uncompressedDecoderPosition = 0;
+          self->_decoderLoopIteration++;
+        }
         
         // Upload to GPU on main thread (fast - just memcpy)
         dispatch_async(dispatch_get_main_queue(), ^{
           for (NSInteger i = 0; i < framesToPreload; i++) {
             NSInteger slot = i % gpuCacheSize;
-            [self uploadDecodedFrameToGPU:i slot:slot];
-            self->_ringSlots[slot] = @(i);
+            // A seek since the decode has emptied the cache
+            if ([self uploadDecodedFrameToGPU:i slot:slot]) {
+              self->_ringSlots[slot] = @(i);
+            }
           }
           
           AVG_VLOG(@"Pre-decode complete, starting playback");
@@ -1479,19 +1486,19 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
 - (void)decodeUncompressedFramesAhead:(NSInteger)currentVirtualPos
 {
   if (!_mmapData || !_isUncompressedStreaming || _useCompressedFormat) return;
+  if (_uncompressedDecodeQueued) return;
+  _uncompressedDecodeQueued = YES;
   
   // Only needed on simulator where we decode ASTC to RGBA
   NSInteger vPosModulus = self.totalFrames * 2;
-  NSInteger currentDecodeVPos = (_decoderLoopIteration * self.totalFrames + _uncompressedDecoderPosition) % vPosModulus;
+  // Decoding past the cache would have the frames evicted before they are shown
+  NSInteger aheadLimit = MIN(self.streamingPrefetchAhead, self.streamingCacheSize);
   
-  // Calculate frames ahead
-  NSInteger framesAhead = (currentDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
-  NSInteger framesToDecode = self.streamingPrefetchAhead - framesAhead;
-  
-  if (framesToDecode <= 0) return;
-  
-  // Dispatch decode work to background queue
+  // The position belongs to the decode queue, so the batch is sized there
   dispatch_async(_astcDecodeQueue, ^{
+    NSInteger currentDecodeVPos = (self->_decoderLoopIteration * self.totalFrames + self->_uncompressedDecoderPosition) % vPosModulus;
+    NSInteger framesAhead = (currentDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
+    NSInteger framesToDecode = aheadLimit - framesAhead;
     for (NSInteger i = 0; i < framesToDecode && self->_mmapData; i++) {
       NSInteger frameIndex = self->_uncompressedDecoderPosition;
       NSInteger virtualPos = (self->_decoderLoopIteration * self.totalFrames + frameIndex) % vPosModulus;
@@ -1547,18 +1554,21 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
         self->_decoderLoopIteration++;
       }
     }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      self->_uncompressedDecodeQueued = NO;
+    });
   });
 }
 
-// Upload pre-decoded RGBA frame to GPU (fast, main thread safe)
-- (void)uploadDecodedFrameToGPU:(NSInteger)virtualPos slot:(NSInteger)slot
+// Upload pre-decoded RGBA frame to GPU (fast, main thread safe); NO when it isn't decoded
+- (BOOL)uploadDecodedFrameToGPU:(NSInteger)virtualPos slot:(NSInteger)slot
 {
   NSData *rgbaData;
   @synchronized(_decodedRgbaCache) {
     rgbaData = _decodedRgbaCache[@(virtualPos)];
   }
   
-  if (!rgbaData || !_textureArray) return;
+  if (!rgbaData || !_textureArray) return NO;
   
   MTLRegion region = MTLRegionMake2D(0, 0, self.frameWidth, self.frameHeight);
   [_textureArray replaceRegion:region
@@ -1567,6 +1577,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
                      withBytes:rgbaData.bytes
                    bytesPerRow:self.frameWidth * 4
                  bytesPerImage:self.frameWidth * self.frameHeight * 4];
+  return YES;
 }
 
 // Evict old decoded frames from cache
