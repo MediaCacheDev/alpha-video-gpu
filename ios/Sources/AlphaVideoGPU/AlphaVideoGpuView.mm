@@ -10,18 +10,11 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Weverything"
 
-// Basis Universal transcoder - must define this before including
-#define BASISU_NO_ITERATOR_DEBUG_LEVEL
-
-// Include the single-file transcoder implementation
-#include "transcoder/basisu_transcoder.cpp"
-
-// Zstandard decompression from basis_universal
 #define ZSTD_STATIC_LINKING_ONLY
 #include "zstd/zstd.h"
 #include "zstd/zstd.c"
 
-// Proper ASTC decoder for simulator fallback
+// Software ASTC decoder, for the simulator
 #include "astc_decomp.cpp"
 
 #pragma clang diagnostic pop
@@ -48,18 +41,6 @@ static BOOL AVGFileHasData(NSString *path) {
 
 static BOOL AVGIsRemote(NSString *uri) {
   return [uri hasPrefix:@"https://"] || [uri hasPrefix:@"http://"];
-}
-
-/** The URI of fileName in the same folder as uri (for multi-part files), or nil when it has no folder. */
-static NSString *AVGSiblingURI(NSString *uri, NSString *fileName) {
-  if (AVGIsRemote(uri)) {
-    return [NSURL URLWithString:fileName relativeToURL:[NSURL URLWithString:uri]].absoluteString;
-  }
-  if ([uri hasPrefix:@"asset://"] || [uri hasPrefix:@"file://"] || [uri hasPrefix:@"/"]) {
-    NSRange slash = [uri rangeOfString:@"/" options:NSBackwardsSearch];
-    return [[uri substringToIndex:slash.location + 1] stringByAppendingString:fileName];
-  }
-  return nil;
 }
 
 /** Downloads urlString into Caches unless it's already there. Blocks; call off the main thread. */
@@ -158,22 +139,10 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   return path;
 }
 
-static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
-  NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
-  NSData *head = [handle readDataOfLength:4];
-  [handle closeFile];
-  const uint8_t *b = (const uint8_t *)head.bytes;
-  return head.length == 4 && b[0] == 0x28 && b[1] == 0xB5 && b[2] == 0x2F && b[3] == 0xFD;
-}
-
 @interface AlphaVideoGpuView () <MTKViewDelegate>
 
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
-@property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
-@property (nonatomic, strong) id<MTLTexture> currentTexture;
-@property (nonatomic, strong) NSArray<id<MTLTexture>> *partTextures;
 @property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
-@property (nonatomic, strong) id<MTLBuffer> uniformBuffer;
 
 @property (nonatomic, assign) NSInteger currentFrame;
 @property (nonatomic, assign) NSInteger totalFrames;
@@ -181,10 +150,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 @property (nonatomic, assign) BOOL isPlaying;
 @property (nonatomic, assign) CFTimeInterval frameInterval;
 
-// Grid layout
-@property (nonatomic, assign) NSInteger framesPerRow;
-@property (nonatomic, assign) NSInteger framesPerPart;
-@property (nonatomic, assign) NSInteger partCount;
 @property (nonatomic, assign) NSInteger frameWidth;
 @property (nonatomic, assign) NSInteger frameHeight;
 
@@ -194,12 +159,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 @end
 
 @implementation AlphaVideoGpuView {
-  basist::transcoder_texture_format _targetFormat;
   MTLPixelFormat _metalPixelFormat;
   BOOL _useCompressedFormat;
-  std::vector<std::vector<uint8_t>> _transcodedData;
   id<MTLSamplerState> _samplerState;
-  BOOL _basisInitialized;
   NSString *_sourceUri;
   // The local file the current source resolved to (a download, a bundle file or a path)
   NSString *_localPath;
@@ -208,22 +170,10 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   // The cache key the loaded/loading source belongs to. Compared against self.cacheKey
   // to tell a re-signed URL for the same object apart from a new asset.
   NSString *_loadedCacheKey;
-  NSArray *_partsMetadata;
-  NSArray<NSNumber *> *_partWidths;
-  NSArray<NSNumber *> *_partHeights;
   BOOL _isSourceLoaded;
   BOOL _isSourceLoading;
   BOOL _isDestroyed;
   
-  BOOL _isNativeASTC;
-  NSDictionary *_cachedMetadata;
-  
-  // GLB container support
-  BOOL _isGLBContainer;
-  NSArray<NSData *> *_glbKtx2Parts;
-  
-  // Texture array support (for packingMode: 'array')
-  BOOL _useTextureArray;
   id<MTLTexture> _textureArray;
   NSInteger _textureArrayLayerCount;
   id<MTLRenderPipelineState> _arrayPipelineState;
@@ -251,7 +201,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   NSMutableData *_frameAccumulator;
   uint32_t _streamBytesPerLayer;
   uint64_t _streamLevel0Offset;
-  BOOL _streamHeaderSkipped;
   
   // Uncompressed streaming (mmap)
   int _mmapFd;
@@ -329,7 +278,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     _frameAccumulator = nil;
     _streamBytesPerLayer = 0;
     _streamLevel0Offset = 0;
-    _streamHeaderSkipped = NO;
     _mmapFd = -1;
     _mmapData = NULL;
     _mmapSize = 0;
@@ -339,12 +287,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     _astcDecodeQueue = dispatch_queue_create("dev.mediacache.alphavideo.gpu.astcdecode", DISPATCH_QUEUE_SERIAL);
     _astcBlockWidth = 4;
     _astcBlockHeight = 4;
-    
-    // Initialize Basis transcoder (only once)
-    if (!_basisInitialized) {
-      basist::basisu_transcoder_init();
-      _basisInitialized = YES;
-    }
     
     // Detect and cache optimal texture format
     [self detectAndCacheTextureFormat];
@@ -362,8 +304,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 {
   // Check if running on simulator
 #if TARGET_OS_SIMULATOR
-  AVG_VLOG(@"Running on simulator - using RGBA32 fallback");
-  _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
+  AVG_VLOG(@"Running on simulator - decoding ASTC to RGBA in software");
   _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
   _useCompressedFormat = NO;
 #else
@@ -371,8 +312,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   if (@available(iOS 8.0, *)) {
     // Check device capabilities - ASTC is supported on A8 and later
     if ([self.device supportsFamily:MTLGPUFamilyApple2]) {
-      AVG_VLOG(@"Using ASTC 4x4 format");
-      _targetFormat = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
+      AVG_VLOG(@"The GPU decodes ASTC");
       _metalPixelFormat = MTLPixelFormatASTC_4x4_LDR;
       _useCompressedFormat = YES;
       return;
@@ -380,8 +320,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   }
   
   // Fallback to RGBA32 for older devices
-  AVG_VLOG(@"Using RGBA32 fallback format");
-  _targetFormat = basist::transcoder_texture_format::cTFRGBA32;
+  AVG_VLOG(@"No GPU ASTC support - decoding ASTC to RGBA in software");
   _metalPixelFormat = MTLPixelFormatRGBA8Unorm;
   _useCompressedFormat = NO;
 #endif
@@ -589,24 +528,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
                                   "  return out;\n"
                                   "}";
   
-  // Create fragment shader (must include VertexOut struct since shaders compile separately)
-  NSString *fragmentShaderSource = @"#include <metal_stdlib>\n"
-                                    "using namespace metal;\n"
-                                    "struct VertexOut {\n"
-                                    "  float4 position [[position]];\n"
-                                    "  float2 texCoord;\n"
-                                    "};\n"
-                                    "struct Uniforms {\n"
-                                    "  float4 frameUV;\n"
-                                    "};\n"
-                                    "fragment float4 fragment_main(VertexOut in [[stage_in]],\n"
-                                    "                             texture2d<float> tex [[texture(0)]],\n"
-                                    "                             sampler s [[sampler(0)]],\n"
-                                    "                             constant Uniforms &uniforms [[buffer(0)]]) {\n"
-                                    "  float2 uv = mix(uniforms.frameUV.xy, uniforms.frameUV.zw, in.texCoord);\n"
-                                    "  return tex.sample(s, uv);\n"
-                                    "}";
-  
   AVG_VLOG(@"Compiling Metal shaders...");
   
   NSError *error = nil;
@@ -619,42 +540,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     NSLog(@"AlphaVideoGpuView: Failed to get vertex_main function!");
   }
   
-  error = nil;
-  id<MTLLibrary> fragmentLibrary = [self.device newLibraryWithSource:fragmentShaderSource options:nil error:&error];
-  if (error) {
-    NSLog(@"AlphaVideoGpuView: Fragment shader compilation error: %@", error);
-  }
-  id<MTLFunction> fragmentFunction = [fragmentLibrary newFunctionWithName:@"fragment_main"];
-  if (!fragmentFunction) {
-    NSLog(@"AlphaVideoGpuView: Failed to get fragment_main function!");
-  }
-  
-  AVG_VLOG(@"Shader compilation complete. vertex=%p, fragment=%p", vertexFunction, fragmentFunction);
-  
-  // Create pipeline
-  MTLRenderPipelineDescriptor *pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
-  pipelineDescriptor.vertexFunction = vertexFunction;
-  pipelineDescriptor.fragmentFunction = fragmentFunction;
-  pipelineDescriptor.colorAttachments[0].pixelFormat = self.colorPixelFormat;
-  // Use premultiplied alpha blending (RGB is pre-multiplied by alpha in encoder)
-  pipelineDescriptor.colorAttachments[0].blendingEnabled = YES;
-  pipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-  pipelineDescriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-  pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-  pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-  pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-  pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-  
-  error = nil;
-  self.pipelineState = [self.device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
-  
-  if (error) {
-    NSLog(@"AlphaVideoGpuView: Failed to create pipeline state: %@", error);
-  } else {
-    AVG_VLOG(@"Pipeline state created successfully: %p", self.pipelineState);
-  }
-  
-  // Create texture array shader for packingMode: 'array'
+  // Each frame is a layer of a texture array
   NSString *arrayFragmentShaderSource = @"#include <metal_stdlib>\n"
                                          "using namespace metal;\n"
                                          "struct VertexOut {\n"
@@ -706,10 +592,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 - (void)setupVertexData
 {
-  // Create uniform buffer for the frame UV rectangle
-  // Uniforms struct: float4 frameUV (16 bytes) + 9 floats (36 bytes) + 1 int (4 bytes) = 56 bytes, aligned to 64
-  self.uniformBuffer = [self.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
-  
   // Create sampler state
   MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
   samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
@@ -789,107 +671,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   return nil;
 }
 
-/**
- * Check if data is a GLB container (magic: "glTF" = 0x46546C67)
- */
-- (BOOL)isGLBData:(NSData *)data
-{
-  if (data.length < 12) return NO;
-  const uint8_t *bytes = (const uint8_t *)[data bytes];
-  return bytes[0] == 0x67 && bytes[1] == 0x6C && bytes[2] == 0x54 && bytes[3] == 0x46;
-}
-
-/**
- * Parse GLB container and extract metadata and KTX2 parts.
- * Returns metadata dictionary, populates _glbKtx2Parts array.
- */
-- (NSDictionary *)parseGLBContainer:(NSData *)data
-{
-  if (![self isGLBData:data]) return nil;
-  
-  const uint8_t *bytes = (const uint8_t *)[data bytes];
-  
-  // Read header (little-endian)
-  uint32_t version = *(uint32_t *)(bytes + 4);
-  
-  if (version != 2) {
-    NSLog(@"AlphaVideoGpuView: Unsupported GLB version: %u", version);
-    return nil;
-  }
-  
-  // Read JSON chunk (starts at byte 12)
-  uint32_t offset = 12;
-  uint32_t jsonChunkLength = *(uint32_t *)(bytes + offset);
-  offset += 4;
-  uint32_t jsonChunkType = *(uint32_t *)(bytes + offset);
-  offset += 4;
-  
-  if (jsonChunkType != 0x4E4F534A) { // "JSON"
-    AVG_VLOG(@"Expected JSON chunk, got: 0x%X", jsonChunkType);
-    return nil;
-  }
-  
-  // Parse JSON metadata
-  NSData *jsonData = [NSData dataWithBytes:(bytes + offset) length:jsonChunkLength];
-  NSError *jsonError = nil;
-  NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&jsonError];
-  if (jsonError || !metadata) {
-    NSLog(@"AlphaVideoGpuView: Failed to parse GLB JSON: %@", jsonError);
-    return nil;
-  }
-  offset += jsonChunkLength;
-  
-  // Read BIN chunk: length (not needed), then type
-  offset += 4;
-  uint32_t binChunkType = *(uint32_t *)(bytes + offset);
-  offset += 4;
-  
-  if (binChunkType != 0x004E4942) { // "BIN\0"
-    AVG_VLOG(@"Expected BIN chunk, got: 0x%X", binChunkType);
-    return nil;
-  }
-  
-  uint32_t binDataStart = offset;
-  
-  // Extract KTX2 parts from BIN chunk using ktx2Parts offsets
-  NSArray *ktx2PartsInfo = metadata[@"ktx2Parts"];
-  if (!ktx2PartsInfo || ktx2PartsInfo.count == 0) {
-    AVG_VLOG(@"No ktx2Parts found in GLB metadata");
-    return nil;
-  }
-  
-  NSMutableArray<NSData *> *parts = [NSMutableArray array];
-  for (NSDictionary *partInfo in ktx2PartsInfo) {
-    uint32_t byteOffset = [partInfo[@"byteOffset"] unsignedIntValue];
-    uint32_t byteLength = [partInfo[@"byteLength"] unsignedIntValue];
-    
-    NSData *partData = [NSData dataWithBytes:(bytes + binDataStart + byteOffset) length:byteLength];
-    [parts addObject:partData];
-  }
-  
-  _glbKtx2Parts = [parts copy];
-  _isGLBContainer = YES;
-  
-  AVG_VLOG(@"Parsed GLB container: %lu KTX2 parts", (unsigned long)_glbKtx2Parts.count);
-  
-  return metadata;
-}
-
 - (void)loadKTX2FromFile:(NSString *)path
 {
-  // Reset GLB state
-  _isGLBContainer = NO;
-  _glbKtx2Parts = nil;
-  
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    // A whole-file zstd frame (.ktx2.zst) streams; recognised by content, since a cached
-    // download is named by its cache key rather than by the URL's extension
-    if (AVGFileStartsWithZstdFrame(path)) {
-      AVG_VLOG(@"Detected streaming mode (zstd frame): %@", path);
-      [self loadStreamingKTX2FromFile:path];
-      return;
-    }
-    
     // With stream, an uncompressed texture array is mmap-streamed rather than loaded into memory
     if ([self checkAndPlayUncompressedStreaming:path]) {
       AVG_VLOG(@"Using uncompressed streaming mode");
@@ -905,280 +689,18 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
       return;
     }
     
-    NSDictionary *metadata = nil;
-    
-    // Check if this is a GLB container or KTX2 file
-    if ([self isGLBData:fileData]) {
-      AVG_VLOG(@"Detected GLB container");
-      metadata = [self parseGLBContainer:fileData];
-      if (!metadata) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-          [self notifyError:@"Failed to parse GLB container"];
-        });
-        return;
-      }
-    } else {
-      // Regular KTX2 file
-      metadata = [self extractKTX2Metadata:fileData];
-      if (!metadata) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-          [self notifyError:@"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."];
-        });
-        return;
-      }
-      AVG_VLOG(@"Using embedded KTX2 metadata");
+    NSDictionary *metadata = [self extractKTX2Metadata:fileData];
+    if (!metadata) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."];
+      });
+      return;
     }
     
     // Continue on main thread with parsed metadata
     dispatch_async(dispatch_get_main_queue(), ^{
       [self applyMetadataAndLoadTextures:metadata sourcePath:path];
     });
-  });
-}
-
-#pragma mark - Streaming Decompression
-
-- (void)loadStreamingKTX2FromFile:(NSString *)path
-{
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    // Memory-mapped, so the compressed file isn't copied into RAM
-    NSData *compressedData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
-    
-    if (!compressedData) {
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"Failed to load streaming file"];
-      });
-      return;
-    }
-    
-    AVG_VLOG(@"Streaming compressed data: %lu bytes", (unsigned long)compressedData.length);
-    
-    // Initialize streaming decompression with ZSTD_DStream
-    ZSTD_DStream *dstream = ZSTD_createDStream();
-    if (!dstream) {
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"Failed to create ZSTD_DStream"];
-      });
-      return;
-    }
-    
-    size_t initResult = ZSTD_initDStream(dstream);
-    if (ZSTD_isError(initResult)) {
-      NSLog(@"AlphaVideoGpuView: ZSTD_initDStream failed: %s", ZSTD_getErrorName(initResult));
-      ZSTD_freeDStream(dstream);
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"Failed to init ZSTD_DStream"];
-      });
-      return;
-    }
-    
-    // Setup input buffer
-    ZSTD_inBuffer input = { compressedData.bytes, compressedData.length, 0 };
-    
-    // Decompress header first (need at least 104 bytes for KTX2 header)
-    size_t outputBufferSize = ZSTD_DStreamOutSize();
-    NSMutableData *headerBuffer = [NSMutableData dataWithLength:outputBufferSize];
-    NSMutableData *decompressedHeader = [NSMutableData data];
-    
-    uint32_t width = 0, height = 0, layerCount = 0;
-    uint64_t level0Offset = 0;
-    BOOL headerParsed = NO;
-    
-    while (!headerParsed && input.pos < input.size) {
-      ZSTD_outBuffer output = { headerBuffer.mutableBytes, outputBufferSize, 0 };
-      size_t result = ZSTD_decompressStream(dstream, &output, &input);
-      
-      if (ZSTD_isError(result)) {
-        NSLog(@"AlphaVideoGpuView: Streaming decompression error: %s", ZSTD_getErrorName(result));
-        ZSTD_freeDStream(dstream);
-        dispatch_async(dispatch_get_main_queue(), ^{
-          [self notifyError:@"Streaming decompression error"];
-        });
-        return;
-      }
-      
-      if (output.pos > 0) {
-        [decompressedHeader appendBytes:headerBuffer.bytes length:output.pos];
-      }
-      
-      // Try to parse header once we have enough data
-      if (decompressedHeader.length >= 104 && !headerParsed) {
-        const uint8_t *bytes = (const uint8_t *)decompressedHeader.bytes;
-        if (bytes[0] == 0xAB && bytes[1] == 0x4B) {
-          uint32_t vkFormat = *(uint32_t *)(bytes + 12);
-          width = *(uint32_t *)(bytes + 20);
-          height = *(uint32_t *)(bytes + 24);
-          layerCount = *(uint32_t *)(bytes + 32);
-          level0Offset = *(uint64_t *)(bytes + 80);
-          headerParsed = YES;
-          
-          // Configure ASTC format from vkFormat
-          dispatch_sync(dispatch_get_main_queue(), ^{
-            [self configureASTCFormatFromVkFormat:vkFormat];
-          });
-          
-          AVG_VLOG(@"Streaming texture: %ux%u, %u layers, offset=%llu, vkFormat=%u", width, height, layerCount, level0Offset, vkFormat);
-        }
-      }
-    }
-    
-    if (!headerParsed || layerCount == 0) {
-      ZSTD_freeDStream(dstream);
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"Failed to parse KTX2 header from stream"];
-      });
-      return;
-    }
-    
-    // Continue decompressing until we have enough for metadata
-    while (decompressedHeader.length < level0Offset && input.pos < input.size) {
-      ZSTD_outBuffer output = { headerBuffer.mutableBytes, outputBufferSize, 0 };
-      size_t result = ZSTD_decompressStream(dstream, &output, &input);
-      
-      if (ZSTD_isError(result)) {
-        NSLog(@"AlphaVideoGpuView: Streaming decompression error: %s", ZSTD_getErrorName(result));
-        ZSTD_freeDStream(dstream);
-        dispatch_async(dispatch_get_main_queue(), ^{
-          [self notifyError:@"Streaming decompression error"];
-        });
-        return;
-      }
-      
-      if (output.pos > 0) {
-        [decompressedHeader appendBytes:headerBuffer.bytes length:output.pos];
-      }
-    }
-    
-    // Extract metadata from header
-    NSDictionary *metadata = [self extractKTX2Metadata:decompressedHeader];
-    if (!metadata) {
-      ZSTD_freeDStream(dstream);
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"No metadata found in streaming KTX2"];
-      });
-      return;
-    }
-    
-    // Calculate bytes per layer using current ASTC block dimensions
-    uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
-    
-    AVG_VLOG(@"Bytes per layer: %u (ASTC %ux%u), level0Offset: %llu", bytesPerLayer, self->_astcBlockWidth, self->_astcBlockHeight, level0Offset);
-    
-    // Determine memory strategy
-    BOOL useVramStrategy = [self.memoryStrategy isEqualToString:@"vram"] || 
-                           ([self.memoryStrategy isEqualToString:@"auto"]);
-    NSInteger gpuCacheSize = useVramStrategy ? 
-        MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
-        MIN(self.streamingRingSize, (NSInteger)layerCount);
-    
-    AVG_VLOG(@"Streaming params: strategy=%@, gpuCache=%ld, vramMode=%d", 
-          self.memoryStrategy, (long)gpuCacheSize, useVramStrategy);
-    
-    // Setup on main thread
-    __block id<MTLTexture> textureArray = nil;
-    __block BOOL setupComplete = NO;
-    
-    dispatch_sync(dispatch_get_main_queue(), ^{
-      // Apply metadata
-      self.totalFrames = layerCount;
-      self.framesPerRow = 1;
-      self.framesPerPart = layerCount;
-      self.partCount = 1;
-      self.frameWidth = width;
-      self.frameHeight = height;
-      self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
-      self.frameInterval = 1.0 / self.frameRate;
-      
-      self->_useTextureArray = YES;
-      self->_textureArrayLayerCount = layerCount;
-      self->_streamingRingBufferMode = YES;
-      self->_streamingRingBufferSize = gpuCacheSize;
-      self->_useVramStrategy = useVramStrategy;
-      
-      // Initialize ring buffer tracking
-      self->_ringSlots = [NSMutableArray arrayWithCapacity:gpuCacheSize];
-      for (NSInteger i = 0; i < gpuCacheSize; i++) {
-        [self->_ringSlots addObject:@(-1)];
-      }
-      self->_frameCache = [NSMutableDictionary dictionary];
-      self->_decoderPosition = 0;
-      self->_decoderLoopIteration = 0;
-      self->_playbackLoopIteration = 0;
-      
-      // Store streaming state for on-demand decoding
-      self->_compressedData = compressedData;
-      self->_compressedDataPos = input.pos;
-      self->_dstream = dstream;
-      self->_frameAccumulator = [NSMutableData data];
-      self->_streamBytesPerLayer = bytesPerLayer;
-      self->_streamLevel0Offset = level0Offset;
-      self->_streamHeaderSkipped = NO;
-      
-      // Copy any data we already have past the header
-      if (decompressedHeader.length > level0Offset) {
-        [self->_frameAccumulator appendBytes:((const uint8_t *)decompressedHeader.bytes + level0Offset) 
-                                      length:decompressedHeader.length - level0Offset];
-        self->_streamHeaderSkipped = YES;
-      }
-      
-      // Create texture array with ring buffer size (not full layer count!)
-      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
-                                                                                           width:width
-                                                                                          height:height
-                                                                                       mipmapped:NO];
-      descriptor.textureType = MTLTextureType2DArray;
-      descriptor.arrayLength = gpuCacheSize;  // Ring buffer size, not total frames!
-      descriptor.usage = MTLTextureUsageShaderRead;
-      
-      self->_textureArray = [self.device newTextureWithDescriptor:descriptor];
-      textureArray = self->_textureArray;
-      
-      if (!textureArray) {
-        [self notifyError:@"Failed to create texture array"];
-        return;
-      }
-      
-      // Initialize staging buffers for async blit uploads (double-buffered)
-      if (self->_useCompressedFormat) {
-        self->_stagingBuffers[0] = [self.device newBufferWithLength:self->_streamBytesPerLayer
-                                                            options:MTLResourceStorageModeShared];
-        self->_stagingBuffers[1] = [self.device newBufferWithLength:self->_streamBytesPerLayer
-                                                            options:MTLResourceStorageModeShared];
-        self->_currentStagingBuffer = 0;
-        if (!self->_blitCommandQueue) {
-          self->_blitCommandQueue = [self.device newCommandQueue];
-        }
-        AVG_VLOG(@"Created staging buffers for async blit: %u bytes each", self->_streamBytesPerLayer);
-      }
-      
-      AVG_VLOG(@"Created streaming texture array: %ux%u, %ld GPU slots (ring buffer)", 
-            width, height, (long)gpuCacheSize);
-      
-      // Pre-decode initial frames so we have something to display
-      // This is needed because decodeFramesAhead is only called during playback
-      NSInteger initialVPos = 0;
-      [self decodeFramesAhead:initialVPos];
-      
-      self->_isSourceLoaded = YES;
-      self->_isSourceLoading = NO;
-      [self notifyLoad];
-      [self notifyStateChange:@"ready"];
-      
-      if (self.autoPlay && !self.playbackPaused) {
-        [self play];
-      }
-      
-      setupComplete = YES;
-    });
-    
-    if (!setupComplete || !textureArray) {
-      // Don't free dstream here - it's now owned by the instance for on-demand decoding
-      return;
-    }
-    
-    // Note: We no longer decode all frames upfront!
-    // Frames are decoded on-demand during playback via decodeFramesAhead:
-    AVG_VLOG(@"Streaming setup complete - frames will be decoded on-demand during playback");
   });
 }
 
@@ -1239,7 +761,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
       input.pos = 0;
       _compressedDataPos = 0;
       [_frameAccumulator setLength:0];
-      _streamHeaderSkipped = NO;
       
       AVG_VLOG(@"Decoder wrap-around: loop %ld, resetting input.pos from %zu to 0", 
             (long)_decoderLoopIteration, input.pos);
@@ -1257,11 +778,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
             (long)newDecodeVPos, (long)newFramesAhead, (long)framesToDecode, input.size);
       // Don't continue - fall through to decompress the header and first frames
       // The continue was causing us to skip decompression after wrap-around
-    }
-    
-    // Skip header bytes if needed
-    if (![self skipStreamHeader:&input buffer:decompressBuffer]) {
-      break;  // Not enough data yet
     }
     
     // Decompress until we have a full frame
@@ -1363,49 +879,28 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   _compressedDataPos = input.pos;
 }
 
-/** Decompresses past the KTX2 header of a whole-file zstd stream; NO if the input ran out first. */
-- (BOOL)skipStreamHeader:(ZSTD_inBuffer *)input buffer:(NSMutableData *)decompressBuffer
-{
-  if (_streamHeaderSkipped) return YES;
-  while (_frameAccumulator.length < _streamLevel0Offset && input->pos < input->size) {
-    ZSTD_outBuffer output = { decompressBuffer.mutableBytes, decompressBuffer.length, 0 };
-    size_t result = ZSTD_decompressStream(_dstream, &output, input);
-    if (ZSTD_isError(result)) break;
-    if (output.pos > 0) {
-      [_frameAccumulator appendBytes:decompressBuffer.bytes length:output.pos];
-    }
-  }
-  if (_frameAccumulator.length < _streamLevel0Offset) return NO;
-  // Remove header data, keep frame data
-  [_frameAccumulator replaceBytesInRange:NSMakeRange(0, _streamLevel0Offset) withBytes:NULL length:0];
-  _streamHeaderSkipped = YES;
-  return YES;
-}
-
 /** Decompresses and drops the next bytes of frame data, for a seek. */
 - (void)skipDecodedBytes:(uint64_t)bytes
 {
   NSMutableData *decompressBuffer = [NSMutableData dataWithLength:ZSTD_DStreamOutSize()];
   ZSTD_inBuffer input = { _compressedData.bytes, _compressedData.length, _compressedDataPos };
-  if ([self skipStreamHeader:&input buffer:decompressBuffer]) {
-    uint64_t held = MIN((uint64_t)_frameAccumulator.length, bytes);
-    [_frameAccumulator replaceBytesInRange:NSMakeRange(0, (NSUInteger)held) withBytes:NULL length:0];
-    bytes -= held;
-    while (bytes > 0) {
-      ZSTD_outBuffer output = { decompressBuffer.mutableBytes, decompressBuffer.length, 0 };
-      size_t result = ZSTD_decompressStream(_dstream, &output, &input);
-      if (ZSTD_isError(result)) {
-        NSLog(@"AlphaVideoGpuView: Decompression error while seeking: %s", ZSTD_getErrorName(result));
-        break;
-      }
-      if (output.pos > bytes) {
-        [_frameAccumulator appendBytes:(const uint8_t *)decompressBuffer.bytes + bytes length:output.pos - (size_t)bytes];
-        bytes = 0;
-      } else {
-        bytes -= output.pos;
-      }
-      if (result == 0 || (output.pos == 0 && input.pos >= input.size)) break;
+  uint64_t held = MIN((uint64_t)_frameAccumulator.length, bytes);
+  [_frameAccumulator replaceBytesInRange:NSMakeRange(0, (NSUInteger)held) withBytes:NULL length:0];
+  bytes -= held;
+  while (bytes > 0) {
+    ZSTD_outBuffer output = { decompressBuffer.mutableBytes, decompressBuffer.length, 0 };
+    size_t result = ZSTD_decompressStream(_dstream, &output, &input);
+    if (ZSTD_isError(result)) {
+      NSLog(@"AlphaVideoGpuView: Decompression error while seeking: %s", ZSTD_getErrorName(result));
+      break;
     }
+    if (output.pos > bytes) {
+      [_frameAccumulator appendBytes:(const uint8_t *)decompressBuffer.bytes + bytes length:output.pos - (size_t)bytes];
+      bytes = 0;
+    } else {
+      bytes -= output.pos;
+    }
+    if (result == 0 || (output.pos == 0 && input.pos >= input.size)) break;
   }
   _compressedDataPos = input.pos;
 }
@@ -1436,7 +931,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
       ZSTD_initDStream(_dstream);
       _compressedDataPos = 0;
       [_frameAccumulator setLength:0];
-      _streamHeaderSkipped = NO;
       [self skipDecodedBytes:(uint64_t)target * _streamBytesPerLayer];
     }
     _decoderPosition = target;
@@ -1745,15 +1239,11 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   // Setup on main thread
   dispatch_sync(dispatch_get_main_queue(), ^{
     self.totalFrames = layerCount;
-    self.framesPerRow = 1;
-    self.framesPerPart = layerCount;
-    self.partCount = 1;
     self.frameWidth = width;
     self.frameHeight = height;
     self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
     self.frameInterval = 1.0 / self.frameRate;
     
-    self->_useTextureArray = YES;
     self->_textureArrayLayerCount = layerCount;
     self->_streamingRingBufferMode = YES;
     self->_streamingRingBufferSize = gpuCacheSize;
@@ -2106,37 +1596,25 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 - (void)applyMetadataAndLoadTextures:(NSDictionary *)metadata sourcePath:(NSString *)sourcePath
 {
+  NSString *mode = metadata[@"mode"];
+  NSString *packingMode = metadata[@"packingMode"];
+  if (![mode isEqual:@"astc"] || ![packingMode isEqual:@"array"]) {
+    [self notifyError:[NSString stringWithFormat:@"Only ASTC texture arrays play (this file is mode '%@', packing '%@'); encode it with texenc",
+                       mode ?: @"", packingMode ?: @""]];
+    return;
+  }
   
-  // Parse metadata (support both new 'part' and legacy 'strip' terminology)
   self.totalFrames = [metadata[@"frameCount"] integerValue];
-  self.framesPerRow = [metadata[@"framesPerRow"] integerValue] ?: 1;
-  self.framesPerPart = [metadata[@"framesPerPart"] integerValue] ?: [metadata[@"framesPerStrip"] integerValue] ?: self.totalFrames;
-  self.partCount = [metadata[@"partCount"] integerValue] ?: [metadata[@"stripCount"] integerValue] ?: 1;
   self.frameWidth = [metadata[@"frameWidth"] integerValue];
   self.frameHeight = [metadata[@"frameHeight"] integerValue];
   self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
   self.frameInterval = 1.0 / self.frameRate;
-  _partsMetadata = metadata[@"parts"] ?: metadata[@"strips"];
-  
-  // Check if this is native ASTC mode
-  NSString *mode = metadata[@"mode"];
-  BOOL isNativeASTC = [mode isEqualToString:@"astc"];
-  
-  // Check for texture array packing mode
-  NSString *packingMode = metadata[@"packingMode"];
-  _useTextureArray = [packingMode isEqualToString:@"array"];
   _textureArrayLayerCount = [metadata[@"layerCount"] integerValue] ?: self.totalFrames;
   
-  AVG_VLOG(@"Metadata: %ld frames, %ldx%ld, %.1f fps, %ld parts, mode=%@, packing=%@",
-        (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight,
-        self.frameRate, (long)self.partCount, mode ?: @"uastc", packingMode ?: @"atlas");
+  AVG_VLOG(@"Metadata: %ld frames, %ldx%ld, %.1f fps",
+        (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight, self.frameRate);
   
-  // Load textures based on packing mode
-  if (_useTextureArray) {
-    [self loadTextureArray:metadata sourcePath:sourcePath isNativeASTC:isNativeASTC];
-  } else {
-    [self loadPartTextures:metadata sourcePath:sourcePath isNativeASTC:isNativeASTC];
-  }
+  [self loadTextureArray:metadata sourcePath:sourcePath];
 }
 
 /**
@@ -2196,179 +1674,14 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   return rgbaData;
 }
 
-/**
- * Load native ASTC data directly from KTX2 file without transcoding.
- * Handles Zstandard decompression if needed.
- */
-- (NSData *)loadNativeASTCFromKTX2:(NSData *)ktx2Data width:(uint32_t *)outWidth height:(uint32_t *)outHeight
-{
-  if (ktx2Data.length < 80) return nil;
-  
-  const uint8_t *bytes = (const uint8_t *)[ktx2Data bytes];
-  
-  // Parse KTX2 header (little-endian)
-  uint32_t vkFormat = *(uint32_t *)(bytes + 12);
-  uint32_t pixelWidth = *(uint32_t *)(bytes + 20);
-  uint32_t pixelHeight = *(uint32_t *)(bytes + 24);
-  uint32_t supercompressionScheme = *(uint32_t *)(bytes + 44);
-  
-  *outWidth = pixelWidth;
-  *outHeight = pixelHeight;
-  
-  AVG_VLOG(@"Native ASTC - VkFormat=%u, %ux%u, supercompression=%u",
-        vkFormat, pixelWidth, pixelHeight, supercompressionScheme);
-  
-  // Configure ASTC format from vkFormat (sets _metalPixelFormat, _astcBlockWidth, _astcBlockHeight)
-  [self configureASTCFormatFromVkFormat:vkFormat];
-  
-  // Read level index (after 80-byte header)
-  // Level index: array of { byteOffset: uint64, byteLength: uint64, uncompressedByteLength: uint64 }
-  uint64_t level0ByteOffset = *(uint64_t *)(bytes + 80);
-  uint64_t level0ByteLength = *(uint64_t *)(bytes + 88);
-  uint64_t level0UncompressedLength = *(uint64_t *)(bytes + 96);
-  
-  AVG_VLOG(@"Level 0 - offset=%llu, length=%llu, uncompressed=%llu",
-        level0ByteOffset, level0ByteLength, level0UncompressedLength);
-  
-  if (level0ByteOffset + level0ByteLength > ktx2Data.length) {
-    NSLog(@"AlphaVideoGpuView: Invalid level data bounds");
-    return nil;
-  }
-  
-  NSData *textureData = nil;
-  
-  if (supercompressionScheme == 2) {
-    // Zstandard compression - use basis_universal's bundled zstd
-    AVG_VLOG(@"Decompressing Zstandard data...");
-    
-    const uint8_t *compressedData = bytes + level0ByteOffset;
-    size_t compressedSize = (size_t)level0ByteLength;
-    size_t uncompressedSize = (size_t)level0UncompressedLength;
-    
-    NSMutableData *decompressedData = [NSMutableData dataWithLength:uncompressedSize];
-    
-    size_t decodedSize = ZSTD_decompress(
-      (uint8_t *)[decompressedData mutableBytes],
-      uncompressedSize,
-      compressedData,
-      compressedSize
-    );
-    
-    if (ZSTD_isError(decodedSize)) {
-      NSLog(@"AlphaVideoGpuView: Zstd decompression failed: %s", ZSTD_getErrorName(decodedSize));
-      return nil;
-    }
-    
-    if (decodedSize != uncompressedSize) {
-      NSLog(@"AlphaVideoGpuView: Zstd decompression size mismatch: expected %zu, got %zu", uncompressedSize, decodedSize);
-      return nil;
-    }
-    
-    textureData = decompressedData;
-    AVG_VLOG(@"Decompressed %zu bytes", decodedSize);
-  } else if (supercompressionScheme == 0) {
-    // No supercompression
-    textureData = [NSData dataWithBytes:(bytes + level0ByteOffset) length:(size_t)level0ByteLength];
-  } else {
-    NSLog(@"AlphaVideoGpuView: Unsupported supercompression scheme: %u", supercompressionScheme);
-    return nil;
-  }
-  
-  return textureData;
-}
-
-/**
- * Transcode UASTC KTX2 data using Basis Universal transcoder.
- * Returns transcoded texture data ready for GPU upload.
- */
-- (NSData *)transcodeKTX2:(NSData *)ktx2Data width:(uint32_t *)outWidth height:(uint32_t *)outHeight
-{
-  basist::ktx2_transcoder transcoder;
-  if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
-    NSLog(@"AlphaVideoGpuView: Failed to init KTX2 transcoder");
-    return nil;
-  }
-  
-  if (!transcoder.start_transcoding()) {
-    NSLog(@"AlphaVideoGpuView: Failed to start transcoding");
-    return nil;
-  }
-  
-  uint32_t width = transcoder.get_width();
-  uint32_t height = transcoder.get_height();
-  *outWidth = width;
-  *outHeight = height;
-  
-  // Calculate transcoded data size
-  // Note: Basis Universal transcoding always targets ASTC 4x4
-  uint32_t dataSize;
-  if (_useCompressedFormat) {
-    uint32_t blocksX = (width + 3) / 4;  // Always 4x4 for Basis transcoding
-    uint32_t blocksY = (height + 3) / 4;
-    dataSize = blocksX * blocksY * 16;
-  } else {
-    dataSize = width * height * 4;
-  }
-  
-  // Allocate and transcode
-  NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
-  if (!transcoder.transcode_image_level(0, 0, 0, (uint8_t*)[transcodedData mutableBytes], dataSize, _targetFormat, 0)) {
-    NSLog(@"AlphaVideoGpuView: Failed to transcode image");
-    return nil;
-  }
-  
-  AVG_VLOG(@"Transcoded UASTC %ux%u (%u bytes)", width, height, dataSize);
-  return transcodedData;
-}
-
-/**
- * The URI of a part file: from the parts prop, else the file the metadata names (or
- * <name>_<index>.ktx2) in the source's folder. Nil when the source has no folder.
- */
-- (NSString *)partURIAtIndex:(NSInteger)partIndex partsArray:(NSArray *)partsArray useExplicitParts:(BOOL)useExplicitParts
-{
-  if (useExplicitParts && partIndex < (NSInteger)self.partURIs.count) {
-    return self.partURIs[partIndex];
-  }
-  NSString *fileName = partIndex < (NSInteger)partsArray.count ? partsArray[partIndex][@"file"] : nil;
-  if (!fileName) {
-    NSString *name = [[_sourceUri componentsSeparatedByString:@"?"].firstObject lastPathComponent];
-    name = [name stringByReplacingOccurrencesOfString:@"_0.ktx2" withString:@""];
-    name = [name stringByReplacingOccurrencesOfString:@".ktx2" withString:@""];
-    fileName = [NSString stringWithFormat:@"%@_%ld.ktx2", name, (long)partIndex];
-  }
-  return AVGSiblingURI(_sourceUri, fileName);
-}
-
-/**
- * The cache key for a downloaded part: its own key from the parts prop, else the source's key
- * with the index before the extension (glow.ktx2 becomes glow_1.ktx2).
- */
-- (NSString *)partCacheKeyAtIndex:(NSInteger)partIndex useExplicitParts:(BOOL)useExplicitParts
-{
-  if (useExplicitParts && partIndex < (NSInteger)self.partCacheKeys.count) {
-    NSString *key = self.partCacheKeys[partIndex];
-    if ([key isKindOfClass:[NSString class]] && key.length > 0) return key;
-  }
-  NSString *key = _loadedCacheKey;
-  if (key.length == 0) return nil;
-  NSString *ext = key.pathExtension;
-  NSString *base = ext.length > 0 ? key.stringByDeletingPathExtension : key;
-  NSString *indexed = [NSString stringWithFormat:@"%@_%ld", base, (long)partIndex];
-  return ext.length > 0 ? [indexed stringByAppendingPathExtension:ext] : indexed;
-}
-
 #pragma mark - Texture Array Loading
 
 /**
  * Load a KTX2 texture array (one frame per layer).
  * Uses Metal's MTLTextureType2DArray for efficient frame switching.
  */
-- (void)loadTextureArray:(NSDictionary *)metadata sourcePath:(NSString *)filePath isNativeASTC:(BOOL)isNativeASTC
+- (void)loadTextureArray:(NSDictionary *)metadata sourcePath:(NSString *)filePath
 {
-  _cachedMetadata = metadata;
-  _isNativeASTC = isNativeASTC;
-  
   // Check for streaming mode from stream prop (not metadata)
   BOOL streamMode = self.stream;
   
@@ -2581,8 +1894,8 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 
 /**
  * Load a KTX2 texture array with internal zstd compression using streaming decompression.
- * This is similar to loadStreamingKTX2FromFile but for internal zstd (supercompressionScheme=2)
- * where the KTX2 header is uncompressed and only level0 data is zstd compressed.
+ * The KTX2 header is uncompressed and only the level0 data is zstd compressed
+ * (supercompressionScheme=2), so the layers are decompressed as they play.
  */
 - (void)loadInternalZstdStreamingTextureArray:(NSString *)filePath
                                         width:(uint32_t)width
@@ -2675,15 +1988,11 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   dispatch_sync(dispatch_get_main_queue(), ^{
     // Apply metadata
     self.totalFrames = layerCount;
-    self.framesPerRow = 1;
-    self.framesPerPart = layerCount;
-    self.partCount = 1;
     self.frameWidth = width;
     self.frameHeight = height;
     self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
     self.frameInterval = 1.0 / self.frameRate;
     
-    self->_useTextureArray = YES;
     self->_textureArrayLayerCount = layerCount;
     self->_streamingRingBufferMode = YES;
     self->_streamingRingBufferSize = gpuCacheSize;
@@ -2699,7 +2008,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     self->_decoderLoopIteration = 0;
     self->_playbackLoopIteration = 0;
     
-    // Store streaming state - internal zstd doesn't need header skip
     self->_dstream = dstream;
     self->_compressedData = [NSData dataWithBytesNoCopy:(void *)compressedDataPtr 
                                                  length:level0Length 
@@ -2707,8 +2015,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     self->_compressedDataPos = 0;
     self->_frameAccumulator = [NSMutableData data];
     self->_streamBytesPerLayer = bytesPerLayer;
-    self->_streamLevel0Offset = 0;  // No header to skip - we start at level0 data directly
-    self->_streamHeaderSkipped = YES;  // Header already skipped
+    self->_streamLevel0Offset = 0;  // _compressedData starts at the level0 data
     
     // Store mmap info for cleanup and loop restart
     self->_mmapFd = fd;
@@ -2750,272 +2057,9 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
   AVG_VLOG(@"Internal zstd streaming setup complete");
 }
 
-- (void)loadPartTextures:(NSDictionary *)metadata sourcePath:(NSString *)sourcePath isNativeASTC:(BOOL)isNativeASTC
-{
-  _cachedMetadata = metadata;
-  _isNativeASTC = isNativeASTC;
-  
-  // Perform loading and transcoding on background thread to avoid blocking main thread
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    NSMutableArray<NSDictionary *> *loadedParts = [NSMutableArray array];
-    NSArray *partsArray = metadata[@"parts"] ?: metadata[@"strips"];
-    
-    // Check if we're loading from GLB container
-    if (self->_isGLBContainer && self->_glbKtx2Parts && self->_glbKtx2Parts.count > 0) {
-      AVG_VLOG(@"Loading %lu KTX2 parts from GLB container...", (unsigned long)self->_glbKtx2Parts.count);
-      
-      for (NSInteger i = 0; i < (NSInteger)self->_glbKtx2Parts.count; i++) {
-        NSData *ktx2Data = self->_glbKtx2Parts[i];
-        AVG_VLOG(@"GLB part %ld size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
-        
-        uint32_t width = 0, height = 0;
-        NSData *textureData = nil;
-        uint32_t blocksX = 0, blocksY = 0;
-        
-        if (isNativeASTC) {
-          AVG_VLOG(@"Using native ASTC loader for GLB part %ld", (long)i);
-          textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
-          
-          if (!textureData) {
-            NSLog(@"AlphaVideoGpuView: Failed to load native ASTC for GLB part %ld", (long)i);
-            continue;
-          }
-          
-          blocksX = (width + self->_astcBlockWidth - 1) / self->_astcBlockWidth;
-          blocksY = (height + self->_astcBlockHeight - 1) / self->_astcBlockHeight;
-          
-          if (!self->_useCompressedFormat) {
-            AVG_VLOG(@"ASTC not supported - decoding to RGBA");
-            textureData = [self decodeASTCToRGBA:textureData width:width height:height];
-            if (!textureData) {
-              NSLog(@"AlphaVideoGpuView: Failed to decode ASTC to RGBA for GLB part %ld", (long)i);
-              continue;
-            }
-          }
-        } else {
-          basist::ktx2_transcoder transcoder;
-          if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
-            NSLog(@"AlphaVideoGpuView: Failed to init KTX2 transcoder for GLB part %ld", (long)i);
-            continue;
-          }
-          
-          if (!transcoder.start_transcoding()) {
-            NSLog(@"AlphaVideoGpuView: Failed to start transcoding for GLB part %ld", (long)i);
-            continue;
-          }
-          
-          width = transcoder.get_width();
-          height = transcoder.get_height();
-          
-          uint32_t dataSize;
-          if (self->_useCompressedFormat) {
-            blocksX = (width + 3) / 4;  // Always 4x4 for Basis transcoding
-            blocksY = (height + 3) / 4;
-            dataSize = blocksX * blocksY * 16;
-          } else {
-            dataSize = width * height * 4;
-          }
-          
-          NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
-          if (!transcoder.transcode_image_level(0, 0, 0, (void *)[transcodedData mutableBytes], dataSize / (self->_useCompressedFormat ? 16 : 4), self->_targetFormat)) {
-            NSLog(@"AlphaVideoGpuView: Failed to transcode GLB part %ld", (long)i);
-            continue;
-          }
-          
-          textureData = transcodedData;
-        }
-        
-        [loadedParts addObject:@{
-          @"data": textureData,
-          @"width": @(width),
-          @"height": @(height),
-          @"blocksX": @(blocksX),
-          @"blocksY": @(blocksY)
-        }];
-        
-        AVG_VLOG(@"Loaded GLB part %ld: %ux%u", (long)i, width, height);
-      }
-    } else {
-      // Load from separate files (original behavior)
-      BOOL useExplicitParts = self.partURIs.count > 1;
-      NSInteger actualPartCount = useExplicitParts ? self.partURIs.count : self.partCount;
-      
-      for (NSInteger i = 0; i < actualPartCount; i++) {
-        // A single-file atlas is its own part 0
-        NSString *partUri = actualPartCount > 1
-            ? [self partURIAtIndex:i partsArray:partsArray useExplicitParts:useExplicitParts]
-            : self->_sourceUri;
-        NSString *partPath = nil;
-        NSString *resolveError = nil;
-        if (!partUri) {
-          resolveError = @"no folder to find it in; pass the parts prop";
-        } else if ([partUri isEqualToString:self->_sourceUri]) {
-          partPath = sourcePath;
-        } else {
-          partPath = AVGResolveSource(partUri, [self partCacheKeyAtIndex:i useExplicitParts:useExplicitParts], &resolveError);
-        }
-        
-        AVG_VLOG(@"Loading part %ld: %@%@", (long)i, partUri, useExplicitParts ? @" (explicit)" : @"");
-        
-        NSData *ktx2Data = partPath ? [NSData dataWithContentsOfFile:partPath] : nil;
-        if (resolveError) {
-          NSLog(@"AlphaVideoGpuView: Can't load part %ld (%@): %@", (long)i, partUri, resolveError);
-        }
-        
-        if (!ktx2Data) {
-          NSLog(@"AlphaVideoGpuView: Failed to load part file: %@", partPath);
-          continue;
-        }
-        
-        AVG_VLOG(@"Part %ld file size: %lu bytes", (long)i, (unsigned long)ktx2Data.length);
-        
-        uint32_t width = 0, height = 0;
-        NSData *textureData = nil;
-        uint32_t blocksX = 0, blocksY = 0;
-        
-        if (isNativeASTC) {
-          // Native ASTC mode - load directly without transcoding
-          AVG_VLOG(@"Using native ASTC loader for part %ld", (long)i);
-          textureData = [self loadNativeASTCFromKTX2:ktx2Data width:&width height:&height];
-          
-          if (!textureData) {
-            NSLog(@"AlphaVideoGpuView: Failed to load native ASTC for part %ld", (long)i);
-            continue;
-          }
-          
-          blocksX = (width + self->_astcBlockWidth - 1) / self->_astcBlockWidth;
-          blocksY = (height + self->_astcBlockHeight - 1) / self->_astcBlockHeight;
-          
-          // Check if we need to decode ASTC to RGBA (simulator or unsupported device)
-          if (!self->_useCompressedFormat) {
-            AVG_VLOG(@"ASTC not supported - decoding to RGBA (simulator/fallback mode)");
-            AVG_VLOG(@"Note: ASTC textures require a real device for optimal performance");
-            textureData = [self decodeASTCToRGBA:textureData width:width height:height];
-            if (!textureData) {
-              NSLog(@"AlphaVideoGpuView: Failed to decode ASTC to RGBA for part %ld", (long)i);
-              continue;
-            }
-          }
-        } else {
-          // UASTC mode - transcode using Basis Universal
-          basist::ktx2_transcoder transcoder;
-          if (!transcoder.init((const uint8_t*)[ktx2Data bytes], (uint32_t)[ktx2Data length])) {
-            NSLog(@"AlphaVideoGpuView: Failed to init KTX2 transcoder for part %ld", (long)i);
-            continue;
-          }
-          
-          if (!transcoder.start_transcoding()) {
-            NSLog(@"AlphaVideoGpuView: Failed to start transcoding for part %ld", (long)i);
-            continue;
-          }
-          
-          width = transcoder.get_width();
-          height = transcoder.get_height();
-          AVG_VLOG(@"Part %ld dimensions: %dx%d", (long)i, width, height);
-          
-          // Calculate transcoded data size
-          uint32_t dataSize;
-          
-          if (self->_useCompressedFormat) {
-            blocksX = (width + 3) / 4;  // Always 4x4 for Basis transcoding
-            blocksY = (height + 3) / 4;
-            dataSize = blocksX * blocksY * 16;
-          } else {
-            dataSize = width * height * 4;
-          }
-          
-          // Allocate and transcode
-          NSMutableData *transcodedData = [NSMutableData dataWithLength:dataSize];
-          if (!transcoder.transcode_image_level(0, 0, 0, (uint8_t*)[transcodedData mutableBytes], dataSize, self->_targetFormat, 0)) {
-            NSLog(@"AlphaVideoGpuView: Failed to transcode part %ld", (long)i);
-            continue;
-          }
-          
-          textureData = transcodedData;
-        }
-        
-        // Store part info for main thread
-        [loadedParts addObject:@{
-          @"data": textureData,
-          @"width": @(width),
-          @"height": @(height),
-          @"blocksX": @(blocksX),
-          @"blocksY": @(blocksY),
-          @"isNativeASTC": @(isNativeASTC)
-        }];
-        
-        AVG_VLOG(@"%@ part %ld successfully", isNativeASTC ? @"Loaded native ASTC" : @"Transcoded", (long)i);
-      }
-    }
-    
-    // Dispatch to main thread for Metal texture creation and UI updates
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (self->_isDestroyed) {
-        AVG_VLOG(@"View destroyed during loading, aborting");
-        return;
-      }
-      
-      NSMutableArray *textures = [NSMutableArray array];
-      NSMutableArray *partWidths = [NSMutableArray array];
-      NSMutableArray *partHeights = [NSMutableArray array];
-      self->_transcodedData.clear();
-      
-      for (NSDictionary *partInfo in loadedParts) {
-        NSData *data = partInfo[@"data"];
-        uint32_t width = [partInfo[@"width"] unsignedIntValue];
-        uint32_t height = [partInfo[@"height"] unsignedIntValue];
-        uint32_t blocksX = [partInfo[@"blocksX"] unsignedIntValue];
-        
-        // Create Metal texture
-        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
-                                                                                             width:width
-                                                                                            height:height
-                                                                                         mipmapped:NO];
-        descriptor.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> texture = [self.device newTextureWithDescriptor:descriptor];
-        
-        NSUInteger bytesPerRow = self->_useCompressedFormat ? (blocksX * 16) : (width * 4);
-        
-        [texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
-                   mipmapLevel:0
-                     withBytes:[data bytes]
-                   bytesPerRow:bytesPerRow];
-        
-        [textures addObject:texture];
-        [partWidths addObject:@(width)];
-        [partHeights addObject:@(height)];
-        
-        AVG_VLOG(@"Created texture %p (%dx%d)", texture, width, height);
-      }
-      
-      self.partTextures = [textures copy];
-      self->_partWidths = [partWidths copy];
-      self->_partHeights = [partHeights copy];
-      AVG_VLOG(@"Loaded %lu part textures total", (unsigned long)self.partTextures.count);
-      
-      if (self.partTextures.count == 0) {
-        [self notifyError:@"No textures loaded"];
-        return;
-      }
-      
-      self->_isSourceLoaded = YES;
-      self->_isSourceLoading = NO;
-      self.currentTexture = self.partTextures[0];
-      [self updateUniforms];
-      [self notifyLoad];
-      [self notifyStateChange:@"ready"];
-      
-      if (self.autoPlay && !self.playbackPaused && self.partTextures.count > 0) {
-        [self play];
-      }
-    });
-  });
-}
-
 - (void)play
 {
-  AVG_VLOG(@"play called - isPlaying=%d, totalFrames=%ld, textureCount=%lu", 
-        self.isPlaying, (long)self.totalFrames, (unsigned long)self.partTextures.count);
+  AVG_VLOG(@"play called - isPlaying=%d, totalFrames=%ld", self.isPlaying, (long)self.totalFrames);
   
   if (!self.isPlaying && self.totalFrames > 0) {
     AVG_VLOG(@"Starting playback...");
@@ -3073,7 +2117,6 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 {
   if (!_frameOwed || ![self prepareShownFrame]) return;
   _frameOwed = NO;
-  [self updateUniforms];
   [self setNeedsDisplay];
 }
 
@@ -3248,63 +2291,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     if (self.enableFrameEvents) {
       [self notifyFrameUpdate];
     }
-    [self updateUniforms];
     [self setNeedsDisplay];
-  }
-}
-
-- (void)updateUniforms
-{
-  // Calculate frame UV based on 2D grid layout
-  NSInteger partIndex = self.framesPerPart > 0 ? self.currentFrame / self.framesPerPart : 0;
-  NSInteger frameToRender = self.currentFrame;
-  
-  partIndex = MIN(partIndex, (NSInteger)self.partTextures.count - 1);
-  NSInteger frameInPart = self.framesPerPart > 0 ? frameToRender % self.framesPerPart : frameToRender;
-  
-  NSInteger col = self.framesPerRow > 0 ? frameInPart % self.framesPerRow : 0;
-  NSInteger row = self.framesPerRow > 0 ? frameInPart / self.framesPerRow : 0;
-  
-  // Get part dimensions from metadata or actual texture
-  NSInteger partWidth, partHeight;
-  
-  if (_partsMetadata && partIndex < [_partsMetadata count]) {
-    NSDictionary *partInfo = _partsMetadata[partIndex];
-    NSInteger cols = [partInfo[@"columns"] integerValue] ?: self.framesPerRow;
-    NSInteger rows = [partInfo[@"rows"] integerValue] ?: ((self.framesPerPart + self.framesPerRow - 1) / self.framesPerRow);
-    partWidth = cols * self.frameWidth;
-    partHeight = rows * self.frameHeight;
-  } else if (partIndex < _partWidths.count) {
-    // Use actual texture dimensions
-    partWidth = [_partWidths[partIndex] integerValue];
-    partHeight = [_partHeights[partIndex] integerValue];
-  } else {
-    // Fallback calculation
-    partWidth = self.framesPerRow * self.frameWidth;
-    if (self.partCount > 1) {
-      NSInteger framesInThisPart = MIN(self.framesPerPart, self.totalFrames - partIndex * self.framesPerPart);
-      partHeight = ((framesInThisPart + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
-    } else {
-      partHeight = ((self.totalFrames + self.framesPerRow - 1) / self.framesPerRow) * self.frameHeight;
-    }
-  }
-  
-  // Calculate UV coordinates
-  float minU = (col * self.frameWidth) / (float)partWidth;
-  float maxU = ((col + 1) * self.frameWidth) / (float)partWidth;
-  float minV = (row * self.frameHeight) / (float)partHeight;
-  float maxV = ((row + 1) * self.frameHeight) / (float)partHeight;
-  
-  // Uniform buffer layout (must match the Metal shader's Uniforms): float4 frameUV
-  float *uniforms = (float *)[self.uniformBuffer contents];
-  uniforms[0] = minU;
-  uniforms[1] = minV;
-  uniforms[2] = maxU;
-  uniforms[3] = maxV;
-  
-  // Update current texture based on part index
-  if (partIndex < (NSInteger)self.partTextures.count) {
-    self.currentTexture = self.partTextures[partIndex];
   }
 }
 
@@ -3312,8 +2299,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
 {
   static int drawCount = 0;
   
-  // Check for texture array mode
-  if (_useTextureArray && _textureArray && _arrayPipelineState) {
+  if (_textureArray && _arrayPipelineState) {
     if (drawCount < 5) {
       AVG_VLOG(@"drawInMTKView - rendering texture array frame %ld", (long)self.currentFrame);
       drawCount++;
@@ -3382,41 +2368,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     }
     
     [commandBuffer commit];
-    return;
   }
-  
-  // Standard atlas mode rendering
-  if (!self.currentTexture || !self.pipelineState) {
-    if (drawCount < 5) {
-      AVG_VLOG(@"drawInMTKView - skipping (texture=%p, pipeline=%p)", self.currentTexture, self.pipelineState);
-    }
-    drawCount++;
-    return;
-  }
-  
-  if (drawCount < 5) {
-    AVG_VLOG(@"drawInMTKView - rendering frame %ld", (long)self.currentFrame);
-    drawCount++;
-  }
-  
-  id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
-  
-  MTLRenderPassDescriptor *renderPassDescriptor = view.currentRenderPassDescriptor;
-  if (renderPassDescriptor) {
-    id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
-    
-    [renderEncoder setRenderPipelineState:self.pipelineState];
-    [renderEncoder setFragmentTexture:self.currentTexture atIndex:0];
-    [renderEncoder setFragmentSamplerState:_samplerState atIndex:0];
-    [renderEncoder setFragmentBuffer:self.uniformBuffer offset:0 atIndex:0];
-    
-    [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-    [renderEncoder endEncoding];
-    
-    [commandBuffer presentDrawable:view.currentDrawable];
-  }
-  
-  [commandBuffer commit];
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size
@@ -3442,10 +2394,7 @@ static BOOL AVGFileStartsWithZstdFrame(NSString *path) {
     self.displayLink = nil;
   }
   
-  // Release textures
-  self.partTextures = nil;
-  self.currentTexture = nil;
-  _transcodedData.clear();
+  _textureArray = nil;
   
   // Cleanup streaming state
   if (_dstream) {

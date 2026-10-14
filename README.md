@@ -1,6 +1,6 @@
 # alpha-video-gpu
 
-Plays transparent (alpha) animations stored as GPU-compressed KTX2 textures (ASTC, or Basis Universal UASTC), drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
+Plays transparent (alpha) animations stored as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
 
 | Platform | Package | View |
 |---|---|---|
@@ -13,13 +13,13 @@ Plays transparent (alpha) animations stored as GPU-compressed KTX2 textures (AST
 
 ## Overview
 
-This library renders animations from KTX2 texture files containing sprite sheets. Frames are packed into GPU-compressed textures and uploaded once, then animated by updating UV coordinates on the GPU.
+This library renders animations from KTX2 files that hold an ASTC texture array, one frame per layer. The ASTC blocks go to the GPU as they are, and the GPU decodes them while sampling.
 
 **Key characteristics:**
-- Single texture upload per animation part (no per-frame decoding)
-- Hardware texture compression (ASTC on iOS/Android, transcoded formats on web)
-- Software RGBA fallback for emulators and unsupported devices
-- Metadata embedded in KTX2 files or provided separately
+- No per-frame decoding: frames are uploaded as compressed ASTC blocks
+- Hardware texture compression on iOS, Android and the mobile web
+- Software ASTC decoding on emulators and devices without ASTC
+- Metadata embedded in the KTX2 file by the encoder
 - **Streaming playback** for long animations with minimal memory footprint
 - **Uncompressed ASTC streaming** for many concurrent players
 
@@ -131,42 +131,18 @@ Both approaches support streaming for long content:
 
 ---
 
-## Encoding Modes
+## Encoding
 
-This player supports two encoding formats. Files are made with the separate [`alpha-video-gpu-encoder`](https://github.com/danielkpl2/alpha-video-gpu-encoder) package (CLI `texenc`).
-
-### Native ASTC
-
-Direct ASTC 4x4 block compression using `toktx` from the KTX-Software tools. Produces the highest visual quality but requires ASTC hardware support for GPU-accelerated playback.
-
-- **Pros:** Best quality, no runtime transcoding
-- **Cons:** Larger files than UASTC+RDO, no GPU benefit on emulators
-
-### UASTC (Basis Universal)
-
-Universal texture format that transcodes at runtime to the device's native GPU format (ASTC, ETC2, BC7, etc.).
-
-- **Pros:** Smaller files with RDO, universal GPU support
-- **Cons:** Slight quality loss vs native ASTC, transcoding overhead on first load
-
----
-
-## Encoding Examples
+Files are made with the separate [`alpha-video-gpu-encoder`](https://github.com/danielkpl2/alpha-video-gpu-encoder) package (CLI `texenc`), which compresses frames to ASTC with `toktx` from KTX-Software (or `astcenc` for the stream encoder).
 
 ```bash
 npm install -g alpha-video-gpu-encoder
 
-# Native ASTC texture array, KTX2-internal zstd (the default; streams with `stream`)
+# ASTC texture array, KTX2-internal zstd (the default; streams with `stream`)
 texenc --input ./frames --output animation.ktx2 --fps 30 --astc-quality exhaustive --astc-perceptual
-
-# UASTC (transcodes at runtime; plays on any GPU, including desktop browsers)
-texenc --input ./frames --output animation.ktx2 --fps 30 --uastc --uastc-rdo 0
 
 # Uncompressed ASTC (largest file, no decompression; mmap streaming)
 texenc --input ./frames --output animation.ktx2 --fps 30 --zstd 0
-
-# Whole-file zstd wrapper (always streams)
-texenc --input ./frames --output animation.ktx2 --fps 30 --outer-compression
 ```
 
 See the encoder's README for every option, video input and the memory-efficient stream encoder.
@@ -181,11 +157,12 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator), the 
 |----------|------------------|----------|
 | iOS Device | ASTC (Metal) | — |
 | iOS Simulator | None | Software ASTC→RGBA decode |
-| Android Device | ASTC or ETC2 | ETC2 or software decode |
+| Android Device | ASTC (nearly all) | Software ASTC→RGBA decode |
 | Android Emulator | Usually none | Software ASTC→RGBA decode |
-| Web (desktop) | Varies (ASTC/BC7/ETC2) | UASTC transcodes; native ASTC fails with `ASTC_UNSUPPORTED` |
+| Web (mobile) | ASTC | — |
+| Web (desktop) | Usually none | None: fails with `ASTC_UNSUPPORTED` |
 
-**Important:** Both ASTC and UASTC modes fall back to uncompressed RGBA on emulators. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices.
+**Important:** On emulators frames are decoded to uncompressed RGBA. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices.
 
 ---
 
@@ -198,7 +175,7 @@ npm install react-native-alpha-video-gpu
 cd ios && pod install
 ```
 
-The Basis Universal transcoder and zstd are compiled in from `third_party/`; there are no other native dependencies. On the web the component uses [`alpha-video-gpu-web`](#web-support), which is installed with it.
+zstd is compiled in from `third_party/`; there are no other native dependencies. On the web the component uses [`alpha-video-gpu-web`](#web-support), which is installed with it.
 
 The view works on both React Native architectures: the new one (Fabric, the default since 0.76) and the old one (`newArchEnabled=false`, up to 0.81). It is tested on 0.83, and on 0.81 with the new architecture turned off.
 
@@ -325,7 +302,7 @@ const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 const defaultConfig = getDefaultConfig(__dirname);
 module.exports = mergeConfig(defaultConfig, {
   resolver: {
-    assetExts: [...defaultConfig.resolver.assetExts, 'ktx2', 'glb', 'zst'],
+    assetExts: [...defaultConfig.resolver.assetExts, 'ktx2'],
   },
 });
 ```
@@ -350,45 +327,18 @@ Android compresses APK entries it doesn't recognise, and a compressed entry can'
 // android/app/build.gradle
 android {
   androidResources {
-    noCompress += ['ktx2', 'zst', 'glb']
+    noCompress += ['ktx2']
   }
 }
 ```
 
-Without it, `stream` on an `asset://` or `res/raw` file fails with an error naming this setting. A whole-file zstd wrapper still plays, but is read into memory first instead of being mapped.
-
----
-
-## Multi-Part Animations
-
-Large atlas animations are split across several textures. By default the encoder packs them into one **GLB** file, which loads like any other source.
-
-With `--no-glb`, the parts are separate `.ktx2` files and the first one's metadata lists the others by file name. The player looks for them next to `source`: in the same folder for `file://`, `/` and `asset://` sources, and at the same URL path for `http(s)://` sources (a part of a source with `cacheKey: 'glow.ktx2'` is cached as `glow_1.ktx2`, and so on).
-
-When they can't be found that way (res/raw names, `content://`, presigned URLs), list every part with `parts`, the first one being the file with the metadata:
-
-```jsx
-<AlphaVideoGpuView
-  source={{ uri: urls[0], cacheKey: 'anim_0.ktx2' }}
-  parts={urls.map((uri, i) => ({ uri, cacheKey: `anim_${i}.ktx2` }))}
-/>
-```
-
-All parts are loaded before playback starts.
+Without it, `stream` on an `asset://` or `res/raw` file fails with an error naming this setting.
 
 ---
 
 ## Metadata
 
-Animation metadata (frame count, dimensions, layout) is embedded in the KTX2 file's key-value data section by the encoder. The player reads this automatically.
-
-For multi-part animations (large frame counts split across multiple textures), the encoder packages all parts into a single **GLB container** by default. GLB is the Khronos Group's binary glTF format, used here as a convenient container for multiple KTX2 textures.
-
-### GLB Container Format
-
-The GLB container includes:
-- **JSON chunk**: Animation metadata with byte offsets for each KTX2 part
-- **BIN chunk**: Concatenated KTX2 texture data
+Animation metadata is embedded by the encoder in the KTX2 file's key-value data, under the key `BasisPlayerMetadata` (the name is kept so older files still read). The player reads it automatically:
 
 ```json
 {
@@ -396,38 +346,14 @@ The GLB container includes:
   "frameWidth": 400,
   "frameHeight": 400,
   "frameRate": 30,
-  "framesPerRow": 4,
-  "framesPerPart": 64,
-  "partCount": 2,
   "mode": "astc",
-  "container": "glb",
-  "ktx2Parts": [
-    { "byteOffset": 0, "byteLength": 1234567, "columns": 4, "rows": 16 },
-    { "byteOffset": 1234567, "byteLength": 987654, "columns": 4, "rows": 14 }
-  ]
+  "packingMode": "array",
+  "layerCount": 120
 }
 ```
 
-### Legacy Multi-Part Format
+Files from older encoders in other modes (UASTC, atlas packing, GLB containers, multi-part files) are rejected with an error; encode them again with `texenc`.
 
-For separate KTX2 files (using `--no-glb` encoder flag), metadata is embedded in the first part:
-
-```json
-{
-  "frameCount": 120,
-  "frameWidth": 400,
-  "frameHeight": 400,
-  "frameRate": 30,
-  "framesPerRow": 4,
-  "framesPerPart": 64,
-  "partCount": 2,
-  "mode": "astc",
-  "parts": [
-    { "file": "anim_0.ktx2", "columns": 4, "rows": 16 },
-    { "file": "anim_1.ktx2", "columns": 4, "rows": 14 }
-  ]
-}
-```
 
 ---
 
@@ -459,17 +385,16 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 <AlphaVideoGpuPlayer src="/animation.ktx2" width={300} height={300} autoPlay loop />
 ```
 
-The zstd decoder and the Basis transcoder (JS and WebAssembly) are bundled inline, so no extra scripts or files need to be served. React is an optional peer dependency, needed only for `alpha-video-gpu-web/react`.
+The zstd decoder (JS and WebAssembly) is bundled inline, so no extra scripts or files need to be served. React is an optional peer dependency, needed only for `alpha-video-gpu-web/react`.
 
 ### Web Texture Format Support
 
 | Format | Browser Support | Notes |
 |--------|-----------------|-------|
-| **Native ASTC** | Mobile browsers, some desktop | Requires `WEBGL_compressed_texture_astc` |
-| **UASTC** | All (transcoded) | Transcodes to BC7/ETC2/RGBA at runtime |
+| **ASTC** | Mobile browsers, some desktop | Requires `WEBGL_compressed_texture_astc` and WebGL 2 |
 | **Zstd compression** | All | Bundled WASM decoder |
 
-Native ASTC files need `WEBGL_compressed_texture_astc`, which most desktop browsers on Windows and Linux lack; there is no software fallback on the web, so `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component). Encode with `--uastc` if desktop browsers matter.
+ASTC needs `WEBGL_compressed_texture_astc`, which most desktop browsers on Windows and Linux lack. There is no software fallback on the web, so `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component); show something else in its place.
 
 ---
 
@@ -492,7 +417,7 @@ The default, `auto`, uses VRAM for non-streaming playback and RAM for streaming.
 
 ### Non-Streaming (Default)
 
-All frames are loaded into memory before playback begins. Best for short-to-medium animations. Works with both **texture arrays** and **atlas** packing modes, and supports both **Native ASTC** and **UASTC** encoding.
+All frames are loaded into memory before playback begins. Best for short-to-medium animations.
 
 ```jsx
 <AlphaVideoGpuView
@@ -522,10 +447,7 @@ All frames are loaded into memory before playback begins. Best for short-to-medi
 
 For very long animations or memory-constrained scenarios, streaming mode decodes frames on-demand during playback using a ring buffer. Only a small window of frames is kept in memory at any time, providing **constant and predictable memory usage** regardless of animation length.
 
-Streaming works with **texture arrays** (`--mode array`, the encoder default) of **native ASTC**. It's used when:
-
-- the file is a whole-file zstd wrapper (`--outer-compression`, usually `.ktx2.zst`). These always stream.
-- `stream` is set and the file uses KTX2-internal zstd (the encoder default) or no compression (`--zstd 0`).
+Streaming is used when `stream` is set, for files with KTX2-internal zstd (the encoder default) or no compression (`--zstd 0`).
 
 The `streamMode` metadata key that older encoders wrote is ignored; only `stream` turns streaming on.
 
@@ -581,7 +503,7 @@ Streaming enables playback of arbitrarily long animations with **fixed memory fo
 
 ### Encoding for Streaming
 
-The encoder's defaults (native ASTC, texture array, KTX2-internal zstd) already produce a streamable file; play it with `stream`. `--outer-compression` produces a whole-file zstd wrapper that the player streams while decompressing, without the `stream` prop.
+The encoder's defaults (ASTC texture array, KTX2-internal zstd) already produce a streamable file; play it with `stream`.
 
 ---
 
@@ -650,20 +572,20 @@ On iOS/Android simulators (no hardware ASTC), uncompressed streaming still requi
 
 ## Performance Characteristics
 
-- **CPU:** Near-zero during playback (UV updates only)
-- **Memory:** GPU texture memory = uncompressed size (ASTC decompresses on GPU)
+- **CPU:** Near-zero during playback (frame uploads only, or none when every frame is in VRAM)
+- **Memory:** GPU texture memory = the ASTC size (ASTC decompresses on GPU)
 - **Battery:** Significantly lower than video playback
-- **Load time:** One-time transcode (UASTC) or direct upload (ASTC)
+- **Load time:** Direct upload of the ASTC blocks
 
 ### Playback Mode Comparison
 
-| Mode | Encoding | Packing | Load Time | Memory | CPU (Playback) | Best For |
-|------|----------|---------|-----------|--------|----------------|----------|
-| Non-streaming VRAM | ASTC or UASTC | Array or Atlas | Slow (all frames) | High VRAM, minimal RAM | Near-zero | Short animations, best performance |
-| Non-streaming RAM | ASTC or UASTC | Array or Atlas | Slow (all frames) | High RAM, minimal VRAM | Low (uploads) | VRAM-constrained devices |
-| Streaming VRAM (Zstd) | ASTC only | Array only | Fast (prefetch) | Low VRAM ring buffer | Medium (decode) | Long animations, fixed memory |
-| Streaming RAM (Zstd) | ASTC only | Array only | Fast (prefetch) | Medium RAM cache, minimal VRAM | Medium (decode) | Long animations, VRAM-constrained |
-| Streaming Uncompressed | ASTC only | Array only | Fast (mmap) | Low VRAM ring buffer | Near-zero | Massive concurrency, battery-critical |
+| Mode | Load Time | Memory | CPU (Playback) | Best For |
+|------|-----------|--------|----------------|----------|
+| Non-streaming VRAM | Slow (all frames) | High VRAM, minimal RAM | Near-zero | Short animations, best performance |
+| Non-streaming RAM | Slow (all frames) | High RAM, minimal VRAM | Low (uploads) | VRAM-constrained devices |
+| Streaming VRAM (Zstd) | Fast (prefetch) | Low VRAM ring buffer | Medium (decode) | Long animations, fixed memory |
+| Streaming RAM (Zstd) | Fast (prefetch) | Medium RAM cache, minimal VRAM | Medium (decode) | Long animations, VRAM-constrained |
+| Streaming Uncompressed | Fast (mmap) | Low VRAM ring buffer | Near-zero | Massive concurrency, battery-critical |
 
 Best suited for:
 - Looping UI effects (glows, shimmers, highlights)
@@ -690,7 +612,6 @@ Not ideal for:
 | `paused` | `boolean` | `false` | Pause playback (and streaming decompression) |
 | `playbackSpeed` | `number` | `1.0` | Speed multiplier |
 | `cacheKey` | `string` | — | Cache identity for downloads; overrides `source.cacheKey` |
-| `parts` | `Array<{ uri: string, cacheKey?: string }>` | — | Every part of a multi-part animation, when they can't be found next to `source` |
 | `memoryStrategy` | `"auto"` \| `"vram"` \| `"ram"` | `"auto"` | Where frames are kept |
 | `stream` | `boolean` | `false` | Stream a texture array with a ring buffer |
 | `streamingRingSize` | `number` | `16` | GPU texture slots for RAM-mode streaming |
@@ -712,14 +633,14 @@ The events have the same shape on Android, iOS and web. Playback is controlled w
 
 | Path | What | Package |
 |---|---|---|
-| `android/` | The Android library: `AlphaVideoGpuView`, source loading, and the JNI transcoder (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
+| `android/` | The Android library: `AlphaVideoGpuView`, source loading, and the JNI code for zstd, the software ASTC decoder and texture uploads (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
 | `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++), with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
-| `third_party/basis_universal/` | The Basis Universal 1.16.4 transcoder and zstd, compiled into both native libraries | |
+| `third_party/zstd/` | zstd 1.4.9 (single-file library), compiled into both native libraries | |
 | `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `react-native-alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
-| `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there inlines the decoders and builds `dist/` | npm `alpha-video-gpu-web` |
+| `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there builds `dist/` | npm `alpha-video-gpu-web` |
 | `scripts/publish-android.sh` | `local` publishes the Android library to `~/.m2`; `central` signs it and uploads it to the Maven Central Portal (see the script for the variables) | |
 
-A clone builds with no setup step, since the transcoders are in the repo (`third_party/` for the native libraries, `web/libs/` for the web package):
+A clone builds with no setup step, since the decoders are in the repo (`third_party/` for the native libraries, `web/src/` for the web package):
 
 ```bash
 cd web && npm ci && npm run build                     # web: dist/
@@ -734,10 +655,10 @@ A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha
 - React Native 0.71+
 - Android: minSdkVersion 24, OpenGL ES 3.0; compileSdkVersion comes from the app (default 36)
 - iOS: iOS 13.0+, Metal
-- Web: WebGL 2 (falls back to WebGL 1)
+- Web: WebGL 2 with `WEBGL_compressed_texture_astc`
 
 ---
 
 ## License
 
-The code in this repository is MIT. The Basis Universal transcoder and the ASTC decoder are Apache-2.0, and zstd is BSD-3-Clause; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The code in this repository is MIT. The ASTC decoder is Apache-2.0, and zstd is BSD-3-Clause; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

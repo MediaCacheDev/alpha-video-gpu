@@ -1,93 +1,10 @@
 /**
  * KTX2 Parsing Utilities
  *
- * Functions for parsing KTX2 files, GLB containers, extracting metadata,
- * and mapping texture formats.
+ * Functions for extracting KTX2 metadata and mapping ASTC formats.
  */
 
-import type { Metadata, GLBParseResult } from './types';
-
-/**
- * Check if data is a GLB container (magic: "glTF")
- */
-export function isGLBContainer(data: Uint8Array): boolean {
-  return (
-    data[0] === 0x67 &&
-    data[1] === 0x6C &&
-    data[2] === 0x54 &&
-    data[3] === 0x46
-  );
-}
-
-/**
- * Parse GLB container and extract KTX2 parts.
- * GLB format: 12-byte header + JSON chunk + BIN chunk
- */
-export function parseGLBContainer(data: Uint8Array): GLBParseResult | null {
-  try {
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    if (!isGLBContainer(data)) return null;
-
-    const version = view.getUint32(4, true);
-    if (version !== 2) {
-      console.warn('[AlphaVideoGpu] Unsupported GLB version:', version);
-      return null;
-    }
-
-    let offset = 12;
-
-    // JSON chunk
-    const jsonChunkLength = view.getUint32(offset, true);
-    offset += 4;
-    const jsonChunkType = view.getUint32(offset, true);
-    offset += 4;
-
-    if (jsonChunkType !== 0x4e4f534a) {
-      // 'JSON' in little-endian
-      console.warn(
-        '[AlphaVideoGpu] Expected JSON chunk, got:',
-        jsonChunkType.toString(16)
-      );
-      return null;
-    }
-
-    const jsonData = new TextDecoder().decode(
-      data.slice(offset, offset + jsonChunkLength)
-    );
-    const metadata = JSON.parse(jsonData.trim()) as Metadata;
-    offset += jsonChunkLength;
-
-    // BIN chunk
-    const binChunkLength = view.getUint32(offset, true);
-    offset += 4;
-    const binChunkType = view.getUint32(offset, true);
-    offset += 4;
-
-    if (binChunkType !== 0x004e4942) {
-      // 'BIN\0' in little-endian
-      console.warn(
-        '[AlphaVideoGpu] Expected BIN chunk, got:',
-        binChunkType.toString(16)
-      );
-      return null;
-    }
-
-    const binData = data.slice(offset, offset + binChunkLength);
-    const ktx2Parts: Uint8Array[] = [];
-    const partsInfo = (metadata as any).ktx2Parts || [];
-
-    for (const partInfo of partsInfo) {
-      ktx2Parts.push(
-        binData.slice(partInfo.byteOffset, partInfo.byteOffset + partInfo.byteLength)
-      );
-    }
-
-    return { metadata, ktx2Parts };
-  } catch (error) {
-    console.warn('[AlphaVideoGpu] Failed to parse GLB:', error);
-    return null;
-  }
-}
+import type { Metadata } from './types';
 
 /**
  * Extract BasisPlayerMetadata from KTX2 key-value data section.
@@ -229,49 +146,4 @@ export function getASTCBytesPerLayer(
   const blocksX = Math.ceil(width / blockWidth);
   const blocksY = Math.ceil(height / blockHeight);
   return blocksX * blocksY * 16;
-}
-
-/**
- * Detect the best GPU-compressed texture format supported by the browser.
- * Returns a Basis Universal target format constant.
- */
-export function detectTextureFormat(
-  gl: WebGLRenderingContext,
-  BasisModule: any
-): number {
-  const formats = [
-    { ext: 'WEBGL_compressed_texture_astc', format: BasisModule.cTFASTC_4x4_RGBA },
-    { ext: 'WEBGL_compressed_texture_s3tc', format: BasisModule.cTFBC3_RGBA },
-    { ext: 'WEBGL_compressed_texture_etc', format: BasisModule.cTFETC2_RGBA },
-    { ext: 'WEBGL_compressed_texture_pvrtc', format: BasisModule.cTFPVRTC1_4_RGBA },
-  ];
-  for (const { ext, format } of formats) {
-    if (gl.getExtension(ext)) return format;
-  }
-  return BasisModule.cTFRGBA32;
-}
-
-/**
- * Map a Basis target format to the corresponding WebGL compressed format constant.
- */
-export function getGLCompressedFormat(
-  gl: WebGLRenderingContext,
-  _basisFormat: number,
-  _hasAlpha: boolean
-): number {
-  const COMPRESSED_RGBA_ASTC_4x4_KHR = 0x93b0;
-  const COMPRESSED_RGBA_S3TC_DXT5_EXT = 0x83f3;
-  const COMPRESSED_RGBA8_ETC2_EAC = 0x9278;
-  const COMPRESSED_RGBA_PVRTC_4BPPV1_IMG = 0x8c02;
-
-  if (gl.getExtension('WEBGL_compressed_texture_astc'))
-    return COMPRESSED_RGBA_ASTC_4x4_KHR;
-  if (gl.getExtension('WEBGL_compressed_texture_s3tc'))
-    return COMPRESSED_RGBA_S3TC_DXT5_EXT;
-  if (gl.getExtension('WEBGL_compressed_texture_etc'))
-    return COMPRESSED_RGBA8_ETC2_EAC;
-  if (gl.getExtension('WEBGL_compressed_texture_pvrtc'))
-    return COMPRESSED_RGBA_PVRTC_4BPPV1_IMG;
-
-  return gl.RGBA;
 }

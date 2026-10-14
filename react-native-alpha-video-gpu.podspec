@@ -14,16 +14,16 @@ Pod::Spec.new do |s|
   s.source       = { :git => package['repository']['url'], :tag => "v#{s.version}" }
 
   # The iOS library (ios/Sources/AlphaVideoGPU, also the Swift package and the alpha-video-gpu
-  # pod) and the React Native view. AlphaVideoGpuView.mm compiles the ASTC decoder, the Basis
-  # transcoder and zstd by #include.
+  # pod) and the React Native view. AlphaVideoGpuView.mm compiles the ASTC decoder and zstd by
+  # #include.
   s.source_files        = 'ios/Sources/AlphaVideoGPU/**/*.{h,mm}', 'react-native/ios/**/*.{h,mm}'
   s.public_header_files = 'ios/Sources/AlphaVideoGPU/include/AlphaVideoGPU.h'
-  s.preserve_paths      = 'ios/Sources/AlphaVideoGPU/astc_decomp.cpp', 'third_party/basis_universal/**/*'
+  s.preserve_paths      = 'ios/Sources/AlphaVideoGPU/astc_decomp.cpp', 'third_party/zstd/**/*'
   s.frameworks          = 'Metal', 'MetalKit'
   s.libraries           = 'c++'
   s.pod_target_xcconfig = {
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++14',
-    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/third_party/basis_universal"'
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/third_party"'
   }
 
   # React Native's helper: the Fabric and codegen dependencies, and RCT_NEW_ARCH_ENABLED on the

@@ -1,14 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import {
   ASTC_FORMAT_MAP,
   extractKTX2Metadata,
   getASTCBlockSize,
   getASTCBytesPerLayer,
-  isGLBContainer,
-  parseGLBContainer,
 } from '../src/ktx2-parser';
 
 const fixturesDir = path.resolve(__dirname, '../../tests/fixtures');
@@ -22,18 +19,14 @@ interface Expected {
   glFormat?: number;
   supercompression?: number;
   bytesPerLayer?: number;
-  glb?: boolean;
-  parts?: { frames: number; columns: number; rows: number }[];
   metadata: Record<string, unknown>;
 }
 
 const expected: Record<string, Expected> = JSON.parse(fs.readFileSync(path.join(fixturesDir, 'expected.json'), 'utf8'));
 delete expected._comment;
 
-/** The file as the player sees it: an outer .zst wrapper is removed first. */
 function load(name: string): Uint8Array {
-  const data = fs.readFileSync(path.join(fixturesDir, name));
-  return new Uint8Array(name.endsWith('.zst') ? zlib.zstdDecompressSync(data) : data);
+  return new Uint8Array(fs.readFileSync(path.join(fixturesDir, name)));
 }
 
 function header(data: Uint8Array) {
@@ -74,7 +67,7 @@ describe('ASTC format tables', () => {
   });
 });
 
-describe.each(Object.entries(expected).filter(([, e]) => !e.glb))('%s', (name, e) => {
+describe.each(Object.entries(expected))('%s', (name, e) => {
   const data = load(name);
   const h = header(data);
 
@@ -99,33 +92,7 @@ describe.each(Object.entries(expected).filter(([, e]) => !e.glb))('%s', (name, e
   }
 });
 
-describe.each(Object.entries(expected).filter(([, e]) => e.glb))('%s', (name, e) => {
-  const data = load(name);
-
-  it('parses into one KTX2 per part', () => {
-    expect(isGLBContainer(data)).toBe(true);
-    const glb = parseGLBContainer(data);
-    expect(glb).not.toBeNull();
-    expect(glb!.metadata).toMatchObject(e.metadata);
-    expect(glb!.ktx2Parts).toHaveLength(e.parts!.length);
-    glb!.ktx2Parts.forEach((part, i) => {
-      expect(Array.from(part.subarray(0, 4)), `part ${i} magic`).toEqual([0xab, 0x4b, 0x54, 0x58]);
-      const h = header(part);
-      const { columns, rows } = e.parts![i];
-      expect({ width: h.width, height: h.height }, `part ${i} size`).toEqual({
-        width: columns * (e.metadata.frameWidth as number),
-        height: rows * (e.metadata.frameHeight as number),
-      });
-    });
-    expect(glb!.metadata.parts?.map((p) => ({ columns: p.columns, rows: p.rows }))).toEqual(
-      e.parts!.map(({ columns, rows }) => ({ columns, rows })),
-    );
-  });
-});
-
-describe('rejects what is not a KTX2 or GLB', () => {
+describe('rejects what is not a KTX2', () => {
   const junk = new Uint8Array(256).fill(7);
   it('extractKTX2Metadata', () => expect(extractKTX2Metadata(junk)).toBeNull());
-  it('parseGLBContainer', () => expect(parseGLBContainer(junk)).toBeNull());
-  it('isGLBContainer on a KTX2', () => expect(isGLBContainer(load('card_383x217/astc4x4.ktx2'))).toBe(false));
 });

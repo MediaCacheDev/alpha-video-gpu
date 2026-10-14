@@ -1,7 +1,7 @@
 {
   "name": "react-native-alpha-video-gpu",
   "version": "1.0.0",
-  "description": "Transparent (alpha) animations for React Native as GPU-compressed KTX2 textures (ASTC / Basis Universal), drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web.",
+  "description": "Transparent (alpha) animations for React Native as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web.",
   "main": "react-native/src/index.js",
   "types": "react-native/src/index.d.ts",
   "files": [
@@ -52,7 +52,6 @@
     "animation",
     "ktx2",
     "astc",
-    "basis-universal",
     "metal",
     "opengl",
     "webgl",

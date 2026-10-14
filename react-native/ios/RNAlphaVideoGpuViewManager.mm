@@ -17,8 +17,6 @@
 
 // `source` prop: { uri, cacheKey }
 @property (nonatomic, copy) NSDictionary *reactSource;
-// `parts` prop: [{ uri, cacheKey }]
-@property (nonatomic, copy) NSArray<NSDictionary *> *reactParts;
 
 @property (nonatomic, copy) RCTDirectEventBlock reactOnLoad;
 @property (nonatomic, copy) RCTDirectEventBlock reactOnFrameUpdate;
@@ -54,24 +52,6 @@ static NSString *RNAVGString(id value)
     self.cacheKey = cacheKey;
   }
   self.source = RNAVGString(reactSource[@"uri"]);
-}
-
-- (void)setReactParts:(NSArray<NSDictionary *> *)reactParts
-{
-  _reactParts = [reactParts copy];
-  if (reactParts.count == 0) {
-    self.partURIs = nil;
-    self.partCacheKeys = nil;
-    return;
-  }
-  NSMutableArray<NSString *> *uris = [NSMutableArray arrayWithCapacity:reactParts.count];
-  NSMutableArray *cacheKeys = [NSMutableArray arrayWithCapacity:reactParts.count];
-  for (NSDictionary *part in reactParts) {
-    [uris addObject:RNAVGString(part[@"uri"]) ?: @""];
-    [cacheKeys addObject:RNAVGString(part[@"cacheKey"]) ?: [NSNull null]];
-  }
-  self.partURIs = uris;
-  self.partCacheKeys = cacheKeys;
 }
 
 - (void)forwardEvents
@@ -128,7 +108,6 @@ RCT_EXPORT_MODULE(AlphaVideoGpuView)
 }
 
 RCT_REMAP_VIEW_PROPERTY(source, reactSource, NSDictionary)
-RCT_REMAP_VIEW_PROPERTY(parts, reactParts, NSArray)
 RCT_REMAP_VIEW_PROPERTY(paused, playbackPaused, BOOL)
 RCT_EXPORT_VIEW_PROPERTY(cacheKey, NSString)
 RCT_EXPORT_VIEW_PROPERTY(autoPlay, BOOL)

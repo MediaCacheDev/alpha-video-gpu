@@ -59,11 +59,6 @@ type ErrorEvent = Readonly<{
 
 export interface NativeProps extends ViewProps {
   source?: NativeSource;
-  /**
-   * For multi-part animations whose part files can't be found next to `source` (res/raw,
-   * content://, presigned URLs): every part's source, first part containing the metadata.
-   */
-  parts?: ReadonlyArray<NativeSource>;
   autoPlay?: WithDefault<boolean, true>;
   loop?: WithDefault<boolean, true>;
   playbackSpeed?: WithDefault<Float, 1.0>;
@@ -71,7 +66,7 @@ export interface NativeProps extends ViewProps {
   paused?: WithDefault<boolean, false>;
   cacheKey?: string;
 
-  // Streaming parameters (for .ktx2.zst files)
+  // Streaming parameters (with stream)
   /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
   streamingRingSize?: WithDefault<Int32, 16>;
   /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */

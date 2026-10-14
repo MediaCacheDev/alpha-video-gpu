@@ -1,32 +1,23 @@
 package dev.mediacache.alphavideo.gpu;
 
 /**
- * JNI bindings to the native library: the Basis Universal transcoder, zstd and the GL upload
- * paths that {@link AlphaVideoGpuView} uses. Loading the class loads the library.
+ * JNI bindings to the native library: zstd decompression, the software ASTC decoder and the GL
+ * upload paths that {@link AlphaVideoGpuView} uses. Loading the class loads the library.
  */
 final class AlphaVideoGpuNative {
 
     static {
         System.loadLibrary("alphavideogpu");
-        nativeInit();
     }
 
     private AlphaVideoGpuNative() {}
 
-    private static native void nativeInit();
-    static native int[] nativeTranscodeKTX2(byte[] ktx2Data, int textureFormat);
-    static native byte[] nativeTranscodeKTX2NoUpload(byte[] ktx2Data, int textureFormat);
     static native void nativeDeleteTexture(int textureId);
-    static native byte[] nativeDecompressZstd(byte[] data, int offset, int compressedLength, int uncompressedLength);
     static native boolean nativeDecompressZstdToBuffer(byte[] data, int offset, int compressedLength, java.nio.ByteBuffer outputBuffer, int uncompressedLength);  // Zero-copy to direct ByteBuffer
-    static native int[] nativeDecodeASTCToRGBA(byte[] astcData, int width, int height, int blockW, int blockH);
     static native int[] nativeLoadTextureArray(byte[] ktx2Data, boolean useAstc);
 
     // Streaming decompression methods (per-instance, returns/accepts stream ID)
-    static native long nativeStreamingDecompressInit(byte[] compressedData);
-    static native long nativeStreamingDecompressInitFromFd(int fd, long offset, long length);  // Memory-mapped, preferred; length < 0 = to end of file
     static native long nativeInternalZstdStreamingInit(int fd, long dataOffset, long compressedSize);  // Internal KTX2 zstd (supercompressionScheme=2); offset within the descriptor
-    static native byte[] nativeStreamingDecompressContinue(long streamId, int maxOutputBytes);
     static native long nativeStreamingDecompressContinueToBuffer(long streamId, java.nio.ByteBuffer outputBuffer, int maxOutputBytes);  // Zero-copy
     static native void nativeStreamingDecompressEnd(long streamId);
 

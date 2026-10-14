@@ -80,7 +80,6 @@ using namespace facebook::react;
   _player.streamingPrefetchAhead = newProps.streamingPrefetchAhead;
   _player.memoryStrategy = RCTNSStringFromString(toString(newProps.memoryStrategy));
   _player.verbose = newProps.verbose;
-  [self applyParts:newProps.parts];
 
   // Setting source starts the load, which reads every other prop, the cache key included.
   NSString *cacheKey = RCTNSStringFromStringNilIfEmpty(newProps.cacheKey)
@@ -89,23 +88,6 @@ using namespace facebook::react;
   _player.source = RCTNSStringFromStringNilIfEmpty(newProps.source.uri);
 
   [super updateProps:props oldProps:oldProps];
-}
-
-- (void)applyParts:(const std::vector<AlphaVideoGpuViewPartsStruct> &)parts
-{
-  if (parts.empty()) {
-    _player.partURIs = nil;
-    _player.partCacheKeys = nil;
-    return;
-  }
-  NSMutableArray<NSString *> *uris = [NSMutableArray arrayWithCapacity:parts.size()];
-  NSMutableArray *cacheKeys = [NSMutableArray arrayWithCapacity:parts.size()];
-  for (const auto &part : parts) {
-    [uris addObject:RCTNSStringFromString(part.uri)];
-    [cacheKeys addObject:RCTNSStringFromStringNilIfEmpty(part.cacheKey) ?: [NSNull null]];
-  }
-  _player.partURIs = uris;
-  _player.partCacheKeys = cacheKeys;
 }
 
 - (std::shared_ptr<const AlphaVideoGpuViewEventEmitter>)playerEventEmitter

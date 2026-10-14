@@ -1,7 +1,7 @@
 /**
- * alpha-video-gpu-web: KTX2 texture animations with alpha, drawn into a <canvas> with WebGL.
- * The Basis Universal transcoder and the zstd decoder (JS + WASM) are bundled inline, so there
- * are no files to host and no <script> tags.
+ * alpha-video-gpu-web: transparent animations from ASTC KTX2 texture arrays, drawn into a
+ * <canvas> with WebGL2. The zstd decoder (JS + WASM) is bundled inline, so there are no files to
+ * host and no <script> tags.
  *
  *   import { createAlphaVideoGpuPlayer } from 'alpha-video-gpu-web';
  *
@@ -13,7 +13,7 @@
 
 import { KTX2PlayerCore } from './KTX2PlayerCore';
 import type { KTX2PlayerCoreOptions } from './types';
-import { initBasisTranscoder, ZSTDDecoder } from './bundled-deps';
+import { ZSTDDecoder } from './bundled-deps';
 
 export { KTX2PlayerCore as AlphaVideoGpuCore };
 
@@ -23,17 +23,11 @@ export type {
   PlayerState,
   MemoryStrategy,
   Metadata,
-  FrameUV,
-  GLBParseResult,
   SharedGLResources,
 } from './types';
 
 export {
-  isGLBContainer,
-  parseGLBContainer,
   extractKTX2Metadata,
-  detectTextureFormat,
-  getGLCompressedFormat,
   ASTC_FORMAT_MAP,
   getASTCBlockSize,
   getASTCBytesPerLayer,
@@ -44,16 +38,15 @@ export { getCachedFile, setCachedFile } from './cache';
 export { AlphaVideoGpuError } from './errors';
 export type { AlphaVideoGpuErrorCode } from './errors';
 
-export { initBasisTranscoder, ZSTDDecoder };
+export { ZSTDDecoder };
 
 /** A player on `canvas` with the bundled decoders. */
 export function createAlphaVideoGpuPlayer(
   canvas: HTMLCanvasElement,
-  options: Omit<KTX2PlayerCoreOptions, 'basisTranscoderInit' | 'ZSTDDecoderClass'> = {}
+  options: Omit<KTX2PlayerCoreOptions, 'ZSTDDecoderClass'> = {}
 ): KTX2PlayerCore {
   return new KTX2PlayerCore(canvas, {
     ...options,
-    basisTranscoderInit: initBasisTranscoder,
     ZSTDDecoderClass: ZSTDDecoder as any,
   });
 }

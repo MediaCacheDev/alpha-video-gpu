@@ -12,8 +12,6 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.MalformedURLException;
-import java.net.URL;
 import java.util.regex.Pattern;
 
 /**
@@ -74,24 +72,6 @@ final class AlphaVideoGpuSource {
         }
         throw new IllegalArgumentException(
             "Unsupported source '" + uri + "'. Use https://, file://, an absolute path, asset:// or content://");
-    }
-
-    /**
-     * The URI of {@code fileName} in the same folder as {@code uri}, for multi-part files that name
-     * their siblings. Returns null for sources without folders (res/raw, content://).
-     */
-    static String resolveSibling(String uri, String fileName) {
-        if (AlphaVideoGpuDownloader.isRemote(uri)) {
-            try {
-                return new URL(new URL(uri), fileName).toString();
-            } catch (MalformedURLException e) {
-                return null;
-            }
-        }
-        if (uri.startsWith(ASSET_SCHEME) || uri.startsWith("file://") || uri.startsWith("/")) {
-            return uri.substring(0, uri.lastIndexOf('/') + 1) + fileName;
-        }
-        return null;
     }
 
     /** The caller closes the descriptor; native code duplicates it if it needs to keep reading. */

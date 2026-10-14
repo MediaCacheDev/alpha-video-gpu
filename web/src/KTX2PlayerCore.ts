@@ -7,7 +7,6 @@
  */
 
 import type {
-  FrameUV,
   Metadata,
   KTX2LoadEvent,
   PlayerState,
@@ -24,13 +23,8 @@ import {
 } from './webgl-context';
 
 import {
-  isGLBContainer,
-  parseGLBContainer,
   extractKTX2Metadata,
-  detectTextureFormat,
-  getGLCompressedFormat,
   ASTC_FORMAT_MAP,
-  getASTCBlockSize,
   getASTCBytesPerLayer,
 } from './ktx2-parser';
 
@@ -39,18 +33,12 @@ import { AlphaVideoGpuError, requireASTC } from './errors';
 
 // Re-export types for convenience
 export type {
-  FrameUV,
   Metadata,
   KTX2LoadEvent,
   PlayerState,
   MemoryStrategy,
   KTX2PlayerCoreOptions,
 };
-
-// ---- Basis Transcoder Singleton ----
-
-let basisModulePromise: Promise<any> | null = null;
-let basisModule: any = null;
 
 /** asset://path names the app's bundled media; on the web it is served from the site root. */
 function resolveWebUri(uri: string): string {
@@ -78,7 +66,6 @@ export class KTX2PlayerCore {
   private _verbose: boolean;
 
   // -- Dependency injection --
-  private _basisTranscoderInit: (() => Promise<any>) | null;
   private _ZSTDDecoderClass: (new () => any) | null;
 
   // -- Callbacks --
@@ -94,18 +81,14 @@ export class KTX2PlayerCore {
   private _ctx2d: CanvasRenderingContext2D | null = null;
   private _usingSharedGL = false;
   private _gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
-  private _program: WebGLProgram | null = null;
   private _arrayProgram: WebGLProgram | null = null;
   private _positionBuffer: WebGLBuffer | null = null;
   private _texCoordBuffer: WebGLBuffer | null = null;
 
   // -- Textures --
-  private _textures: WebGLTexture[] = [];
   private _textureArray: WebGLTexture | null = null;
-  private _useTextureArray = false;
 
   // -- Playback --
-  private _frameUVs: FrameUV[] = [];
   private _metadata: Metadata | null = null;
   private _state: PlayerState = 'idle';
   private _currentFrame = 0;
@@ -126,7 +109,6 @@ export class KTX2PlayerCore {
   private _streamingRingActualSize = 0;
   private _streamingDecodePos = 0;
   private _streamingFramesReady = 0;
-  private _streamingDecompressPaused = false;
   private _streamingLoopCount = 0;
   private _streamingCompressedChunks: Uint8Array[] | null = null;
   private _streamingDecompressState: any = null;
@@ -136,10 +118,8 @@ export class KTX2PlayerCore {
   private _streamingLayerCount = 0;
   private _streamingLevel0Offset = 0;
   private _streamingAstcFormat = 0;
-  private _streamingIsInternalZstd = false;
   // Frames decoded before this one are dropped: the decoder is catching up to a seek
   private _streamingSkipTo = 0;
-  private _decodeFrameId: number | null = null;
   private _backgroundDecodeRunning = false;
 
   // A clip that doesn't loop has reached its last frame; playing again starts it over
@@ -172,7 +152,6 @@ export class KTX2PlayerCore {
     this._streamingPrefetchAhead = clampInt(options.streamingPrefetchAhead ?? 30, 5, 100);
     this._memoryStrategy = options.memoryStrategy ?? 'auto';
     this._verbose = options.verbose ?? false;
-    this._basisTranscoderInit = options.basisTranscoderInit ?? null;
     this._ZSTDDecoderClass = options.ZSTDDecoderClass ?? null;
     this._onStateChange = options.onStateChange ?? null;
     this._onLoad = options.onLoad ?? null;
@@ -305,18 +284,17 @@ export class KTX2PlayerCore {
   }
 
   /**
-   * Load a source: an http(s) or relative URL, or asset://path (served from the site root).
-   * Handles .ktx2, .ktx2.zst, .glb, multi-part, streaming, etc.
+   * Load a source: an http(s) or relative URL, or asset://path (served from the site root),
+   * holding an ASTC KTX2 texture array.
    *
    * @param cacheKey stable identity for the IndexedDB cache, for URLs that change while the file
    *                 doesn't (presigned URLs); defaults to the URL
    */
-  async setSource(sourceUri: string, partUris?: string[], cacheKey?: string): Promise<void> {
+  async setSource(sourceUri: string, cacheKey?: string): Promise<void> {
     try {
       if (this._loadedSource === sourceUri) return;
       this._loadedSource = sourceUri;
       const uri = resolveWebUri(sourceUri);
-      partUris = partUris?.map(resolveWebUri);
       this._setState('loading');
       this._stopAnimationLoop();
       this._streamingCancelled = false;
@@ -327,24 +305,9 @@ export class KTX2PlayerCore {
       const gl = this._gl || this._initGL();
       if (!gl) return;
 
-      const BasisModule = await this._initBasisTranscoder();
-      const targetFormat = detectTextureFormat(gl, BasisModule);
-
       this._cleanupTextures(gl);
       this._cleanupStreamingState(gl);
       this._cleanupRamState();
-
-      // Streaming .zst
-      const isStreamingZst = uri.endsWith('.zst') || uri.includes('.zst?') || /\.ktx2\.[a-f0-9]+\.zst/.test(uri);
-      if (isStreamingZst) {
-        if (!(gl instanceof WebGL2RenderingContext) || !this._arrayProgram) {
-          throw new Error('Streaming mode requires WebGL2');
-        }
-        const success = await this._loadStreamingTextureArray(gl, uri);
-        if (!success) throw new Error('Failed to load streaming texture array');
-        this._finishLoad();
-        return;
-      }
 
       // Fetch (with IndexedDB cache)
       const cacheId = cacheKey || uri;
@@ -357,15 +320,8 @@ export class KTX2PlayerCore {
       }
       const data = new Uint8Array(arrayBuffer);
 
-      if (isGLBContainer(data)) {
-        await this._loadGLBSource(gl, data, BasisModule, targetFormat);
-      } else {
-        await this._loadKTX2Source(gl, data, BasisModule, targetFormat, uri, partUris);
-      }
+      await this._loadKTX2Source(gl, data);
 
-      if (!this._useTextureArray) {
-        this._frameUVs = this._calculateFrameUVs(this._metadata!);
-      }
       this._currentFrame = 0;
       this._finishLoad();
     } catch (error) {
@@ -384,16 +340,12 @@ export class KTX2PlayerCore {
     this._streamingCancelled = true;
     this._stopAnimationLoop();
     if (this._owedFrameId !== null) cancelAnimationFrame(this._owedFrameId);
-    if (this._decodeFrameId !== null) cancelAnimationFrame(this._decodeFrameId);
     this._owedFrameId = null;
-    this._decodeFrameId = null;
     const gl = this._gl;
     if (gl) {
-      this._textures.forEach(tex => gl.deleteTexture(tex));
       if (this._textureArray) gl.deleteTexture(this._textureArray);
       if (this._streamingRingBuffer) gl.deleteTexture(this._streamingRingBuffer);
       if (!this._usingSharedGL) {
-        if (this._program) gl.deleteProgram(this._program);
         if (this._arrayProgram) gl.deleteProgram(this._arrayProgram);
         if (this._positionBuffer) gl.deleteBuffer(this._positionBuffer);
         if (this._texCoordBuffer) gl.deleteBuffer(this._texCoordBuffer);
@@ -444,7 +396,6 @@ export class KTX2PlayerCore {
         this._ctx2d = ctx2d;
         this._usingSharedGL = true;
         this._gl = shared.gl;
-        this._program = shared.program;
         this._arrayProgram = shared.arrayProgram;
         this._positionBuffer = shared.positionBuffer;
         this._texCoordBuffer = shared.texCoordBuffer;
@@ -461,37 +412,10 @@ export class KTX2PlayerCore {
 
     this._usingSharedGL = false;
     this._gl = dedicated.gl;
-    this._program = dedicated.program;
     this._arrayProgram = dedicated.arrayProgram;
     this._positionBuffer = dedicated.positionBuffer;
     this._texCoordBuffer = dedicated.texCoordBuffer;
     return dedicated.gl;
-  }
-
-  // ======== Private: Basis Transcoder ========
-
-  private async _initBasisTranscoder(): Promise<any> {
-    if (basisModule) return basisModule;
-    if (basisModulePromise) return basisModulePromise;
-
-    basisModulePromise = (async () => {
-      if (this._basisTranscoderInit) {
-        basisModule = await this._basisTranscoderInit();
-      } else {
-        let attempts = 0;
-        while (typeof (globalThis as any).BASIS === 'undefined' && attempts < 100) {
-          await new Promise(r => setTimeout(r, 50));
-          attempts++;
-        }
-        if (typeof (globalThis as any).BASIS === 'undefined') {
-          throw new Error('Basis Universal not loaded');
-        }
-        basisModule = await (globalThis as any).BASIS();
-        basisModule.initializeBasis();
-      }
-      return basisModule;
-    })();
-    return basisModulePromise;
   }
 
   // ======== Private: ZSTD ========
@@ -512,10 +436,7 @@ export class KTX2PlayerCore {
   // ======== Private: Cleanup ========
 
   private _cleanupTextures(gl: WebGLRenderingContext): void {
-    this._textures.forEach(tex => gl.deleteTexture(tex));
-    this._textures = [];
     if (this._textureArray) { gl.deleteTexture(this._textureArray); this._textureArray = null; }
-    this._useTextureArray = false;
   }
 
   private _cleanupStreamingState(gl: WebGLRenderingContext): void {
@@ -547,226 +468,39 @@ export class KTX2PlayerCore {
     });
   }
 
-  // ======== Private: Frame UVs ========
-
-  private _calculateFrameUVs(metadata: Metadata): FrameUV[] {
-    const uvs: FrameUV[] = [];
-    const { frameCount, frameWidth, frameHeight, framesPerRow } = metadata;
-    const framesPerPart = metadata.framesPerPart || metadata.framesPerStrip || frameCount;
-    const parts = metadata.parts || metadata.strips || [];
-
-    for (let i = 0; i < frameCount; i++) {
-      const partIndex = Math.floor(i / framesPerPart);
-      const frameInPart = i % framesPerPart;
-      const col = frameInPart % framesPerRow;
-      const row = Math.floor(frameInPart / framesPerRow);
-
-      let partWidth: number, partHeight: number;
-      if (parts[partIndex]) {
-        partWidth = parts[partIndex].columns * frameWidth;
-        partHeight = parts[partIndex].rows * frameHeight;
-      } else {
-        // A part holds only the rows its frames fill, short of framesPerPart in the last one
-        const framesInPart = Math.min(framesPerPart, frameCount - partIndex * framesPerPart);
-        partWidth = framesPerRow * frameWidth;
-        partHeight = Math.ceil(framesInPart / framesPerRow) * frameHeight;
-      }
-
-      uvs.push({
-        minU: (col * frameWidth) / partWidth,
-        minV: (row * frameHeight) / partHeight,
-        maxU: ((col + 1) * frameWidth) / partWidth,
-        maxV: ((row + 1) * frameHeight) / partHeight,
-      });
-    }
-    return uvs;
-  }
-
-  // ======== Private: Load Native ASTC KTX2 ========
-
-  private async _loadNativeASTCKTX2(
-    gl: WebGLRenderingContext, data: Uint8Array
-  ): Promise<WebGLTexture | null> {
-    requireASTC(gl);
-
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const vkFormat = view.getUint32(12, true);
-    const pixelWidth = view.getUint32(20, true);
-    const pixelHeight = view.getUint32(24, true);
-    const supercompressionScheme = view.getUint32(44, true);
-
-    const glFormat = ASTC_FORMAT_MAP[vkFormat];
-    if (!glFormat) throw new Error(`Unsupported ASTC format: VkFormat ${vkFormat}`);
-
-    const levelIndexOffset = 80;
-    const level0ByteOffset = Number(view.getBigUint64(levelIndexOffset, true));
-    const level0ByteLength = Number(view.getBigUint64(levelIndexOffset + 8, true));
-
-    let textureData: Uint8Array;
-    if (supercompressionScheme === 2) {
-      const compressedData = new Uint8Array(data.buffer, data.byteOffset + level0ByteOffset, level0ByteLength);
-      const level0UncompressedLength = Number(view.getBigUint64(levelIndexOffset + 16, true));
-      const decoder = await this._ensureZstdDecoder();
-      textureData = decoder.decode(compressedData, level0UncompressedLength);
-      this._log(`[AlphaVideoGpu] WASM zstd decompressed ${level0ByteLength} -> ${textureData.length} bytes`);
-    } else if (supercompressionScheme === 0) {
-      textureData = new Uint8Array(data.buffer, data.byteOffset + level0ByteOffset, level0ByteLength);
-    } else {
-      throw new Error(`Unsupported supercompression: ${supercompressionScheme}`);
-    }
-
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.compressedTexImage2D(gl.TEXTURE_2D, 0, glFormat, pixelWidth, pixelHeight, 0, textureData);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    return texture;
-  }
-
-  // ======== Private: Transcode UASTC KTX2 ========
-
-  private async _transcodeKTX2(
-    gl: WebGLRenderingContext, BasisModule: any, data: Uint8Array, targetFormat: number
-  ): Promise<WebGLTexture | null> {
-    const ktx2File = new BasisModule.KTX2File(data);
-    if (!ktx2File.isValid()) { ktx2File.close(); ktx2File.delete(); throw new Error('Invalid KTX2 file'); }
-    if (!ktx2File.startTranscoding()) { ktx2File.close(); ktx2File.delete(); throw new Error('Failed to start transcoding'); }
-
-    const width = ktx2File.getWidth();
-    const height = ktx2File.getHeight();
-    const levels = ktx2File.getLevels();
-    const hasAlpha = ktx2File.getHasAlpha();
-
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-
-    for (let level = 0; level < levels; level++) {
-      const dstSize = ktx2File.getImageTranscodedSizeInBytes(level, 0, 0, targetFormat);
-      const dst = new Uint8Array(dstSize);
-      if (!ktx2File.transcodeImage(dst, level, 0, 0, targetFormat, 0, -1, -1)) {
-        ktx2File.close(); ktx2File.delete();
-        throw new Error(`Failed to transcode level ${level}`);
-      }
-      const lw = Math.max(1, width >> level);
-      const lh = Math.max(1, height >> level);
-      if (targetFormat === BasisModule.cTFRGBA32) {
-        gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA, lw, lh, 0, gl.RGBA, gl.UNSIGNED_BYTE, dst);
-      } else {
-        const glFmt = getGLCompressedFormat(gl, targetFormat, hasAlpha);
-        gl.compressedTexImage2D(gl.TEXTURE_2D, level, glFmt, lw, lh, 0, dst);
-      }
-    }
-
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    ktx2File.close(); ktx2File.delete();
-    return texture;
-  }
-
-  // ======== Private: Load GLB Source ========
-
-  private async _loadGLBSource(
-    gl: WebGLRenderingContext, data: Uint8Array, BasisModule: any, targetFormat: number
-  ): Promise<void> {
-    this._log('[AlphaVideoGpu] Detected GLB container');
-    const glbResult = parseGLBContainer(data);
-    if (!glbResult) throw new Error('Failed to parse GLB container');
-
-    const { metadata, ktx2Parts } = glbResult;
-    this._metadata = metadata;
-    this._emitLoad(metadata);
-
-    const isNativeASTC = metadata.mode === 'astc';
-    const isTextureArray = metadata.packingMode === 'array';
-
-    this._log(`[AlphaVideoGpu] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
-
-    if (isTextureArray && gl instanceof WebGL2RenderingContext && this._arrayProgram) {
-      this._log('[AlphaVideoGpu] Using texture array mode');
-      const success = await this._loadTextureArray(gl, ktx2Parts[0], metadata);
-      if (!success) throw new Error('Failed to load texture array');
-      this._textures.push(gl.createTexture()!);
-    } else {
-      for (const partData of ktx2Parts) {
-        const tex = isNativeASTC
-          ? await this._loadNativeASTCKTX2(gl, partData)
-          : await this._transcodeKTX2(gl, BasisModule, partData, targetFormat);
-        if (tex) this._textures.push(tex);
-      }
-    }
-  }
-
   // ======== Private: Load KTX2 Source ========
 
-  private async _loadKTX2Source(
-    gl: WebGLRenderingContext, data: Uint8Array, BasisModule: any, targetFormat: number,
-    uri: string, partUris?: string[]
-  ): Promise<void> {
+  private async _loadKTX2Source(gl: WebGLRenderingContext, data: Uint8Array): Promise<void> {
     const metadata = extractKTX2Metadata(data);
     if (!metadata) throw new Error('No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.');
+    if (metadata.mode !== 'astc' || metadata.packingMode !== 'array') {
+      throw new Error(`Only ASTC texture arrays play (this file is mode '${metadata.mode ?? ''}', packing '${metadata.packingMode ?? ''}'); encode it with texenc`);
+    }
+    if (!(gl instanceof WebGL2RenderingContext) || !this._arrayProgram) {
+      throw new AlphaVideoGpuError('WEBGL_UNSUPPORTED', 'Texture arrays need WebGL2');
+    }
 
-    this._log('[AlphaVideoGpu] Using embedded KTX2 metadata');
-    this._log(`[AlphaVideoGpu] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}, mode=${metadata.mode}, packing=${metadata.packingMode || 'atlas'}`);
+    this._log(`[AlphaVideoGpu] Metadata: ${metadata.frameCount} frames, ${metadata.frameWidth}x${metadata.frameHeight}`);
     this._metadata = metadata;
     this._emitLoad(metadata);
 
-    const partCount = metadata.partCount || metadata.stripCount || 1;
-    const isNativeASTC = metadata.mode === 'astc';
-    const isTextureArray = metadata.packingMode === 'array';
-
-    if (isTextureArray && gl instanceof WebGL2RenderingContext && this._arrayProgram) {
-      this._log('[AlphaVideoGpu] Using texture array mode');
-      if (this._stream) {
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const supercompressionScheme = view.getUint32(44, true);
-        if (supercompressionScheme === 2) {
-          this._log('[AlphaVideoGpu] Using internal zstd streaming mode (stream=true)');
-          const success = await this._loadInternalZstdStreamingTextureArray(gl, data, metadata);
-          if (!success) throw new Error('Failed to load internal zstd streaming texture array');
-        } else if (supercompressionScheme === 0) {
-          this._log('[AlphaVideoGpu] Using uncompressed streaming mode (stream=true)');
-          const success = await this._loadUncompressedStreamingTextureArray(gl, data, metadata);
-          if (!success) throw new Error('Failed to load uncompressed streaming texture array');
-        } else {
-          throw new Error(`Unsupported supercompressionScheme for streaming: ${supercompressionScheme}`);
-        }
+    if (this._stream) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const supercompressionScheme = view.getUint32(44, true);
+      if (supercompressionScheme === 2) {
+        this._log('[AlphaVideoGpu] Using internal zstd streaming mode (stream=true)');
+        const success = await this._loadInternalZstdStreamingTextureArray(gl, data, metadata);
+        if (!success) throw new Error('Failed to load internal zstd streaming texture array');
+      } else if (supercompressionScheme === 0) {
+        this._log('[AlphaVideoGpu] Using uncompressed streaming mode (stream=true)');
+        const success = await this._loadUncompressedStreamingTextureArray(gl, data, metadata);
+        if (!success) throw new Error('Failed to load uncompressed streaming texture array');
       } else {
-        const success = await this._loadTextureArray(gl, data, metadata);
-        if (!success) throw new Error('Failed to load texture array');
+        throw new Error(`Unsupported supercompressionScheme for streaming: ${supercompressionScheme}`);
       }
-      this._textures.push(gl.createTexture()!);
     } else {
-      const useExplicitParts = partUris && partUris.length > 1;
-      const actualPartCount = useExplicitParts ? partUris!.length : partCount;
-
-      if (actualPartCount > 1) {
-        const metadataParts = metadata.parts || metadata.strips || [];
-        const basePath = uri.replace(/(_\d+)?\.(ktx2|basis)$/i, '');
-        for (let i = 0; i < actualPartCount; i++) {
-          let partUrl: string;
-          if (useExplicitParts && partUris![i]) {
-            partUrl = partUris![i];
-          } else {
-            const partFile = metadataParts[i]?.file || `${basePath}_${i}.ktx2`;
-            partUrl = partFile.startsWith('http') ? partFile : uri.substring(0, uri.lastIndexOf('/') + 1) + partFile;
-          }
-          const partResponse = await fetch(partUrl);
-          const partData = new Uint8Array(await partResponse.arrayBuffer());
-          const tex = isNativeASTC
-            ? await this._loadNativeASTCKTX2(gl, partData)
-            : await this._transcodeKTX2(gl, BasisModule, partData, targetFormat);
-          if (tex) this._textures.push(tex);
-        }
-      } else {
-        const tex = isNativeASTC
-          ? await this._loadNativeASTCKTX2(gl, data)
-          : await this._transcodeKTX2(gl, BasisModule, data, targetFormat);
-        if (tex) this._textures.push(tex);
-      }
+      const success = await this._loadTextureArray(gl, data, metadata);
+      if (!success) throw new Error('Failed to load texture array');
     }
   }
 
@@ -843,13 +577,6 @@ export class KTX2PlayerCore {
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
       this._textureArray = textureArray;
-      this._useTextureArray = true;
-
-      const uvs: FrameUV[] = [];
-      for (let i = 0; i < metadata.frameCount; i++) {
-        uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
-      }
-      this._frameUVs = uvs;
 
       this._log(`[AlphaVideoGpu] ✓ Texture array loaded: ${width}x${height}, ${layerCount} layers`);
       return true;
@@ -958,12 +685,7 @@ export class KTX2PlayerCore {
       };
       this._streamingFrameCache = fileFrames as any;
 
-      const uvs: FrameUV[] = [];
-      for (let i = 0; i < metadata.frameCount; i++) uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
-      this._frameUVs = uvs;
-
       this._textureArray = this._streamingRingBuffer;
-      this._useTextureArray = true;
 
       this._log(`[AlphaVideoGpu] ✓ Uncompressed streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
       return true;
@@ -1005,7 +727,6 @@ export class KTX2PlayerCore {
       this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
 
       this._streamingMode = true;
-      this._streamingIsInternalZstd = true;
       this._streamingLayerCount = layerCount;
       this._streamingLevel0Offset = level0Offset;
       this._streamingFrameCache = new Map();
@@ -1039,12 +760,7 @@ export class KTX2PlayerCore {
         }
       }
 
-      const uvs: FrameUV[] = [];
-      for (let i = 0; i < metadata.frameCount; i++) uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
-      this._frameUVs = uvs;
-
       this._textureArray = this._streamingRingBuffer;
-      this._useTextureArray = true;
 
       this._startBackgroundDecompression();
 
@@ -1186,133 +902,6 @@ export class KTX2PlayerCore {
     }
   }
 
-  // ======== Private: Continue Streaming Decompression (outer zstd) ========
-
-  private _continueStreamingDecompression(): void {
-    if (this._streamingCancelled) return;
-
-    const state = this._streamingDecompressState;
-    if (!state || state.reachedEnd) return;
-
-    const currentFrame = this._currentFrame;
-    const decodePos = this._streamingDecodePos;
-    const frameCache = this._streamingFrameCache;
-    const bytesPerLayer = this._streamingBytesPerLayer;
-
-    if (decodePos > currentFrame + this._streamingPrefetchAhead) {
-      if (!this._streamingDecompressPaused) this._streamingDecompressPaused = true;
-      this._evictOldFramesFromCache(currentFrame);
-      this._scheduleStreamingDecode();
-      return;
-    }
-
-    this._streamingDecompressPaused = false;
-    this._evictOldFramesFromCache(currentFrame);
-
-    const startTime = performance.now();
-    const maxTimePerBatch = 8;
-    const maxCacheSize = this._useVramStrategy ? 5 : this._streamingCacheSize;
-
-    while (performance.now() - startTime < maxTimePerBatch) {
-      if (frameCache.size >= maxCacheSize) break;
-      if (state.frameAccumulatorLength > bytesPerLayer * 2) break;
-
-      const result = state.generator.next();
-      if (result.done) {
-        state.reachedEnd = true;
-        this._log(`[AlphaVideoGpu] ✓ Streaming decompression complete: ${decodePos} frames decoded`);
-        break;
-      }
-
-      const chunk = result.value;
-
-      // Skip header bytes on loop restart
-      if (state.bytesToSkipForHeader > 0) {
-        const toSkip = Math.min(chunk.length, state.bytesToSkipForHeader);
-        state.bytesToSkipForHeader -= toSkip;
-        if (toSkip < chunk.length) {
-          const remaining = chunk.subarray(toSkip);
-          if (state.frameAccumulator && state.frameAccumulatorLength + remaining.length <= state.frameAccumulator.length) {
-            state.frameAccumulator.set(remaining, state.frameAccumulatorLength);
-            state.frameAccumulatorLength += remaining.length;
-          }
-        }
-        continue;
-      }
-
-      // Parse header first (only on first pass)
-      if (!state.headerParsed) {
-        const spaceLeft = state.headerBuffer.length - state.headerBufferLength;
-        const toCopy = Math.min(chunk.length, spaceLeft);
-        state.headerBuffer.set(chunk.subarray(0, toCopy), state.headerBufferLength);
-        state.headerBufferLength += toCopy;
-
-        if (state.headerBufferLength >= 200) {
-          const view = new DataView(state.headerBuffer.buffer);
-          if (state.headerBuffer[0] === 0xAB && state.headerBuffer[1] === 0x4B) {
-            state.headerParsed = true;
-            state.level0Offset = Number(view.getBigUint64(80, true));
-            this._streamingLevel0Offset = state.level0Offset;
-            state.frameAccumulator = new Uint8Array(bytesPerLayer * 2);
-            state.frameAccumulatorLength = 0;
-            const headerRemaining = state.headerBufferLength - state.level0Offset;
-            if (headerRemaining > 0) {
-              state.frameAccumulator.set(
-                state.headerBuffer.subarray(state.level0Offset, state.headerBufferLength), 0
-              );
-              state.frameAccumulatorLength = headerRemaining;
-            }
-            if (toCopy < chunk.length) {
-              const remaining = chunk.subarray(toCopy);
-              state.frameAccumulator.set(remaining, state.frameAccumulatorLength);
-              state.frameAccumulatorLength += remaining.length;
-            }
-          }
-        }
-        continue;
-      }
-
-      // Accumulate frame data
-      const maxAccumulatorSize = bytesPerLayer * 4;
-      if (state.frameAccumulatorLength + chunk.length > state.frameAccumulator.length) {
-        const newSize = Math.min(state.frameAccumulator.length * 2, maxAccumulatorSize);
-        if (newSize > state.frameAccumulator.length) {
-          const newAccum = new Uint8Array(newSize);
-          newAccum.set(state.frameAccumulator.subarray(0, state.frameAccumulatorLength));
-          state.frameAccumulator = newAccum;
-        }
-      }
-      if (state.frameAccumulatorLength + chunk.length <= state.frameAccumulator.length) {
-        state.frameAccumulator.set(chunk, state.frameAccumulatorLength);
-        state.frameAccumulatorLength += chunk.length;
-      }
-
-      // Extract complete frames
-      while (state.frameAccumulatorLength >= bytesPerLayer) {
-        if (frameCache.size >= maxCacheSize) break;
-        if (this._streamingDecodePos >= this._streamingSkipTo) {
-          frameCache.set(this._streamingDecodePos, state.frameAccumulator.slice(0, bytesPerLayer));
-        }
-        this._streamingDecodePos++;
-        this._streamingFramesReady = this._streamingDecodePos;
-        const remaining = state.frameAccumulatorLength - bytesPerLayer;
-        if (remaining > 0) {
-          state.frameAccumulator.copyWithin(0, bytesPerLayer, state.frameAccumulatorLength);
-        }
-        state.frameAccumulatorLength = remaining;
-      }
-    }
-
-    if (!state.reachedEnd && !this._streamingCancelled) {
-      const cacheIsFull = frameCache.size >= maxCacheSize;
-      if (!cacheIsFull) {
-        this._scheduleStreamingDecode();
-      } else {
-        this._streamingDecompressPaused = true;
-      }
-    }
-  }
-
   // ======== Private: Handle Streaming Loop ========
 
   private _handleStreamingLoop(): void {
@@ -1323,24 +912,11 @@ export class KTX2PlayerCore {
     this._restartStreamingDecode(0);
   }
 
-  /** Starts whichever streaming decoder this source uses, unless it is already running. */
+  /** Starts the streaming decoder, unless it is already running. */
   private _kickStreamingDecode(): void {
     const state = this._streamingDecompressState;
     if (!this._streamingMode || !state || this._streamingCancelled) return;
-    if (this._streamingIsInternalZstd) {
-      this._startBackgroundDecompression();
-    } else if (!state.reachedEnd) {
-      this._streamingDecompressPaused = false;
-      this._continueStreamingDecompression();
-    }
-  }
-
-  private _scheduleStreamingDecode(): void {
-    if (this._decodeFrameId !== null || this._streamingCancelled) return;
-    this._decodeFrameId = requestAnimationFrame(() => {
-      this._decodeFrameId = null;
-      this._continueStreamingDecompression();
-    });
+    this._startBackgroundDecompression();
   }
 
   /**
@@ -1358,8 +934,7 @@ export class KTX2PlayerCore {
     }
     if (buffered) return;
 
-    const reachedEnd = this._streamingIsInternalZstd ? decodePos >= this._streamingLayerCount : state.reachedEnd;
-    if (target >= decodePos && !reachedEnd) {
+    if (target >= decodePos && decodePos < this._streamingLayerCount) {
       this._streamingFrameCache.clear();
       this._streamingSkipTo = target;
       this._kickStreamingDecode();
@@ -1381,7 +956,6 @@ export class KTX2PlayerCore {
     this._streamingDecodePos = 0;
     this._streamingFramesReady = 0;
     this._streamingSkipTo = skipTo;
-    this._streamingDecompressPaused = false;
 
     const state = this._streamingDecompressState;
     this._closeStreamingGenerator();
@@ -1392,19 +966,9 @@ export class KTX2PlayerCore {
 
       if (state) {
         state.generator = generator;
-        if (this._streamingIsInternalZstd) {
-          state.frameAccumulator = new Uint8Array(0);
-          state.totalBytesDecoded = 0;
-          state.totalFramesDecoded = 0;
-        } else {
-          state.reachedEnd = false;
-          state.frameAccumulatorLength = 0;
-          state.bytesToSkipForHeader = this._streamingLevel0Offset;
-          const bytesPerLayer = this._streamingBytesPerLayer;
-          if (bytesPerLayer > 0) {
-            state.frameAccumulator = new Uint8Array(bytesPerLayer * 2);
-          }
-        }
+        state.frameAccumulator = new Uint8Array(0);
+        state.totalBytesDecoded = 0;
+        state.totalFramesDecoded = 0;
       }
 
       this._kickStreamingDecode();
@@ -1431,144 +995,18 @@ export class KTX2PlayerCore {
     attempt();
   }
 
-  // ======== Private: Load Streaming Texture Array (.ktx2.zst) ========
-
-  private async _loadStreamingTextureArray(
-    gl: WebGL2RenderingContext, uri: string,
-    onProgress?: (loaded: number, total: number, layersReady: number) => void
-  ): Promise<boolean> {
-    try {
-      this._log('[AlphaVideoGpu] Starting streaming load:', uri);
-
-      const decoder = await this._ensureZstdDecoder();
-      if (typeof decoder.decodeStreaming !== 'function') {
-        throw new Error('decodeStreaming not available. Include zstddec-stream.js');
-      }
-
-      const response = await fetch(uri);
-      if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
-
-      const contentLength = parseInt(response.headers.get('content-length') || '0');
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('ReadableStream not supported');
-
-      const compressedChunks: Uint8Array[] = [];
-      let receivedLength = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        compressedChunks.push(value);
-        receivedLength += value.length;
-        onProgress?.(receivedLength, contentLength, 0);
-      }
-
-      this._log(`[AlphaVideoGpu] Downloaded ${receivedLength} bytes, parsing header...`);
-      this._streamingCompressedChunks = compressedChunks;
-
-      // Parse header from first decompressed chunk
-      const generator = decoder.decodeStreaming(compressedChunks);
-      let headerBuffer = new Uint8Array(256);
-      let headerBufferLength = 0;
-      let headerParsed = false;
-      let width = 0, height = 0, layerCount = 0, vkFormat = 0, level0Offset = 0;
-
-      for (const chunk of generator) {
-        if (headerBufferLength + chunk.length > headerBuffer.length) {
-          const newSize = Math.max(headerBuffer.length * 2, headerBufferLength + chunk.length);
-          const newBuf = new Uint8Array(newSize);
-          newBuf.set(headerBuffer.subarray(0, headerBufferLength));
-          headerBuffer = newBuf;
-        }
-        headerBuffer.set(chunk, headerBufferLength);
-        headerBufferLength += chunk.length;
-
-        if (headerBufferLength >= 200 && !headerParsed) {
-          const view = new DataView(headerBuffer.buffer);
-          if (headerBuffer[0] === 0xAB && headerBuffer[1] === 0x4B) {
-            vkFormat = view.getUint32(12, true);
-            width = view.getUint32(20, true);
-            height = view.getUint32(24, true);
-            layerCount = view.getUint32(32, true);
-            level0Offset = Number(view.getBigUint64(80, true));
-            headerParsed = true;
-            break;
-          }
-        }
-      }
-
-      if (!headerParsed) throw new Error('Failed to parse KTX2 header from stream');
-
-      this._log(`[AlphaVideoGpu] Streaming texture: ${width}x${height}, ${layerCount} layers`);
-
-      const metadata = extractKTX2Metadata(headerBuffer.subarray(0, Math.min(headerBufferLength, level0Offset + 100)));
-      if (!metadata) throw new Error('No metadata found in streaming KTX2');
-      this._metadata = metadata;
-      this._emitLoad(metadata);
-
-      this._streamingLayerCount = layerCount;
-      this._streamingLevel0Offset = level0Offset;
-
-      requireASTC(gl);
-      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
-      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
-
-      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
-
-      this._streamingMode = true;
-      this._streamingIsInternalZstd = false;
-      this._streamingFrameCache = new Map();
-      this._streamingDecodePos = 0;
-      this._streamingFramesReady = 0;
-
-      const uvs: FrameUV[] = [];
-      for (let i = 0; i < metadata.frameCount; i++) uvs.push({ minU: 0, minV: 0, maxU: 1, maxV: 1, layer: i });
-      this._frameUVs = uvs;
-
-      this._textureArray = this._streamingRingBuffer;
-      this._useTextureArray = true;
-      this._textures.push(gl.createTexture()!);
-
-      const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
-
-      const newGenerator = decoder.decodeStreaming(compressedChunks);
-      this._streamingDecompressState = {
-        generator: newGenerator,
-        reachedEnd: false,
-        headerBuffer: new Uint8Array(256),
-        headerBufferLength: 0,
-        headerParsed: true,
-        level0Offset: level0Offset,
-        frameAccumulator: new Uint8Array(bytesPerLayer * 2),
-        frameAccumulatorLength: 0,
-        bytesToSkipForHeader: level0Offset,
-      };
-
-      this._continueStreamingDecompression();
-
-      this._log(`[AlphaVideoGpu] ✓ Streaming initialized: ${width}x${height}, ring=${this._streamingRingActualSize}, cache=${this._streamingCacheSize}`);
-      return true;
-    } catch (error) {
-      if (error instanceof AlphaVideoGpuError) throw error;
-      console.error('[AlphaVideoGpu] Streaming load failed:', error);
-      return false;
-    }
-  }
-
   // ======== Private: Render Frame ========
 
   /** Draws the current frame; false when it isn't decoded yet, leaving the last one showing. */
   private _render(): boolean {
     const gl = this._gl;
-    const program = this._program;
-    const frameUVs = this._frameUVs;
-    const textures = this._textures;
     const metadata = this._metadata;
+    const arrayProgram = this._arrayProgram;
 
-    if (!gl || !frameUVs.length || !metadata) return false;
+    if (!gl || !metadata || !arrayProgram || !this._textureArray) return false;
 
     const currentFrame = this._currentFrame;
-    const frameUV = frameUVs[currentFrame];
-    if (!frameUV) return false;
+    if (currentFrame >= metadata.frameCount) return false;
 
     const prepareTarget = () => {
       // If using shared GL context, ensure shared canvas is large enough and set viewport
@@ -1582,104 +1020,65 @@ export class KTX2PlayerCore {
       gl.clear(gl.COLOR_BUFFER_BIT);
     };
 
-    // Texture array rendering (WebGL2)
-    if (this._useTextureArray && this._arrayProgram && this._textureArray) {
-      const arrayProgram = this._arrayProgram;
-      const gl2 = gl as WebGL2RenderingContext;
+    const gl2 = gl as WebGL2RenderingContext;
 
-      let layerIndex: number;
+    let layerIndex: number;
 
-      if (this._streamingMode) {
-        // Check if frame is ready
-        const slot = currentFrame < this._streamingFramesReady ? this._ensureFrameInRingBuffer(currentFrame) : -1;
-        if (slot === -1) {
-          if (this._streamingDecompressPaused) this._kickStreamingDecode();
-          return false;
+    if (this._streamingMode) {
+      // Check if frame is ready
+      const slot = currentFrame < this._streamingFramesReady ? this._ensureFrameInRingBuffer(currentFrame) : -1;
+      if (slot === -1) return false;
+      layerIndex = slot;
+
+      // Prefetch next frames
+      for (let i = 1; i <= 3; i++) {
+        const nextFrame = currentFrame + i;
+        if (nextFrame < metadata.frameCount) {
+          this._ensureFrameInRingBuffer(nextFrame);
         }
-        layerIndex = slot;
-
-        // Prefetch next frames
-        for (let i = 1; i <= 3; i++) {
-          const nextFrame = currentFrame + i;
-          if (nextFrame < metadata.frameCount) {
-            this._ensureFrameInRingBuffer(nextFrame);
-          }
-        }
-
-        // Resume decompression if paused and cache has room
-        const maxCacheSize = this._useVramStrategy ? 5 : this._streamingCacheSize;
-        if (this._streamingDecompressPaused && this._streamingFrameCache.size < maxCacheSize) {
-          this._kickStreamingDecode();
-        }
-      } else if (this._ramHeavyMode && this._ramFrameData) {
-        // Non-streaming RAM mode: upload current frame on demand
-        if (currentFrame !== this._ramUploadedFrame) {
-          const offset = currentFrame * this._ramBytesPerFrame;
-          const frameData = new Uint8Array(
-            this._ramFrameData.buffer,
-            this._ramFrameData.byteOffset + offset,
-            this._ramBytesPerFrame
-          );
-
-          gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, this._textureArray);
-          gl2.compressedTexSubImage3D(
-            gl2.TEXTURE_2D_ARRAY, 0, 0, 0, 0,
-            this._ramWidth, this._ramHeight, 1,
-            this._ramAstcFormat, frameData
-          );
-          this._ramUploadedFrame = currentFrame;
-        }
-        layerIndex = 0;
-      } else {
-        // Non-streaming VRAM mode
-        layerIndex = frameUV.layer !== undefined ? frameUV.layer : currentFrame;
       }
+    } else if (this._ramHeavyMode && this._ramFrameData) {
+      // Non-streaming RAM mode: upload current frame on demand
+      if (currentFrame !== this._ramUploadedFrame) {
+        const offset = currentFrame * this._ramBytesPerFrame;
+        const frameData = new Uint8Array(
+          this._ramFrameData.buffer,
+          this._ramFrameData.byteOffset + offset,
+          this._ramBytesPerFrame
+        );
 
-      prepareTarget();
-      gl2.useProgram(arrayProgram);
-      gl2.activeTexture(gl2.TEXTURE0);
-      gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, this._textureArray);
-      gl2.uniform1i(gl2.getUniformLocation(arrayProgram, 'u_textureArray'), 0);
-      gl2.uniform1f(gl2.getUniformLocation(arrayProgram, 'u_layer'), layerIndex);
-
-      const posLoc = gl2.getAttribLocation(arrayProgram, 'a_position');
-      gl2.bindBuffer(gl2.ARRAY_BUFFER, this._positionBuffer);
-      gl2.enableVertexAttribArray(posLoc);
-      gl2.vertexAttribPointer(posLoc, 2, gl2.FLOAT, false, 0, 0);
-
-      const texLoc = gl2.getAttribLocation(arrayProgram, 'a_texCoord');
-      gl2.bindBuffer(gl2.ARRAY_BUFFER, this._texCoordBuffer);
-      gl2.enableVertexAttribArray(texLoc);
-      gl2.vertexAttribPointer(texLoc, 2, gl2.FLOAT, false, 0, 0);
-
-      gl2.drawArrays(gl2.TRIANGLES, 0, 6);
+        gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, this._textureArray);
+        gl2.compressedTexSubImage3D(
+          gl2.TEXTURE_2D_ARRAY, 0, 0, 0, 0,
+          this._ramWidth, this._ramHeight, 1,
+          this._ramAstcFormat, frameData
+        );
+        this._ramUploadedFrame = currentFrame;
+      }
+      layerIndex = 0;
     } else {
-      // Standard 2D texture rendering (atlas mode)
-      if (!program || !textures.length) return false;
-
-      const framesPerPart = metadata.framesPerPart || metadata.framesPerStrip || metadata.frameCount;
-      const partIndex = Math.floor(currentFrame / framesPerPart);
-      const texture = textures[partIndex] || textures[0];
-
-      prepareTarget();
-      gl.useProgram(program);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.uniform1i(gl.getUniformLocation(program, 'u_texture'), 0);
-      gl.uniform4f(gl.getUniformLocation(program, 'u_frameUV'), frameUV.minU, frameUV.minV, frameUV.maxU, frameUV.maxV);
-
-      const posLoc = gl.getAttribLocation(program, 'a_position');
-      gl.bindBuffer(gl.ARRAY_BUFFER, this._positionBuffer);
-      gl.enableVertexAttribArray(posLoc);
-      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-
-      const texLoc = gl.getAttribLocation(program, 'a_texCoord');
-      gl.bindBuffer(gl.ARRAY_BUFFER, this._texCoordBuffer);
-      gl.enableVertexAttribArray(texLoc);
-      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
-
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      // Non-streaming VRAM mode
+      layerIndex = currentFrame;
     }
+
+    prepareTarget();
+    gl2.useProgram(arrayProgram);
+    gl2.activeTexture(gl2.TEXTURE0);
+    gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, this._textureArray);
+    gl2.uniform1i(gl2.getUniformLocation(arrayProgram, 'u_textureArray'), 0);
+    gl2.uniform1f(gl2.getUniformLocation(arrayProgram, 'u_layer'), layerIndex);
+
+    const posLoc = gl2.getAttribLocation(arrayProgram, 'a_position');
+    gl2.bindBuffer(gl2.ARRAY_BUFFER, this._positionBuffer);
+    gl2.enableVertexAttribArray(posLoc);
+    gl2.vertexAttribPointer(posLoc, 2, gl2.FLOAT, false, 0, 0);
+
+    const texLoc = gl2.getAttribLocation(arrayProgram, 'a_texCoord');
+    gl2.bindBuffer(gl2.ARRAY_BUFFER, this._texCoordBuffer);
+    gl2.enableVertexAttribArray(texLoc);
+    gl2.vertexAttribPointer(texLoc, 2, gl2.FLOAT, false, 0, 0);
+
+    gl2.drawArrays(gl2.TRIANGLES, 0, 6);
 
     // If using shared GL context, copy rendered frame to visible canvas
     if (this._usingSharedGL && this._ctx2d) {

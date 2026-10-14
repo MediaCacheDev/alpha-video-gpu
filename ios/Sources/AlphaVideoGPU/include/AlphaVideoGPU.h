@@ -1,7 +1,7 @@
 /**
  * AlphaVideoGPU.h
- * Transparent animations for iOS from KTX2 texture arrays (ASTC, or Basis UASTC transcoded on the
- * device), drawn with Metal.
+ * Transparent animations for iOS from ASTC KTX2 texture arrays, drawn with Metal. The simulator
+ * decodes the ASTC in software.
  */
 
 #import <Metal/Metal.h>
@@ -30,12 +30,6 @@ NS_ASSUME_NONNULL_BEGIN
  * before source. Default: a hash of the URL, under Caches/alpha-video-gpu.
  */
 @property (nonatomic, copy, nullable) NSString *cacheKey;
-/**
- * Multi-part animations whose parts can't be found next to source: every part's URI, the first
- * holding the metadata. Optional cache keys by index, NSNull or @"" where there is none.
- */
-@property (nonatomic, copy, nullable) NSArray<NSString *> *partURIs;
-@property (nonatomic, copy, nullable) NSArray *partCacheKeys;
 
 @property (nonatomic, assign) BOOL autoPlay;           // Default YES
 @property (nonatomic, assign) BOOL loop;               // Default YES

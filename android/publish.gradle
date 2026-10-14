@@ -18,7 +18,7 @@ afterEvaluate {
 
                 pom {
                     name = 'alpha-video-gpu'
-                    description = 'Transparent animations for Android from KTX2 texture arrays (ASTC or Basis UASTC), drawn into a TextureView with OpenGL ES 3.0.'
+                    description = 'Transparent animations for Android from ASTC texture arrays in KTX2 files, drawn into a TextureView with OpenGL ES 3.0.'
                     url = repoUrl
                     inceptionYear = '2026'
                     licenses {
@@ -28,7 +28,7 @@ afterEvaluate {
                             distribution = 'repo'
                         }
                         license {
-                            name = 'Apache-2.0 (Basis Universal transcoder, ASTC decoder)'
+                            name = 'Apache-2.0 (ASTC decoder)'
                             url = 'https://www.apache.org/licenses/LICENSE-2.0'
                             distribution = 'repo'
                         }

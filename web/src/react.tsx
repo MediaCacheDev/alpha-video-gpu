@@ -14,22 +14,20 @@
  *     loop
  *   />
  *
- * Self-contained: Basis Universal + ZSTD decoders (JS + WASM) are bundled inline.
+ * Self-contained: the ZSTD decoder (JS + WASM) is bundled inline.
  * No external files or <script> tags needed.
  */
 
 import React, { forwardRef, useImperativeHandle, useRef, useEffect, useMemo } from 'react';
 import { KTX2PlayerCore } from './KTX2PlayerCore';
 import type { KTX2LoadEvent, PlayerState, MemoryStrategy } from './types';
-import { initBasisTranscoder, ZSTDDecoder } from './bundled-deps';
+import { ZSTDDecoder } from './bundled-deps';
 
 export type { KTX2LoadEvent as AlphaVideoGpuLoadEvent, PlayerState, MemoryStrategy };
 
 export interface AlphaVideoGpuPlayerProps {
   /** Source URL for the KTX2 file */
   src?: string;
-  /** Optional array of part URIs for multi-part animations */
-  parts?: string[];
   /** Stable identity for the IndexedDB cache, for URLs that change while the file doesn't */
   cacheKey?: string;
   /** Canvas width in pixels */
@@ -80,7 +78,6 @@ export interface AlphaVideoGpuPlayerRef {
 
 export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideoGpuPlayerProps>(({
   src,
-  parts,
   cacheKey,
   width = 300,
   height = 300,
@@ -129,7 +126,6 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
       streamingPrefetchAhead,
       memoryStrategy,
       verbose,
-      basisTranscoderInit: initBasisTranscoder,
       ZSTDDecoderClass: ZSTDDecoder as any,
       onStateChange,
       onLoad,
@@ -158,7 +154,7 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
     const identity = cacheKey || src;
     if (loadedSrcRef.current === identity) return;
     loadedSrcRef.current = identity;
-    core.setSource(src, parts, cacheKey);
+    core.setSource(src, cacheKey);
     return () => { loadedSrcRef.current = null; core.resetSource(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKey || src]);

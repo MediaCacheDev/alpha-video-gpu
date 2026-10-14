@@ -5,7 +5,7 @@
  * Thin wrapper around AlphaVideoGpuCore (alpha-video-gpu-web) for React Native Web.
  * Same API as native iOS/Android implementations.
  *
- * The Basis Universal and zstd decoders (JS + WASM) come bundled in alpha-video-gpu-web.
+ * The zstd decoder (JS + WASM) comes bundled in alpha-video-gpu-web.
  */
 
 import React, { forwardRef, useImperativeHandle, useRef, useEffect, useMemo } from 'react';
@@ -13,7 +13,6 @@ import { View, StyleSheet } from 'react-native';
 
 import {
   AlphaVideoGpuCore,
-  initBasisTranscoder,
   ZSTDDecoder,
   type AlphaVideoGpuError,
   type AlphaVideoGpuErrorCode,
@@ -37,8 +36,6 @@ export interface SourceType {
 
 export interface AlphaVideoGpuViewProps {
   source?: SourceType | string | null;
-  /** For multi-part animations: array of all part sources (first part contains metadata) */
-  parts?: SourceType[] | null;
   autoPlay?: boolean;
   loop?: boolean;
   playbackSpeed?: number;
@@ -57,7 +54,7 @@ export interface AlphaVideoGpuViewProps {
   /** Send onFrameUpdate for every frame played; seeks always send it. Default: false */
   enableFrameEvents?: boolean;
 
-  // Streaming parameters (for .ktx2.zst files)
+  // Streaming parameters (with stream)
   /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
   streamingRingSize?: number;
   /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */
@@ -86,7 +83,6 @@ export interface AlphaVideoGpuViewRef {
 
 export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuViewProps>(({
   source,
-  parts,
   autoPlay = true,
   loop = true,
   playbackSpeed = 1.0,
@@ -143,7 +139,6 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
       memoryStrategy,
       verbose,
       frameEvents: enableFrameEvents,
-      basisTranscoderInit: initBasisTranscoder,
       ZSTDDecoderClass: ZSTDDecoder,
       onStateChange: state => callbacksRef.current.onStateChange?.({ nativeEvent: { state } }),
       onLoad: event => callbacksRef.current.onLoad?.({ nativeEvent: event }),
@@ -179,8 +174,7 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
     if (!core || !uri || !sourceIdentity || loadedSourceRef.current === sourceIdentity) return;
 
     loadedSourceRef.current = sourceIdentity;
-    const partUris = parts?.map(p => p.uri).filter(Boolean) as string[] | undefined;
-    core.setSource(uri, partUris, sourceCacheKey);
+    core.setSource(uri, sourceCacheKey);
 
     return () => {
       loadedSourceRef.current = null;

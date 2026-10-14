@@ -1,7 +1,7 @@
 {
   "name": "alpha-video-gpu-web",
   "version": "1.0.0",
-  "description": "Transparent (alpha) KTX2 texture animations in a <canvas> with WebGL, for plain JS/TS and React. Basis Universal and zstd decoders are bundled inline.",
+  "description": "Transparent (alpha) animations from ASTC KTX2 texture arrays in a <canvas> with WebGL2, for plain JS/TS and React. The zstd decoder is bundled inline.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -27,15 +27,14 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "bundle-basis": "node scripts/bundle-basis.js",
-    "build": "npm run bundle-basis && tsup",
-    "typecheck": "npm run bundle-basis && tsc --noEmit",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "npm run build"
   },
   "keywords": [
     "ktx2",
-    "basis-universal",
+    "astc",
     "webgl",
     "alpha",
     "transparent",

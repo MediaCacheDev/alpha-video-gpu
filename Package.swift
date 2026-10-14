@@ -11,10 +11,10 @@ let package = Package(
         .target(
             name: "AlphaVideoGPU",
             path: "ios/Sources/AlphaVideoGPU",
-            // AlphaVideoGpuView.mm compiles it, and the Basis transcoder and zstd, by #include
+            // AlphaVideoGpuView.mm compiles it, and zstd, by #include
             exclude: ["astc_decomp.cpp"],
             publicHeadersPath: "include",
-            cxxSettings: [.headerSearchPath("../../../third_party/basis_universal")],
+            cxxSettings: [.headerSearchPath("../../../third_party")],
             linkerSettings: [
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),

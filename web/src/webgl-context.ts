@@ -12,27 +12,6 @@ let sharedGLResources: SharedGLResources | null = null;
 
 // ---- Vertex/Fragment Shaders ----
 
-const VERT_2D = `
-  attribute vec2 a_position;
-  attribute vec2 a_texCoord;
-  varying vec2 v_texCoord;
-  void main() {
-    gl_Position = vec4(a_position, 0.0, 1.0);
-    v_texCoord = a_texCoord;
-  }
-`;
-
-const FRAG_2D = `
-  precision mediump float;
-  varying vec2 v_texCoord;
-  uniform sampler2D u_texture;
-  uniform vec4 u_frameUV;
-  void main() {
-    vec2 uv = mix(u_frameUV.xy, u_frameUV.zw, v_texCoord);
-    gl_FragColor = texture2D(u_texture, uv);
-  }
-`;
-
 const VERT_ARRAY = `#version 300 es
   in vec2 a_position;
   in vec2 a_texCoord;
@@ -149,11 +128,6 @@ export function getSharedGL(): SharedGLResources | null {
     return null;
   }
 
-  // Compile standard 2D texture program
-  const vs2d = compileShader(gl, gl.VERTEX_SHADER, VERT_2D);
-  const fs2d = compileShader(gl, gl.FRAGMENT_SHADER, FRAG_2D);
-  const program = linkProgram(gl, vs2d, fs2d);
-
   // Compile texture array program (WebGL2 only)
   let arrayProgram: WebGLProgram | null = null;
   if (gl instanceof WebGL2RenderingContext) {
@@ -181,7 +155,6 @@ export function getSharedGL(): SharedGLResources | null {
   sharedGLResources = {
     gl,
     canvas,
-    program,
     arrayProgram,
     positionBuffer,
     texCoordBuffer,
@@ -200,9 +173,8 @@ export function releaseSharedGL(): void {
 
   sharedGLResources.refCount--;
   if (sharedGLResources.refCount <= 0) {
-    const { gl, program, arrayProgram, positionBuffer, texCoordBuffer } =
+    const { gl, arrayProgram, positionBuffer, texCoordBuffer } =
       sharedGLResources;
-    gl.deleteProgram(program);
     if (arrayProgram) gl.deleteProgram(arrayProgram);
     gl.deleteBuffer(positionBuffer);
     gl.deleteBuffer(texCoordBuffer);
@@ -226,7 +198,6 @@ export function createDedicatedGL(
   canvas: HTMLCanvasElement
 ): {
   gl: WebGL2RenderingContext | WebGLRenderingContext;
-  program: WebGLProgram;
   arrayProgram: WebGLProgram | null;
   positionBuffer: WebGLBuffer;
   texCoordBuffer: WebGLBuffer;
@@ -238,10 +209,6 @@ export function createDedicatedGL(
     | null;
 
   if (!gl) return null;
-
-  const vs2d = compileShader(gl, gl.VERTEX_SHADER, VERT_2D);
-  const fs2d = compileShader(gl, gl.FRAGMENT_SHADER, FRAG_2D);
-  const program = linkProgram(gl, vs2d, fs2d);
 
   let arrayProgram: WebGLProgram | null = null;
   if (gl instanceof WebGL2RenderingContext) {
@@ -265,5 +232,5 @@ export function createDedicatedGL(
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-  return { gl, program, arrayProgram, positionBuffer, texCoordBuffer };
+  return { gl, arrayProgram, positionBuffer, texCoordBuffer };
 }

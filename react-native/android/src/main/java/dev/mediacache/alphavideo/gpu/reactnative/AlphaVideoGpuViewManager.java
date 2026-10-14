@@ -3,7 +3,6 @@ package dev.mediacache.alphavideo.gpu.reactnative;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.uimanager.ThemedReactContext;
 import com.facebook.react.uimanager.annotations.ReactProp;
@@ -131,29 +130,6 @@ public class AlphaVideoGpuViewManager extends AlphaVideoGpuViewManagerSpec<Alpha
         view.setStream(stream);
     }
     
-    /**
-     * Explicit part sources for multi-part animations, for sources whose sibling files can't be
-     * found from the source URI (res/raw, content://, presigned URLs).
-     */
-    @ReactProp(name = "parts")
-    @Override
-    public void setParts(AlphaVideoGpuView view, @Nullable ReadableArray parts) {
-        if (parts == null || parts.size() == 0) {
-            view.setParts(null, null);
-            return;
-        }
-
-        String[] uris = new String[parts.size()];
-        String[] cacheKeys = new String[parts.size()];
-        for (int i = 0; i < parts.size(); i++) {
-            ReadableMap part = parts.getMap(i);
-            if (part == null) continue;
-            if (part.hasKey("uri") && !part.isNull("uri")) uris[i] = part.getString("uri");
-            if (part.hasKey("cacheKey") && !part.isNull("cacheKey")) cacheKeys[i] = part.getString("cacheKey");
-        }
-        view.setParts(uris, cacheKeys);
-    }
-
     @ReactProp(name = "verbose", defaultBoolean = false)
     @Override
     public void setVerbose(AlphaVideoGpuView view, boolean verbose) {

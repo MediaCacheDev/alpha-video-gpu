@@ -5,34 +5,14 @@
  * and all wrapper implementations (React Native Web, React, Vanilla JS).
  */
 
-export interface FrameUV {
-  minU: number;
-  minV: number;
-  maxU: number;
-  maxV: number;
-  layer?: number; // For texture array mode
-}
-
 export interface Metadata {
   frameCount: number;
   frameWidth: number;
   frameHeight: number;
   frameRate: number;
-  framesPerRow: number;
-  framesPerPart?: number;
-  framesPerStrip?: number;
-  partCount?: number;
-  stripCount?: number;
-  parts?: Array<{ file: string; columns: number; rows: number }>;
-  strips?: Array<{ file: string; columns: number; rows: number }>;
-  mode?: string;
-  packingMode?: string; // 'atlas' or 'array'
+  mode?: string; // 'astc'
+  packingMode?: string; // 'array'
   layerCount?: number;
-}
-
-export interface GLBParseResult {
-  metadata: Metadata;
-  ktx2Parts: Uint8Array[];
 }
 
 export interface KTX2LoadEvent {
@@ -74,8 +54,6 @@ export interface KTX2PlayerCoreOptions {
   verbose?: boolean;
 
   // Dependency injection — allows different bundling strategies
-  /** Function that returns a Promise resolving to the Basis Universal module */
-  basisTranscoderInit?: () => Promise<any>;
   /** ZSTDDecoder class constructor (for zstd decompression) */
   ZSTDDecoderClass?: new () => any;
 
@@ -95,31 +73,10 @@ export interface KTX2PlayerCoreOptions {
 export interface SharedGLResources {
   gl: WebGL2RenderingContext | WebGLRenderingContext;
   canvas: HTMLCanvasElement;
-  program: WebGLProgram;
   arrayProgram: WebGLProgram | null;
   positionBuffer: WebGLBuffer;
   texCoordBuffer: WebGLBuffer;
   refCount: number;
   maxWidth: number;
   maxHeight: number;
-}
-
-/**
- * Internal streaming decompression state.
- */
-export interface StreamingDecompressState {
-  generator: Generator<Uint8Array, void, unknown> | null;
-  compressedChunks: Uint8Array[];
-  headerBuffer: Uint8Array;
-  headerBufferLength: number;
-  headerParsed: boolean;
-  ktx2Header: any;
-  level0Offset: number;
-  bytesPerLayer: number;
-  gl: WebGL2RenderingContext | WebGLRenderingContext;
-  frameAccumulator: Uint8Array | null;
-  frameAccumulatorLength: number;
-  lastLoggedFrame: number;
-  bytesToSkipForHeader?: number;
-  reachedEnd?: boolean;
 }

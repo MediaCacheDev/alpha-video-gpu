@@ -16,7 +16,6 @@ import com.facebook.react.uimanager.SimpleViewManager;
 public abstract class AlphaVideoGpuViewManagerSpec<T extends View> extends SimpleViewManager<T> {
 
     public abstract void setSource(T view, @Nullable ReadableMap value);
-    public abstract void setParts(T view, @Nullable ReadableArray value);
     public abstract void setAutoPlay(T view, boolean value);
     public abstract void setLoop(T view, boolean value);
     public abstract void setPlaybackSpeed(T view, float value);

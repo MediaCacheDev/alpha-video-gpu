@@ -17,8 +17,6 @@ export interface AlphaVideoGpuViewProps {
   loop?: boolean;
   /** Playback speed multiplier (default: 1.0) */
   playbackSpeed?: number;
-  /** Multi-part animations: every part's source, when the parts can't be found next to `source` */
-  parts?: ReadonlyArray<AlphaVideoGpuSource> | null;
   /** Cache key for remote downloads (same as `source.cacheKey`) */
   cacheKey?: string;
   /** Pause playback */
