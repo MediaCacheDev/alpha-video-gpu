@@ -1094,8 +1094,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             
             while (framesToDecode < targetFramesAhead) {
                 
-                // If decompression ended for current loop, restart for next loop (if looping)
-                if (decompressEnded[0]) {
+                // Once decompression has ended and the last frames are out of the accumulator (a
+                // 64 KB chunk can hold several small frames), restart for the next loop
+                boolean framesLeft = frameAccumulatorBuffer.position() >= finalBytesPerLayer;
+                if (decompressEnded[0] && !framesLeft) {
                     if (!loop) break;
                     // Restart decompression for next loop
                     decoderLoopIteration[0]++;
@@ -1141,7 +1143,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     if (status == 1) { decompressEnded[0] = true; break; }
                 }
                 
-                if (decompressEnded[0]) continue; // Will restart on next iteration if looping
+                if (decompressEnded[0] && frameAccumulatorBuffer.position() < finalBytesPerLayer) continue; // Will restart on next iteration if looping
                 
                 // Update accumulator size after header skip
                 accumulatorSize = frameAccumulatorBuffer.position();
@@ -1976,7 +1978,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             int targetFramesAhead = PREFETCH_AHEAD;
             
             while (framesToDecode < targetFramesAhead) {
-                if (decompressEnded[0]) {
+                // Once decompression has ended and the last frames are out of the accumulator (a
+                // 64 KB chunk can hold several small frames), restart for the next loop
+                boolean framesLeft = frameAccumulatorBuffer.position() >= finalBytesPerLayer;
+                if (decompressEnded[0] && !framesLeft) {
                     if (!loop) break;
                     // Restart decompression for next loop
                     decoderLoopIteration[0]++;
@@ -2014,7 +2019,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     }
                     if (status == 1) { decompressEnded[0] = true; break; }
                 }
-                if (decompressEnded[0]) continue;
+                if (decompressEnded[0] && frameAccumulatorBuffer.position() < finalBytesPerLayer) continue;
                 
                 int accumulatorSize = frameAccumulatorBuffer.position();
                 
