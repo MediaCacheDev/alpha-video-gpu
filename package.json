@@ -37,11 +37,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/danielkpl2/alpha-video-gpu"
+    "url": "https://github.com/MediaCacheDev/alpha-video-gpu"
   },
-  "homepage": "https://github.com/danielkpl2/alpha-video-gpu#readme",
+  "homepage": "https://github.com/MediaCacheDev/alpha-video-gpu#readme",
   "bugs": {
-    "url": "https://github.com/danielkpl2/alpha-video-gpu/issues"
+    "url": "https://github.com/MediaCacheDev/alpha-video-gpu/issues"
   },
   "keywords": [
     "react-native",

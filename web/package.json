@@ -8,11 +8,13 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "module": "./dist/index.mjs",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     },
     "./react": {
       "types": "./dist/react.d.ts",
+      "module": "./dist/react.mjs",
       "import": "./dist/react.mjs",
       "require": "./dist/react.js"
     },
@@ -28,6 +30,7 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup",
+    "build:wasm": "wasm/build.sh",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "npm run build"
@@ -45,12 +48,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danielkpl2/alpha-video-gpu.git",
+    "url": "git+https://github.com/MediaCacheDev/alpha-video-gpu.git",
     "directory": "web"
   },
-  "homepage": "https://github.com/danielkpl2/alpha-video-gpu#readme",
+  "homepage": "https://github.com/MediaCacheDev/alpha-video-gpu#readme",
   "bugs": {
-    "url": "https://github.com/danielkpl2/alpha-video-gpu/issues"
+    "url": "https://github.com/MediaCacheDev/alpha-video-gpu/issues"
   },
   "peerDependencies": {
     "react": ">=16.8"

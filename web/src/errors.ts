@@ -1,6 +1,7 @@
 /**
- * - `ASTC_UNSUPPORTED`: the browser has no `WEBGL_compressed_texture_astc`. There is no
- *   software fallback on the web.
+ * - `ASTC_UNSUPPORTED`: the browser has no `WEBGL_compressed_texture_astc`, and the software
+ *   decoder couldn't load either (WebAssembly blocked, as by a Content-Security-Policy without
+ *   'wasm-unsafe-eval').
  * - `WEBGL_UNSUPPORTED`: no WebGL2 context could be created.
  */
 export type AlphaVideoGpuErrorCode = 'ASTC_UNSUPPORTED' | 'WEBGL_UNSUPPORTED';
@@ -14,12 +15,4 @@ export class AlphaVideoGpuError extends Error {
     this.name = 'AlphaVideoGpuError';
     this.code = code;
   }
-}
-
-export function requireASTC(gl: WebGLRenderingContext): void {
-  if (gl.getExtension('WEBGL_compressed_texture_astc')) return;
-  throw new AlphaVideoGpuError(
-    'ASTC_UNSUPPORTED',
-    'This browser has no ASTC texture support (WEBGL_compressed_texture_astc), so ASTC files cannot play here.'
-  );
 }

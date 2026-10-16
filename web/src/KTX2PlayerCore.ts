@@ -25,11 +25,13 @@ import {
 import {
   extractKTX2Metadata,
   ASTC_FORMAT_MAP,
+  getASTCBlockSize,
   getASTCBytesPerLayer,
 } from './ktx2-parser';
 
 import { getCachedFile, setCachedFile } from './cache';
-import { AlphaVideoGpuError, requireASTC } from './errors';
+import { AlphaVideoGpuError } from './errors';
+import type { SoftwareAstcDecoder } from './software-astc';
 
 // Re-export types for convenience
 export type {
@@ -87,6 +89,10 @@ export class KTX2PlayerCore {
 
   // -- Textures --
   private _textureArray: WebGLTexture | null = null;
+  // Set when the browser has no ASTC: layers are decoded to RGBA and the textures are RGBA8
+  private _softwareAstc: SoftwareAstcDecoder | null = null;
+  private _blockWidth = 4;
+  private _blockHeight = 4;
 
   // -- Playback --
   private _metadata: Metadata | null = null;
@@ -433,6 +439,46 @@ export class KTX2PlayerCore {
     return this._zstdDecoder;
   }
 
+  // ======== Private: ASTC on the GPU, or decoded in software ========
+
+  /** Uses the GPU's ASTC where the browser has it, and loads the software decoder where not. */
+  private async _prepareAstc(gl: WebGL2RenderingContext, vkFormat: number): Promise<void> {
+    ({ blockWidth: this._blockWidth, blockHeight: this._blockHeight } = getASTCBlockSize(vkFormat));
+    if (gl.getExtension('WEBGL_compressed_texture_astc')) {
+      this._softwareAstc = null;
+      return;
+    }
+    try {
+      const { loadSoftwareAstcDecoder } = await import('./software-astc');
+      this._softwareAstc = await loadSoftwareAstcDecoder();
+    } catch (error) {
+      throw new AlphaVideoGpuError(
+        'ASTC_UNSUPPORTED',
+        `This browser has no ASTC texture support (WEBGL_compressed_texture_astc), and the software decoder failed to load: ${(error as Error).message}`
+      );
+    }
+    this._log('[AlphaVideoGpu] No GPU ASTC support: decoding frames to RGBA in software');
+  }
+
+  /** Allocates the bound texture array: ASTC, or RGBA8 when decoding in software. */
+  private _allocateLayers(
+    gl: WebGL2RenderingContext, width: number, height: number, layers: number, astcFormat: number
+  ): void {
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, this._softwareAstc ? gl.RGBA8 : astcFormat, width, height, layers);
+  }
+
+  /** Uploads one layer of ASTC blocks to the bound texture array, decoding it first in software. */
+  private _uploadLayer(
+    gl: WebGL2RenderingContext, layer: number, width: number, height: number, astcFormat: number, astc: Uint8Array
+  ): void {
+    if (this._softwareAstc) {
+      const rgba = this._softwareAstc.decode(astc, width, height, this._blockWidth, this._blockHeight);
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, width, height, 1, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    } else {
+      gl.compressedTexSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, width, height, 1, astcFormat, astc);
+    }
+  }
+
   // ======== Private: Cleanup ========
 
   private _cleanupTextures(gl: WebGLRenderingContext): void {
@@ -510,13 +556,19 @@ export class KTX2PlayerCore {
     gl: WebGL2RenderingContext, ktx2Data: Uint8Array, metadata: Metadata
   ): Promise<boolean> {
     try {
-      const useRamMode = this._memoryStrategy === 'ram';
       const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
       const vkFormat = view.getUint32(12, true);
       const width = view.getUint32(20, true);
       const height = view.getUint32(24, true);
       const layerCount = view.getUint32(32, true);
       const supercompressionScheme = view.getUint32(44, true);
+
+      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
+      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
+      await this._prepareAstc(gl, vkFormat);
+      // In software the clip stays ASTC in memory and the shown frame is decoded: every frame as
+      // RGBA would take 4-36 times the memory, which a long clip doesn't have
+      const useRamMode = this._memoryStrategy === 'ram' || this._softwareAstc !== null;
 
       this._log(`[AlphaVideoGpu] Texture array: ${width}x${height}, ${layerCount} layers (${useRamMode ? 'RAM' : 'VRAM'} mode)`);
 
@@ -534,18 +586,13 @@ export class KTX2PlayerCore {
         compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
       }
 
-      requireASTC(gl);
-      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
-      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
-
       const textureArray = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, textureArray);
 
       if (useRamMode) {
         const gpuRingSize = 2;
         const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
-        const emptyData = new Uint8Array(bytesPerLayer * gpuRingSize);
-        gl.compressedTexImage3D(gl.TEXTURE_2D_ARRAY, 0, astcFormat, width, height, gpuRingSize, 0, emptyData);
+        this._allocateLayers(gl, width, height, gpuRingSize, astcFormat);
 
         this._ramFrameData = compressedData;
         this._ramBytesPerFrame = bytesPerLayer;
@@ -607,7 +654,7 @@ export class KTX2PlayerCore {
 
     const ringBuffer = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, ringBuffer);
-    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, astcFormat, width, height, ringSize);
+    this._allocateLayers(gl, width, height, ringSize, astcFormat);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -645,9 +692,9 @@ export class KTX2PlayerCore {
 
       this._log(`[AlphaVideoGpu] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
 
-      requireASTC(gl);
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
+      await this._prepareAstc(gl, vkFormat);
 
       this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
 
@@ -670,7 +717,7 @@ export class KTX2PlayerCore {
 
       for (let i = 0; i < actualRingSize; i++) {
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
-        gl.compressedTexSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, width, height, 1, astcFormat, frameView(i)!);
+        this._uploadLayer(gl, i, width, height, astcFormat, frameView(i)!);
         this._streamingRingSlots[i] = i;
       }
 
@@ -717,9 +764,9 @@ export class KTX2PlayerCore {
 
       this._log(`[AlphaVideoGpu] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
 
-      requireASTC(gl);
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
+      await this._prepareAstc(gl, vkFormat);
 
       const decoder = await this._ensureZstdDecoder();
       const compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
@@ -755,7 +802,7 @@ export class KTX2PlayerCore {
         this._streamingFramesReady = i + 1;
         if (i < actualRingSize) {
           gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
-          gl.compressedTexSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, width, height, 1, astcFormat, frameData);
+          this._uploadLayer(gl, i, width, height, astcFormat, frameData);
           this._streamingRingSlots[i] = i;
         }
       }
@@ -816,25 +863,31 @@ export class KTX2PlayerCore {
       const aheadLimit = this._useVramStrategy
         ? this._streamingPrefetchAhead
         : Math.min(this._streamingPrefetchAhead, this._streamingCacheSize);
-      while (!this._streamingCancelled && this._streamingDecodePos < layerCount) {
-        const framesAhead = this._streamingDecodePos - this._currentFrame;
-        if (framesAhead < aheadLimit) {
-          const frameData = await this._decodeNextFrame();
-          if (frameData) {
-            const frameIndex = this._streamingDecodePos;
-            if (frameIndex >= this._streamingSkipTo) this._streamingFrameCache.set(frameIndex, frameData);
-            this._streamingDecodePos++;
-            this._streamingFramesReady = this._streamingDecodePos;
-            this._evictOldFramesFromCache(this._currentFrame);
+      // The flag clears as the loop ends, not a task later: a restart in between would see it
+      // still set, start nothing, and leave playback waiting for frames
+      try {
+        while (!this._streamingCancelled && this._streamingDecodePos < layerCount) {
+          const framesAhead = this._streamingDecodePos - this._currentFrame;
+          if (framesAhead < aheadLimit) {
+            const frameData = await this._decodeNextFrame();
+            if (frameData) {
+              const frameIndex = this._streamingDecodePos;
+              if (frameIndex >= this._streamingSkipTo) this._streamingFrameCache.set(frameIndex, frameData);
+              this._streamingDecodePos++;
+              this._streamingFramesReady = this._streamingDecodePos;
+              this._evictOldFramesFromCache(this._currentFrame);
+            } else {
+              break;
+            }
           } else {
-            break;
+            await new Promise(resolve => setTimeout(resolve, 16));
           }
-        } else {
-          await new Promise(resolve => setTimeout(resolve, 16));
         }
+      } finally {
+        this._backgroundDecodeRunning = false;
       }
     };
-    decompressLoop().finally(() => { this._backgroundDecodeRunning = false; });
+    decompressLoop();
   }
 
   // ======== Private: Ensure Frame In Ring Buffer ========
@@ -856,11 +909,7 @@ export class KTX2PlayerCore {
     const slot = frameIndex % ringSize;
 
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
-    gl.compressedTexSubImage3D(
-      gl.TEXTURE_2D_ARRAY, 0, 0, 0, slot,
-      this._streamingWidth, this._streamingHeight, 1,
-      this._streamingAstcFormat, frameData
-    );
+    this._uploadLayer(gl, slot, this._streamingWidth, this._streamingHeight, this._streamingAstcFormat, frameData);
     ringSlots[slot] = frameIndex;
     return slot;
   }
@@ -1048,11 +1097,7 @@ export class KTX2PlayerCore {
         );
 
         gl2.bindTexture(gl2.TEXTURE_2D_ARRAY, this._textureArray);
-        gl2.compressedTexSubImage3D(
-          gl2.TEXTURE_2D_ARRAY, 0, 0, 0, 0,
-          this._ramWidth, this._ramHeight, 1,
-          this._ramAstcFormat, frameData
-        );
+        this._uploadLayer(gl2, 0, this._ramWidth, this._ramHeight, this._ramAstcFormat, frameData);
         this._ramUploadedFrame = currentFrame;
       }
       layerIndex = 0;

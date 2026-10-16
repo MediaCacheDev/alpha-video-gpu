@@ -3,18 +3,18 @@
 #
 # 1.0.0 goes on CocoaPods trunk, which is read-only from 2 December 2026. Later versions are used
 # through the podspec at their tag:
-#   pod 'alpha-video-gpu', :podspec => 'https://raw.githubusercontent.com/danielkpl2/alpha-video-gpu/v<version>/alpha-video-gpu.podspec'
+#   pod 'alpha-video-gpu', :podspec => 'https://raw.githubusercontent.com/MediaCacheDev/alpha-video-gpu/v<version>/alpha-video-gpu.podspec'
 
 Pod::Spec.new do |s|
   s.name          = 'alpha-video-gpu'
   s.module_name   = 'AlphaVideoGPU'
   s.version       = '1.0.0'
   s.summary       = 'Transparent animations for iOS from ASTC KTX2 texture arrays, drawn with Metal.'
-  s.homepage      = 'https://github.com/danielkpl2/alpha-video-gpu'
+  s.homepage      = 'https://github.com/MediaCacheDev/alpha-video-gpu'
   s.license       = { :type => 'MIT', :file => 'LICENSE' }
   s.author        = { 'Daniel Kasprowicz' => '9932671+danielkpl2@users.noreply.github.com' }
   s.platform      = :ios, '13.0'
-  s.source        = { :git => 'https://github.com/danielkpl2/alpha-video-gpu.git', :tag => "v#{s.version}" }
+  s.source        = { :git => 'https://github.com/MediaCacheDev/alpha-video-gpu.git', :tag => "v#{s.version}" }
 
   # AlphaVideoGpuView.mm compiles the ASTC decoder and zstd by #include
   s.source_files        = 'ios/Sources/AlphaVideoGPU/**/*.{h,mm}'

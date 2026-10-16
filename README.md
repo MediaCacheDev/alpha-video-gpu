@@ -13,12 +13,12 @@ See it next to the other formats in the [demo app](#demo-and-related-packages).
 
 ## alpha-video-gpu or alpha-video?
 
-alpha-video-gpu doesn't depend on a video codec. There's nothing to decode, so it uses almost no CPU, needs no hardware video decoder, and runs wherever the GPU supports ASTC textures, which covers more devices than VP9 or AV1 hardware decoding. [alpha-video](https://github.com/danielkpl2/alpha-video) plays WebM VP9 and AV1 instead, for when file size matters more.
+alpha-video-gpu doesn't depend on a video codec. There's nothing to decode, so it uses almost no CPU, needs no hardware video decoder, and runs wherever the GPU supports ASTC textures, which covers more devices than VP9 or AV1 hardware decoding. [alpha-video](https://github.com/MediaCacheDev/alpha-video) plays WebM VP9 and AV1 instead, for when file size matters more.
 
-| | [alpha-video](https://github.com/danielkpl2/alpha-video) | alpha-video-gpu (this package) |
+| | [alpha-video](https://github.com/MediaCacheDev/alpha-video) | alpha-video-gpu (this package) |
 |---|---|---|
 | **Format** | WebM: VP9 with alpha, or dual-stream VP9/AV1 | KTX2: an ASTC texture array, one layer per frame |
-| **Made with** | ffmpeg, or any tool that exports alpha WebM | [alpha-video-gpu-encoder](https://github.com/danielkpl2/alpha-video-gpu-encoder) (`texenc`) |
+| **Made with** | ffmpeg, or any tool that exports alpha WebM | [alpha-video-gpu-encoder](https://github.com/MediaCacheDev/alpha-video-gpu-encoder) (`texenc`) |
 | **Decoding** | Every frame: libvpx or dav1d on the CPU, or MediaCodec on Android | None |
 | **CPU and battery** | A decode per frame, or one pass up front with `mode="preload"` | Near zero |
 | **What the device needs** | Nothing for software decoding. Hardware decoding needs a VP9 or AV1 decoder (Android only), and each player takes 2 of its few instances | ASTC texture support: every iPhone and iPad since the A8 (2014), nearly every Android GPU, Apple silicon Macs and mobile browsers |
@@ -28,7 +28,7 @@ alpha-video-gpu doesn't depend on a video codec. There's nothing to decode, so i
 | **Web** | `<video>` in Chrome and Firefox | WebGL where the browser has ASTC |
 | **Best for** | Long or large clips, downloads where size matters, files from standard video tools | UI effects, stickers and glows, many simultaneous loops, short to medium videos |
 
-[Video Codecs vs GPU Texture Streaming](#video-codecs-vs-gpu-texture-streaming) below goes through the trade-offs in detail. [alpha-video-ffmpegkit](https://github.com/danielkpl2/alpha-video-ffmpegkit) was the first attempt at transparent WebM, on FFmpegKit, and stays as a reference; use alpha-video for WebM.
+[Video Codecs vs GPU Texture Streaming](#video-codecs-vs-gpu-texture-streaming) below goes through the trade-offs in detail. [alpha-video-ffmpegkit](https://github.com/MediaCacheDev/alpha-video-ffmpegkit) was the first attempt at transparent WebM, on FFmpegKit, and stays as a reference; use alpha-video for WebM.
 
 ## Overview
 
@@ -152,7 +152,7 @@ Both approaches support streaming for long content:
 
 ## Encoding
 
-Files are made with the separate [`alpha-video-gpu-encoder`](https://github.com/danielkpl2/alpha-video-gpu-encoder) package (CLI `texenc`), which compresses frames to ASTC with `toktx` from KTX-Software (or `astcenc` for the stream encoder).
+Files are made with the separate [`alpha-video-gpu-encoder`](https://github.com/MediaCacheDev/alpha-video-gpu-encoder) package (CLI `texenc`), which compresses frames to ASTC with `toktx` from KTX-Software (or `astcenc` for the stream encoder).
 
 ```bash
 npm install -g alpha-video-gpu-encoder
@@ -170,7 +170,7 @@ See the encoder's README for every option, video input and the memory-efficient 
 
 ## Emulator / Fallback Behavior
 
-On devices without hardware ASTC support (iOS Simulator, Android Emulator), the player automatically decodes ASTC textures to RGBA in software. Browsers have no software fallback (see [Web Texture Format Support](#web-texture-format-support)).
+On devices and browsers without hardware ASTC support (iOS Simulator, Android Emulator, browsers without `WEBGL_compressed_texture_astc`), the player automatically decodes ASTC textures to RGBA in software, with the same decoder everywhere (compiled to WebAssembly on the web; see [Web Texture Format Support](#web-texture-format-support)).
 
 | Platform | Hardware Support | Fallback |
 |----------|------------------|----------|
@@ -179,9 +179,9 @@ On devices without hardware ASTC support (iOS Simulator, Android Emulator), the 
 | Android Device | ASTC (nearly all) | Software ASTC→RGBA decode |
 | Android Emulator | Usually none | Software ASTC→RGBA decode |
 | Web (mobile) | ASTC | — |
-| Web (desktop) | ASTC where the browser has `WEBGL_compressed_texture_astc` | None: fails with `ASTC_UNSUPPORTED` |
+| Web (desktop) | ASTC where the browser has `WEBGL_compressed_texture_astc` | Software ASTC→RGBA decode (WebAssembly) |
 
-**Important:** On emulators frames are decoded to uncompressed RGBA. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices.
+**Important:** On emulators frames are decoded to uncompressed RGBA. There is no GPU compression benefit on emulators—they exist purely for functional testing. Always test performance on real devices. The same goes for browsers without ASTC, where decoding costs CPU time on the main thread and textures take 4 bytes a pixel.
 
 ---
 
@@ -275,7 +275,7 @@ pod 'alpha-video-gpu', '1.0.0'
 **Swift Package Manager**, package `alpha-video-gpu`, product `AlphaVideoGPU`:
 
 ```swift
-.package(url: "https://github.com/danielkpl2/alpha-video-gpu", from: "1.0.0")
+.package(url: "https://github.com/MediaCacheDev/alpha-video-gpu", from: "1.0.0")
 // in the target's dependencies:
 .product(name: "AlphaVideoGPU", package: "alpha-video-gpu")
 ```
@@ -522,10 +522,10 @@ The zstd decoder (JS and WebAssembly) is bundled inline, so no extra scripts or 
 
 | Format | Browser Support | Notes |
 |--------|-----------------|-------|
-| **ASTC** | Mobile browsers, some desktop | Requires `WEBGL_compressed_texture_astc` and WebGL 2 |
+| **ASTC** | All with WebGL 2 | Sampled by the GPU with `WEBGL_compressed_texture_astc`, else decoded to RGBA in WebAssembly |
 | **Zstd compression** | All | Bundled WASM decoder |
 
-ASTC needs `WEBGL_compressed_texture_astc`. There is no software fallback on the web, so `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component); show something else in its place.
+Without `WEBGL_compressed_texture_astc`, frames are decoded to RGBA as they're uploaded, by a 42 KB WebAssembly decoder that only those browsers download. Preloaded playback then keeps the clip as ASTC and decodes the shown frame; [the web package's README](web/README.md#without-gpu-astc) has the costs. If WebAssembly is blocked too (a Content-Security-Policy without `'wasm-unsafe-eval'`), `onError` gets an `AlphaVideoGpuError` whose `code` is `'ASTC_UNSUPPORTED'` (`nativeEvent.code` in the React Native component); show something else in its place.
 
 ---
 
@@ -788,17 +788,17 @@ A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha
 - React Native 0.71+
 - Android: minSdkVersion 24, OpenGL ES 3.0; compileSdkVersion comes from the app (default 36)
 - iOS: iOS 13.0+, Metal
-- Web: WebGL 2 with `WEBGL_compressed_texture_astc`
+- Web: WebGL 2; ASTC on the GPU needs `WEBGL_compressed_texture_astc`, and without it WebAssembly
 
 ## Demo and related packages
 
-[alpha-video-test](https://github.com/danielkpl2/alpha-video-test) is a React Native app (Android, iOS and web) that plays the same video in each of these formats side by side, with FPS, CPU and memory readouts, so you can compare them on your own device.
+[alpha-video-test](https://github.com/MediaCacheDev/alpha-video-test) is a React Native app (Android, iOS and web) that plays the same video in each of these formats side by side, with FPS, CPU and memory readouts, so you can compare them on your own device.
 
-- [alpha-video-gpu-encoder](https://github.com/danielkpl2/alpha-video-gpu-encoder): makes the KTX2 files for this player (`texenc`).
-- [alpha-video](https://github.com/danielkpl2/alpha-video): WebM VP9 and AV1 with alpha, decoded in software by a shared C++ core or in hardware by MediaCodec on Android. The smallest files.
-- [alpha-video-ffmpegkit](https://github.com/danielkpl2/alpha-video-ffmpegkit): the first attempt at WebM alpha, on FFmpegKit, kept as a reference.
-- [react-native-apng-avif](https://github.com/danielkpl2/react-native-apng-avif): animated APNG and AVIF with alpha.
-- [alpha-glow-button](https://github.com/danielkpl2/alpha-glow-button): buttons whose glow is a transparent video.
+- [alpha-video-gpu-encoder](https://github.com/MediaCacheDev/alpha-video-gpu-encoder): makes the KTX2 files for this player (`texenc`).
+- [alpha-video](https://github.com/MediaCacheDev/alpha-video): WebM VP9 and AV1 with alpha, decoded in software by a shared C++ core or in hardware by MediaCodec on Android. The smallest files.
+- [alpha-video-ffmpegkit](https://github.com/MediaCacheDev/alpha-video-ffmpegkit): the first attempt at WebM alpha, on FFmpegKit, kept as a reference.
+- [react-native-apng-avif](https://github.com/MediaCacheDev/react-native-apng-avif): animated APNG and AVIF with alpha.
+- [alpha-glow-button](https://github.com/MediaCacheDev/alpha-glow-button): buttons whose glow is a transparent video.
 
 ---
 

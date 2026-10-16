@@ -1,0 +1,38 @@
+<!doctype html>
+<!--
+  Plays the test cards in this browser and checks the frames from the canvas: after seeks, and
+  in playback. Build dist/ first and serve a folder holding both this repo and the cards over
+  HTTP; see the README's Testing section.
+
+    ?astc=off      hide WEBGL_compressed_texture_astc, to test the software decoder
+    ?cards=<path>  folder of card_*/ with layout.json (default: ../../../tests/fixtures)
+    ?only=<regex>  run only the matching cases
+
+  The results are in window.results once window.done is true, and on the page.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>alpha-video-gpu-web: test cards</title>
+  <style>
+    body { font: 13px/1.4 ui-monospace, monospace; background: #333; color: #ddd; }
+    canvas { background: #000; display: block; margin: 8px 0; }
+    .fail { color: #f77; }
+    .pass { color: #7d7; }
+  </style>
+  <script>
+    if (new URLSearchParams(location.search).get('astc') === 'off') {
+      for (const proto of [WebGL2RenderingContext.prototype, WebGLRenderingContext.prototype]) {
+        const getExtension = proto.getExtension;
+        proto.getExtension = function (name) {
+          return name === 'WEBGL_compressed_texture_astc' ? null : getExtension.call(this, name);
+        };
+      }
+    }
+  </script>
+</head>
+<body>
+  <pre id="log"></pre>
+  <script type="module" src="./run.js"></script>
+</body>
+</html>
