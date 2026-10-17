@@ -32,7 +32,31 @@ player.destroy();
 
 A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before the source loads are ignored. While streaming, a seek outside the buffered frames starts the zstd decoder at the file's nearest seek point (the encoder writes one every 8 MB of ASTC by default), or at the start of a file written as one stream. `stop()` pauses on the first frame. `setPaused(paused)` is the `paused` prop: it holds playback, and unpausing plays again when `autoPlay` is on.
 
-`setSource(uri, cacheKey?)` caches downloads in IndexedDB, under `cacheKey` when given (for URLs that change while the file doesn't). `AlphaVideoGpuCore` is the player class itself, for supplying your own decoders.
+`AlphaVideoGpuCore` is the player class itself, for supplying your own decoders.
+
+## Sources and storage
+
+`setSource(source, { cacheKey, headers })` takes:
+
+- **A URL:** `https://`, relative, or `asset://path` (served from the site root). It is read with HTTP range requests, so streaming starts after the first few hundred kilobytes, and a seek fetches only from its seek point on. `headers` (for example `Authorization`) go with every request. A server without range support works too, read progressively from the start.
+- **A `Blob` or `File`,** read with `slice`.
+- **An `ArrayBuffer` or `Uint8Array`.**
+- **A byte source** of your own: `{ size, read(offset, length, signal) }`, returning a `Promise<Uint8Array>`. It's for apps that fetch, decrypt or cache in their own code. See [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source/tree/main/web#sources) for the full interface; `httpSource`, `blobSource` and `memorySource` are re-exported here.
+
+What a URL's bytes are kept in between plays is the `storage` option, read when the player is created:
+
+- `'auto'` (the default for URLs) is OPFS, falling back to IndexedDB where OPFS isn't available.
+- `'opfs'`, `'indexeddb'`, `'cache'` (the Cache API) or `'memory'` (this page only) pick one. Where it isn't available, the player falls back to IndexedDB, then memory.
+- `'none'` stores nothing. Clips up to 16 MB still stay in memory, so loops don't fetch again.
+- A `ByteStore` of your own (from `createStore`, or written against alpha-video-source's interface).
+
+Storage is partial: it keeps the ranges played so far, and a clip held whole plays again without the network. `maxStorageBytes` (default 512 MB) caps what this player keeps across every clip, evicting the least recently played. Stored clips are named by `cacheKey`, else the URL, so a presigned URL that changes on each visit can keep the same copy. A copy is dropped when the server's `ETag`, `Last-Modified` or length no longer matches it. A clip held whole isn't checked again; give a changed file a new `cacheKey` or URL.
+
+Blobs, byte sources and bytes in memory default to `'none'`, as the data is local already, or the source does its own caching. With `storage` and a `cacheKey` they are stored too.
+
+A Service Worker controlling the page sees the player's range requests as plain `fetch`es, so it can answer them from its own cache.
+
+Cross-origin URLs need CORS. To check versions, the server must expose `ETag` (or `Last-Modified`) and `Content-Range` with `Access-Control-Expose-Headers`; without them, copies aren't checked.
 
 ## React
 
@@ -49,7 +73,7 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 />
 ```
 
-Props: `src`, `cacheKey`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingRingSize`, `streamingCacheSize`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. A ref has `play()`, `pause()`, `stop()`, `seekToFrame(frame)` and `seekToTime(seconds)`. React 16.8 or later is an optional peer dependency.
+Props: `src` (any source `setSource` takes), `cacheKey`, `headers`, `storage`, `maxStorageBytes`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingRingSize`, `streamingCacheSize`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. A ref has `play()`, `pause()`, `stop()`, `seekToFrame(frame)` and `seekToTime(seconds)`. A new `src` loads again, as does a new `cacheKey` for a URL. New `headers` are used from the next load, and `storage` and `maxStorageBytes` are read when the component mounts. React 16.8 or later is an optional peer dependency.
 
 ## Without GPU ASTC
 
@@ -86,6 +110,14 @@ onError: (error) => {
 `npm test` runs the unit tests, which include decoding every frame of the test-card fixtures in `../tests/fixtures` with the software decoder and reading back each frame's index from its pixels.
 
 `test/browser/index.html` plays the test cards in a real browser, in every streaming and memory mode, and checks the frames from the canvas after seeks and in playback. Build `dist/`, serve a folder that holds this repository over HTTP, and open the page; `?astc=off` hides `WEBGL_compressed_texture_astc` to test the software decoder, `?cards=<path>` points at other cards (the demo app's include uncompressed files), and `?only=<regex>` picks cases. Results show on the page and in `window.results`.
+
+Other parameters exercise sources and storage:
+
+- `?storage=<kind>` stores what's played (default `none`). The page clears that store first.
+- `?replay` plays each case a second time. With a persistent store, it checks that the clip was stored whole and played again without a request.
+- `?input=blob|bytes|buffer` loads each file as a `Blob`, a minimal `{ size, read }` byte source, or an `ArrayBuffer` instead of a URL.
+
+To test range requests, serve the folder with alpha-video-source's server: `npm run serve -- <folder> --port 8766` in `alpha-video-source/web`. Add `--no-range` for a server without range support. Python's `http.server` doesn't support ranges either.
 
 ## License
 

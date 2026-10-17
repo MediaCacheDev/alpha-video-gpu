@@ -20,16 +20,28 @@
 
 import React, { forwardRef, useImperativeHandle, useRef, useEffect, useMemo } from 'react';
 import { KTX2PlayerCore } from './KTX2PlayerCore';
-import type { KTX2LoadEvent, PlayerState, MemoryStrategy } from './types';
+import type { KTX2LoadEvent, PlayerState, MemoryStrategy, KTX2Source, KTX2Storage } from './types';
 import { ZSTDDecoder } from './bundled-deps';
 
-export type { KTX2LoadEvent as AlphaVideoGpuLoadEvent, PlayerState, MemoryStrategy };
+export type {
+  KTX2LoadEvent as AlphaVideoGpuLoadEvent,
+  KTX2Source as AlphaVideoGpuSource,
+  KTX2Storage as AlphaVideoGpuStorage,
+  PlayerState,
+  MemoryStrategy,
+};
 
 export interface AlphaVideoGpuPlayerProps {
-  /** Source URL for the KTX2 file */
-  src?: string;
-  /** Stable identity for the IndexedDB cache, for URLs that change while the file doesn't */
+  /** The KTX2 file: a URL, a Blob or File, bytes in memory, or a ByteSource */
+  src?: KTX2Source;
+  /** Names the stored copy, for URLs that change while the file doesn't (presigned URLs) */
   cacheKey?: string;
+  /** Sent with every request for a URL source, e.g. Authorization; a change doesn't reload */
+  headers?: Record<string, string>;
+  /** Where a URL's bytes are kept between plays. Default: 'auto' (OPFS, else IndexedDB). Read on mount */
+  storage?: KTX2Storage;
+  /** Cap on the stored bytes across clips. Default: 512 MB. Read on mount */
+  maxStorageBytes?: number;
   /** Canvas width in pixels */
   width?: number;
   /** Canvas height in pixels */
@@ -79,6 +91,9 @@ export interface AlphaVideoGpuPlayerRef {
 export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideoGpuPlayerProps>(({
   src,
   cacheKey,
+  headers,
+  storage,
+  maxStorageBytes,
   width = 300,
   height = 300,
   className,
@@ -101,7 +116,9 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const coreRef = useRef<KTX2PlayerCore | null>(null);
-  const loadedSrcRef = useRef<string | null>(null);
+  const loadedSrcRef = useRef<unknown>(null);
+  const headersRef = useRef(headers);
+  headersRef.current = headers;
 
   useImperativeHandle(ref, () => ({
     play: () => coreRef.current?.play(),
@@ -126,6 +143,8 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
       streamingPrefetchAhead,
       memoryStrategy,
       verbose,
+      storage,
+      maxStorageBytes,
       ZSTDDecoderClass: ZSTDDecoder as any,
       onStateChange,
       onLoad,
@@ -151,13 +170,13 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
   useEffect(() => {
     const core = coreRef.current;
     if (!core || !src) return;
-    const identity = cacheKey || src;
+    const identity = (typeof src === 'string' && cacheKey) || src;
     if (loadedSrcRef.current === identity) return;
     loadedSrcRef.current = identity;
-    core.setSource(src, cacheKey);
+    core.setSource(src, { cacheKey, headers: headersRef.current });
     return () => { loadedSrcRef.current = null; core.resetSource(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheKey || src]);
+  }, [(typeof src === 'string' && cacheKey) || src]);
 
   useEffect(() => { if (coreRef.current) coreRef.current.verbose = verbose; }, [verbose]);
 

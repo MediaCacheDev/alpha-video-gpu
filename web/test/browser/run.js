@@ -1,8 +1,12 @@
-import { createAlphaVideoGpuPlayer } from '../../dist/index.mjs';
+import { createAlphaVideoGpuPlayer, createStore, STORAGE_NAMESPACE } from '../../dist/index.mjs';
 
 const params = new URLSearchParams(location.search);
 const cardsDir = params.get('cards') ?? '../../../tests/fixtures';
 const only = params.get('only') ? new RegExp(params.get('only')) : null;
+const storage = params.get('storage') ?? 'none';
+const input = params.get('input') ?? 'url';
+const replay = params.has('replay');
+const PERSISTENT = storage !== 'none';
 const CARDS = ['card_256x256', 'card_383x217'];
 const FIXTURES = ['astc4x4.ktx2', 'astc4x4_stream.ktx2', 'astc4x4_seek.ktx2', 'astc4x4_nozstd.ktx2', 'astc6x6.ktx2', 'astc8x8.ktx2'];
 const MODES = [
@@ -46,16 +50,57 @@ function readFrame(canvas, layout) {
   return agree ? colour : null;
 }
 
-async function runCase(card, fixture, mode, layout) {
+/** The card as the input under test: its URL, a Blob, a minimal { size, read } source, or an ArrayBuffer. */
+async function sourceFor(url) {
+  if (input === 'url') return url;
+  const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  if (input === 'blob') return new Blob([bytes]);
+  if (input === 'buffer') return bytes.buffer;
+  if (input === 'bytes') {
+    return {
+      size: bytes.byteLength,
+      read: async (offset, length) => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return bytes.slice(offset, offset + length);
+      },
+    };
+  }
+  throw new Error(`unknown input ${input}`);
+}
+
+/** Waits up to 5 s for the store's queued writes to hold all of url; false if they don't. */
+async function storedWhole(url) {
+  const store = createStore(storage, { namespace: STORAGE_NAMESPACE });
+  for (const start = performance.now(); performance.now() - start < 5000; await new Promise((r) => setTimeout(r, 50))) {
+    const entry = await store.lookup(url);
+    if (entry && entry.blocks.length === Math.ceil(entry.info.size / entry.blockSize)) return true;
+  }
+  return false;
+}
+
+// Counted as fetch() is called: resource timing records a request only once its response ends,
+// which for an open-ended range read can be after the next case has started
+const fetches = new Map();
+const pageFetch = window.fetch.bind(window);
+window.fetch = (resource, init) => {
+  const href = new URL(resource instanceof Request ? resource.url : String(resource), location.href).href;
+  fetches.set(href, (fetches.get(href) ?? 0) + 1);
+  return pageFetch(resource, init);
+};
+
+/** Requests made for url so far. */
+const requestsFor = (url) => fetches.get(new URL(url, location.href).href) ?? 0;
+
+async function runCase(card, fixture, mode, layout, url) {
   const canvas = document.createElement('canvas');
   canvas.width = layout.width;
   canvas.height = layout.height;
   document.body.append(canvas);
   const failures = [];
   let error = null;
-  const player = createAlphaVideoGpuPlayer(canvas, { autoPlay: false, loop: true, ...mode, onError: (e) => { error = e; } });
+  const player = createAlphaVideoGpuPlayer(canvas, { autoPlay: false, loop: true, storage, ...mode, onError: (e) => { error = e; } });
   try {
-    await player.setSource(`${cardsDir}/${card}/${fixture}?${Date.now()}`);
+    await player.setSource(await sourceFor(url));
     if (error) throw error;
 
     for (const frame of SEEKS) {
@@ -100,7 +145,8 @@ async function main() {
     const gl = document.createElement('canvas').getContext('webgl2');
     return !!gl?.getExtension('WEBGL_compressed_texture_astc');
   })();
-  log(`GPU ASTC ${astc ? 'available' : 'unavailable: software decoding'}`);
+  log(`GPU ASTC ${astc ? 'available' : 'unavailable: software decoding'}; input ${input}, storage ${storage}${replay ? ', replayed' : ''}`);
+  if (PERSISTENT) await createStore(storage, { namespace: STORAGE_NAMESPACE })?.clear();
   const results = [];
   for (const card of CARDS) {
     const layout = await (await fetch(`${cardsDir}/${card}/layout.json`)).json();
@@ -109,7 +155,17 @@ async function main() {
       for (const mode of MODES) {
         const name = `${card}/${fixture} ${mode.stream ? 'stream' : 'preload'} ${mode.memoryStrategy}`;
         if (only && !only.test(name)) continue;
-        const failures = await runCase(card, fixture, mode, layout);
+        const url = `${cardsDir}/${card}/${fixture}?${Date.now()}`;
+        const failures = await runCase(card, fixture, mode, layout, url);
+        if (replay && input === 'url') {
+          if (PERSISTENT && !(await storedWhole(url))) failures.push(`storage ${storage}: not stored whole 5 s after playing`);
+          const before = requestsFor(url);
+          const again = await runCase(card, fixture, mode, layout, url);
+          const requests = requestsFor(url) - before;
+          failures.push(...again.map((f) => `replay ${f}`));
+          // A clip stored whole plays again without the network
+          if (PERSISTENT && requests > 0) failures.push(`replay: ${requests} requests with storage ${storage}`);
+        }
         results.push({ name, failures });
         log(`${failures.length ? 'FAIL' : 'PASS'} ${name}${failures.length ? `: ${failures.join('; ')}` : ''}`, failures.length ? 'fail' : 'pass');
       }

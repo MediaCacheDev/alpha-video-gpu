@@ -17,25 +17,31 @@ import {
   type AlphaVideoGpuError,
   type AlphaVideoGpuErrorCode,
   type AlphaVideoGpuLoadEvent,
+  type ByteSource,
 } from 'alpha-video-gpu-web';
 
-export type { AlphaVideoGpuErrorCode, AlphaVideoGpuLoadEvent, PlayerState } from 'alpha-video-gpu-web';
+export type { AlphaVideoGpuErrorCode, AlphaVideoGpuLoadEvent, PlayerState, ByteSource } from 'alpha-video-gpu-web';
 
 /**
  * Where to load from (on web, `asset://` and http(s) URLs apply):
- * - `https://…` / `http://…`: downloaded once into the app cache (named by `cacheKey`, else a hash of the URL)
+ * - `https://…` / `http://…`: downloaded once into the app cache (named by `cacheKey`, else a hash of the URL);
+ *   on web read with range requests into the browser's storage (OPFS, else IndexedDB)
  * - `file:///abs/path` or `/abs/path`: read in place
  * - `asset://relative/path`: Android APK `assets/`, the iOS app bundle, or the site root on web
  * - Android only: `content://…`, or a res/raw name (what `require()` resolves to in a release build)
+ *
+ * On web, `source` can also be a Blob or File, or a ByteSource that reads by offset.
  */
 export interface SourceType {
   uri?: string;
   /** Stable identity for the cache, for URLs that change while the file doesn't (presigned URLs) */
   cacheKey?: string;
+  /** Web: sent with every request for the URL, e.g. Authorization */
+  headers?: Record<string, string>;
 }
 
 export interface AlphaVideoGpuViewProps {
-  source?: SourceType | string | null;
+  source?: SourceType | string | Blob | ByteSource | null;
   autoPlay?: boolean;
   loop?: boolean;
   playbackSpeed?: number;
@@ -104,7 +110,7 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const coreRef = useRef<AlphaVideoGpuCore | null>(null);
-  const loadedSourceRef = useRef<string | null>(null);
+  const loadedSourceRef = useRef<unknown>(null);
   const callbacksRef = useRef({ onLoad, onStateChange, onFrameUpdate, onFinished, onError });
   callbacksRef.current = { onLoad, onStateChange, onFrameUpdate, onFinished, onError };
 
@@ -116,12 +122,15 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
     seekToTime: (seconds: number) => coreRef.current?.seekToTime(seconds),
   }), []);
 
-  // Normalize source prop to { uri } format
-  const normalizedSource = useMemo(() => {
-    if (!source) return null;
+  // A Blob or ByteSource plays as it is; anything else is normalized to { uri } format
+  const directSource = isDirectSource(source) ? source : null;
+  const normalizedSource = useMemo((): SourceType | null => {
+    if (!source || isDirectSource(source)) return null;
     if (typeof source === 'string') return { uri: source };
     return source;
   }, [source]);
+  const headersRef = useRef(normalizedSource?.headers);
+  headersRef.current = normalizedSource?.headers;
 
   // Create core instance when canvas is available
   useEffect(() => {
@@ -165,16 +174,16 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   // the load on it would resetSource() and refetch on each refresh, visibly restarting
   // a loop that should run until unmount. The cache key is the stable identity.
   const sourceCacheKey = normalizedSource?.cacheKey || cacheKey;
-  const sourceIdentity = sourceCacheKey || normalizedSource?.uri || null;
+  const sourceIdentity = directSource || sourceCacheKey || normalizedSource?.uri || null;
 
   // Load source when it changes
   useEffect(() => {
     const core = coreRef.current;
-    const uri = normalizedSource?.uri;
-    if (!core || !uri || !sourceIdentity || loadedSourceRef.current === sourceIdentity) return;
+    const toLoad = directSource || normalizedSource?.uri;
+    if (!core || !toLoad || !sourceIdentity || loadedSourceRef.current === sourceIdentity) return;
 
     loadedSourceRef.current = sourceIdentity;
-    core.setSource(uri, sourceCacheKey);
+    core.setSource(toLoad, { cacheKey: sourceCacheKey, headers: headersRef.current });
 
     return () => {
       loadedSourceRef.current = null;
@@ -234,6 +243,11 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
     </View>
   );
 });
+
+function isDirectSource(source: AlphaVideoGpuViewProps['source']): source is Blob | ByteSource {
+  if (!source || typeof source !== 'object') return false;
+  return (typeof Blob !== 'undefined' && source instanceof Blob) || typeof (source as ByteSource).read === 'function';
+}
 
 const styles = StyleSheet.create({
   container: {

@@ -5,12 +5,23 @@ import type React from 'react';
 export * from './AlphaVideoGpuViewNativeComponent';
 
 // Source type for the wrapper component (see SourceType for the URI forms)
-export type AlphaVideoGpuSource = import('./AlphaVideoGpuViewNativeComponent').SourceType;
+export type AlphaVideoGpuSource = import('./AlphaVideoGpuViewNativeComponent').SourceType & {
+  /** Web only for now: sent with every request for the URL, e.g. Authorization */
+  headers?: Record<string, string>;
+};
+
+/** Web only: reads the file by offset (an app's own fetcher or cache); the smallest is `{ size, read }`. */
+export interface AlphaVideoGpuByteSource {
+  open?(signal?: AbortSignal): Promise<{ size: number; etag?: string; lastModified?: string }>;
+  readonly size?: number;
+  read(offset: number, length: number, signal?: AbortSignal): Promise<Uint8Array>;
+  close?(): void;
+}
 
 // Props for the main AlphaVideoGpuView wrapper component (index.js)
 export interface AlphaVideoGpuViewProps {
-  /** Source object, or a bare URI string (legacy) */
-  source?: AlphaVideoGpuSource | string | null;
+  /** Source object, or a bare URI string (legacy). On web also a Blob or a byte source */
+  source?: AlphaVideoGpuSource | string | Blob | AlphaVideoGpuByteSource | null;
   /** Start playing automatically (default: true) */
   autoPlay?: boolean;
   /** Loop the animation (default: true) */

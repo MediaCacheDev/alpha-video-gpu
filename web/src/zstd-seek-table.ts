@@ -28,8 +28,11 @@ export interface SeekPoint {
 /**
  * The seek table at the end of the level data, or null when there is none or it doesn't
  * describe exactly the frames before it (then the level plays as one stream).
+ *
+ * @param level the level data, or its last bytes holding the table
+ * @param tailOffset where those bytes start in the level, when they are only its tail
  */
-export function parseZstdSeekTable(level: Uint8Array, decompressedLength?: number): ZstdSeekTable | null {
+export function parseZstdSeekTable(level: Uint8Array, decompressedLength?: number, tailOffset = 0): ZstdSeekTable | null {
   if (level.length < SKIPPABLE_HEADER_SIZE + FOOTER_SIZE) return null;
   const view = new DataView(level.buffer, level.byteOffset, level.byteLength);
   const end = level.length;
@@ -56,9 +59,26 @@ export function parseZstdSeekTable(level: Uint8Array, decompressedLength?: numbe
     compressed += view.getUint32(entry, true);
     decompressed += view.getUint32(entry + 4, true);
   }
-  if (compressed !== tableStart) return null;
+  if (compressed !== tailOffset + tableStart) return null;
   if (decompressedLength !== undefined && decompressed !== decompressedLength) return null;
   return { compressedOffsets, decompressedOffsets };
+}
+
+/** Reads the seek table from a level's last bytes: the footer, then the table it sizes. */
+export async function readZstdSeekTable(
+  read: (offset: number, length: number) => Promise<Uint8Array>,
+  levelLength: number,
+  decompressedLength?: number,
+): Promise<ZstdSeekTable | null> {
+  if (levelLength < SKIPPABLE_HEADER_SIZE + FOOTER_SIZE) return null;
+  const footer = await read(levelLength - FOOTER_SIZE, FOOTER_SIZE);
+  if (footer.length < FOOTER_SIZE) return null;
+  const view = new DataView(footer.buffer, footer.byteOffset, footer.byteLength);
+  if (view.getUint32(5, true) !== SEEKABLE_FOOTER_MAGIC || footer[4] & RESERVED_BITS) return null;
+  const entrySize = footer[4] & CHECKSUM_FLAG ? 12 : 8;
+  const tableStart = levelLength - SKIPPABLE_HEADER_SIZE - (view.getUint32(0, true) * entrySize + FOOTER_SIZE);
+  if (tableStart < 0) return null;
+  return parseZstdSeekTable(await read(tableStart, levelLength - tableStart), decompressedLength, tableStart);
 }
 
 /** The last frame starting at or before that decompressed offset; the level start without a table. */

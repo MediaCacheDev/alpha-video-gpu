@@ -65,6 +65,7 @@
   },
   "devDependencies": {
     "@types/react": "^18.3.31",
+    "alpha-video-source": "file:../../alpha-video-source/web",
     "react": "^18.3.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

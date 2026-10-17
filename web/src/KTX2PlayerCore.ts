@@ -12,6 +12,9 @@ import type {
   PlayerState,
   MemoryStrategy,
   KTX2PlayerCoreOptions,
+  KTX2Source,
+  KTX2SourceOptions,
+  KTX2Storage,
 } from './types';
 
 import {
@@ -29,10 +32,11 @@ import {
   getASTCBytesPerLayer,
 } from './ktx2-parser';
 
-import { getCachedFile, setCachedFile } from './cache';
 import { AlphaVideoGpuError } from './errors';
 import type { SoftwareAstcDecoder } from './software-astc';
 import { ZstdLayerStream } from './zstd-layer-stream';
+import { UncompressedLayerStream, type LayerStream, type LevelData } from './layer-stream';
+import { openKtx2Source, sourceIdentity, type SourceReader } from './source';
 
 // Re-export types for convenience
 export type {
@@ -41,15 +45,35 @@ export type {
   PlayerState,
   MemoryStrategy,
   KTX2PlayerCoreOptions,
+  KTX2Source,
+  KTX2SourceOptions,
+  KTX2Storage,
 };
-
-/** asset://path names the app's bundled media; on the web it is served from the site root. */
-function resolveWebUri(uri: string): string {
-  return uri.startsWith('asset://') ? '/' + uri.slice('asset://'.length).replace(/^\/+/, '') : uri;
-}
 
 function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+/** Bytes read first: the header, level index and key/value data fit in this for texenc's files. */
+const HEADER_READ_BYTES = 16 * 1024;
+
+/** The header through the level index and key/value data, reading more if they run past the first read. */
+async function readKtx2Header(reader: SourceReader): Promise<Uint8Array> {
+  let header = await reader.read(0, Math.min(reader.size, HEADER_READ_BYTES));
+  if (header.byteLength < 80) throw new Error(`Not a KTX2 file: ${header.byteLength} bytes`);
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const levelIndexEnd = 80 + Math.max(1, view.getUint32(40, true)) * 24;
+  const kvdEnd = view.getUint32(56, true) + view.getUint32(60, true);
+  const needed = Math.max(levelIndexEnd, kvdEnd);
+  if (needed > header.byteLength) header = await reader.read(0, needed);
+  return header;
+}
+
+/** Thrown inside a load that a newer setSource or destroy has replaced. */
+class SupersededLoad extends Error {}
+
+function isAbortError(error: unknown): boolean {
+  return (error as { name?: string } | null)?.name === 'AbortError';
 }
 
 /** How long the streaming decoder works before letting the page draw and handle input. */
@@ -76,6 +100,8 @@ export class KTX2PlayerCore {
   private _streamingPrefetchAhead: number;
   private _memoryStrategy: MemoryStrategy;
   private _verbose: boolean;
+  private _storage: KTX2Storage | undefined;
+  private _maxStorageBytes: number | undefined;
 
   // -- Dependency injection --
   private _ZSTDDecoderClass: (new () => any) | null;
@@ -110,7 +136,10 @@ export class KTX2PlayerCore {
   private _currentFrame = 0;
   private _animationFrameId: number | null = null;
   private _lastFrameTime = 0;
-  private _loadedSource: string | null = null;
+  private _loadedSource: unknown = null;
+  // Counts loads, so one that a newer setSource or destroy replaced can stop
+  private _loadId = 0;
+  private _reader: SourceReader | null = null;
 
   // -- Decoders --
   private _zstdDecoder: any = null;
@@ -126,15 +155,16 @@ export class KTX2PlayerCore {
   private _streamingDecodePos = 0;
   private _streamingFramesReady = 0;
   private _streamingLoopCount = 0;
-  // The zstd level's decoder; null for uncompressed streaming
-  private _zstdStream: ZstdLayerStream | null = null;
+  // Reads the level's layers: zstd-decoded, or straight from the file when uncompressed
+  private _layerStream: LayerStream | null = null;
   private _streamingBytesPerLayer = 0;
   private _streamingWidth = 0;
   private _streamingHeight = 0;
   private _streamingLayerCount = 0;
   private _streamingLevel0Offset = 0;
   private _streamingAstcFormat = 0;
-  private _backgroundDecodeRunning = false;
+  // The stream the background decode loop is reading, while it runs
+  private _backgroundDecodeStream: LayerStream | null = null;
 
   // A clip that doesn't loop has reached its last frame; playing again starts it over
   private _ended = false;
@@ -166,6 +196,8 @@ export class KTX2PlayerCore {
     this._streamingPrefetchAhead = clampInt(options.streamingPrefetchAhead ?? 30, 5, 100);
     this._memoryStrategy = options.memoryStrategy === 'ram' ? 'ram' : 'vram';
     this._verbose = options.verbose ?? false;
+    this._storage = options.storage;
+    this._maxStorageBytes = options.maxStorageBytes;
     this._ZSTDDecoderClass = options.ZSTDDecoderClass ?? null;
     this._onStateChange = options.onStateChange ?? null;
     this._onLoad = options.onLoad ?? null;
@@ -298,17 +330,20 @@ export class KTX2PlayerCore {
   }
 
   /**
-   * Load a source: an http(s) or relative URL, or asset://path (served from the site root),
-   * holding an ASTC KTX2 texture array.
+   * Loads an ASTC KTX2 texture array from a URL (http(s), relative, or asset://path, served from
+   * the site root), a Blob or File, bytes in memory, or a ByteSource. Files are read by range:
+   * streaming playback starts once the first frames have arrived, and a URL's bytes are kept in
+   * the storage option's store for the next play.
    *
-   * @param cacheKey stable identity for the IndexedDB cache, for URLs that change while the file
-   *                 doesn't (presigned URLs); defaults to the URL
+   * @param options cacheKey and headers; a string is taken as the cacheKey
    */
-  async setSource(sourceUri: string, cacheKey?: string): Promise<void> {
+  async setSource(source: KTX2Source, options: KTX2SourceOptions | string = {}): Promise<void> {
+    const { cacheKey, headers } = typeof options === 'string' ? { cacheKey: options, headers: undefined } : options;
+    const identity = sourceIdentity(source, cacheKey);
+    if (this._loadedSource === identity) return;
+    this._loadedSource = identity;
+    const loadId = ++this._loadId;
     try {
-      if (this._loadedSource === sourceUri) return;
-      this._loadedSource = sourceUri;
-      const uri = resolveWebUri(sourceUri);
       this._setState('loading');
       this._stopAnimationLoop();
       this._streamingCancelled = false;
@@ -321,23 +356,29 @@ export class KTX2PlayerCore {
       this._cleanupTextures(gl);
       this._cleanupStreamingState(gl);
       this._cleanupRamState();
+      this._closeReader();
 
-      // Fetch (with IndexedDB cache)
-      const cacheId = cacheKey || uri;
-      let arrayBuffer = await getCachedFile(cacheId, this._verbose);
-      if (!arrayBuffer) {
-        const response = await fetch(uri);
-        if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
-        arrayBuffer = await response.arrayBuffer();
-        setCachedFile(cacheId, arrayBuffer, this._verbose);
+      const reader = await openKtx2Source(source, {
+        cacheKey,
+        headers,
+        storage: this._storage,
+        maxStorageBytes: this._maxStorageBytes,
+      });
+      if (loadId !== this._loadId) {
+        reader.close();
+        return;
       }
-      const data = new Uint8Array(arrayBuffer);
+      this._reader = reader;
+      const header = await readKtx2Header(reader);
+      this._checkLoad(loadId);
 
-      await this._loadKTX2Source(gl, data);
+      await this._loadKTX2Source(gl, header, reader, loadId);
+      this._checkLoad(loadId);
 
       this._currentFrame = 0;
       this._finishLoad();
     } catch (error) {
+      if (loadId !== this._loadId) return;
       console.error('[AlphaVideoGpu] Load error:', error);
       this._setState('error');
       this._onError?.(error as Error);
@@ -350,6 +391,7 @@ export class KTX2PlayerCore {
 
   /** Tear down all resources. Call when the player is no longer needed. */
   destroy(): void {
+    this._loadId++;
     this._streamingCancelled = true;
     this._stopAnimationLoop();
     if (this._owedFrameId !== null) cancelAnimationFrame(this._owedFrameId);
@@ -370,11 +412,22 @@ export class KTX2PlayerCore {
     }
     this._streamingMode = false;
     this._streamingFrameCache.clear();
-    this._closeZstdStream();
+    this._closeLayerStream();
+    this._closeReader();
     this._ramFrameData = null;
     this._ramHeavyMode = false;
     this._loadedSource = null;
     this._state = 'idle';
+  }
+
+  /** Stops a load that a newer setSource or destroy has replaced. */
+  private _checkLoad(loadId: number): void {
+    if (loadId !== this._loadId) throw new SupersededLoad();
+  }
+
+  private _closeReader(): void {
+    this._reader?.close();
+    this._reader = null;
   }
 
   // ======== Private: State ========
@@ -494,7 +547,7 @@ export class KTX2PlayerCore {
     if (this._streamingRingBuffer) { gl.deleteTexture(this._streamingRingBuffer); this._streamingRingBuffer = null; }
     this._streamingMode = false;
     this._streamingFrameCache.clear();
-    this._closeZstdStream();
+    this._closeLayerStream();
   }
 
   private _cleanupRamState(): void {
@@ -519,8 +572,10 @@ export class KTX2PlayerCore {
 
   // ======== Private: Load KTX2 Source ========
 
-  private async _loadKTX2Source(gl: WebGLRenderingContext, data: Uint8Array): Promise<void> {
-    const metadata = extractKTX2Metadata(data);
+  private async _loadKTX2Source(
+    gl: WebGLRenderingContext, header: Uint8Array, reader: SourceReader, loadId: number
+  ): Promise<void> {
+    const metadata = extractKTX2Metadata(header);
     if (!metadata) throw new Error('No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.');
     if (metadata.mode !== 'astc' || metadata.packingMode !== 'array') {
       throw new Error(`Only ASTC texture arrays play (this file is mode '${metadata.mode ?? ''}', packing '${metadata.packingMode ?? ''}'); encode it with texenc`);
@@ -533,22 +588,23 @@ export class KTX2PlayerCore {
     this._metadata = metadata;
     this._emitLoad(metadata);
 
+    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    const supercompressionScheme = view.getUint32(44, true);
+    if (supercompressionScheme !== 0 && supercompressionScheme !== 2) {
+      throw new Error(`Unsupported supercompressionScheme: ${supercompressionScheme}`);
+    }
     if (this._stream) {
-      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const supercompressionScheme = view.getUint32(44, true);
-      if (supercompressionScheme === 2) {
-        this._log('[AlphaVideoGpu] Using internal zstd streaming mode (stream=true)');
-        const success = await this._loadInternalZstdStreamingTextureArray(gl, data, metadata);
-        if (!success) throw new Error('Failed to load internal zstd streaming texture array');
-      } else if (supercompressionScheme === 0) {
-        this._log('[AlphaVideoGpu] Using uncompressed streaming mode (stream=true)');
-        const success = await this._loadUncompressedStreamingTextureArray(gl, data, metadata);
-        if (!success) throw new Error('Failed to load uncompressed streaming texture array');
-      } else {
-        throw new Error(`Unsupported supercompressionScheme for streaming: ${supercompressionScheme}`);
-      }
+      this._log(`[AlphaVideoGpu] Streaming ${supercompressionScheme === 2 ? 'zstd' : 'uncompressed'} layers (stream=true)`);
+      await this._loadStreamingTextureArray(gl, header, reader, metadata, loadId);
     } else {
-      const success = await this._loadTextureArray(gl, data, metadata);
+      const level0Offset = Number(view.getBigUint64(80, true));
+      const level0Length = Number(view.getBigUint64(88, true));
+      const level = await reader.read(level0Offset, level0Length);
+      this._checkLoad(loadId);
+      if (level.byteLength < level0Length) throw new Error(`The file ends ${level0Length - level.byteLength} bytes into its texture data`);
+      // Everything is read: the reader has nothing more to do
+      this._closeReader();
+      const success = await this._loadTextureArray(gl, header, level, metadata, loadId);
       if (!success) throw new Error('Failed to load texture array');
     }
   }
@@ -556,10 +612,10 @@ export class KTX2PlayerCore {
   // ======== Private: Load Texture Array (non-streaming) ========
 
   private async _loadTextureArray(
-    gl: WebGL2RenderingContext, ktx2Data: Uint8Array, metadata: Metadata
+    gl: WebGL2RenderingContext, header: Uint8Array, level: Uint8Array, metadata: Metadata, loadId: number
   ): Promise<boolean> {
     try {
-      const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
+      const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
       const vkFormat = view.getUint32(12, true);
       const width = view.getUint32(20, true);
       const height = view.getUint32(24, true);
@@ -569,24 +625,23 @@ export class KTX2PlayerCore {
       const astcFormat = ASTC_FORMAT_MAP[vkFormat];
       if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
       await this._prepareAstc(gl, vkFormat);
+      this._checkLoad(loadId);
       // In software the clip stays ASTC in memory and the shown frame is decoded: every frame as
       // RGBA would take 4-36 times the memory, which a long clip doesn't have
       const useRamMode = this._memoryStrategy === 'ram' || this._softwareAstc !== null;
 
       this._log(`[AlphaVideoGpu] Texture array: ${width}x${height}, ${layerCount} layers (${useRamMode ? 'RAM' : 'VRAM'} mode)`);
 
-      const level0Offset = Number(view.getBigUint64(80, true));
-      const level0Length = Number(view.getBigUint64(88, true));
       const level0UncompressedLength = Number(view.getBigUint64(96, true));
 
       let compressedData: Uint8Array;
       if (supercompressionScheme === 2) {
-        const zstdData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
         const decoder = await this._ensureZstdDecoder();
-        compressedData = decoder.decode(zstdData, level0UncompressedLength);
-        this._log(`[AlphaVideoGpu] WASM zstd decompressed ${level0Length} -> ${compressedData.length} bytes`);
+        this._checkLoad(loadId);
+        compressedData = decoder.decode(level, level0UncompressedLength);
+        this._log(`[AlphaVideoGpu] WASM zstd decompressed ${level.length} -> ${compressedData.length} bytes`);
       } else {
-        compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
+        compressedData = level;
       }
 
       const textureArray = gl.createTexture();
@@ -631,7 +686,7 @@ export class KTX2PlayerCore {
       this._log(`[AlphaVideoGpu] ✓ Texture array loaded: ${width}x${height}, ${layerCount} layers`);
       return true;
     } catch (error) {
-      if (error instanceof AlphaVideoGpuError) throw error;
+      if (error instanceof AlphaVideoGpuError || error instanceof SupersededLoad) throw error;
       console.error('[AlphaVideoGpu] Failed to load texture array:', error);
       return false;
     }
@@ -674,161 +729,103 @@ export class KTX2PlayerCore {
     this._log(`[AlphaVideoGpu] Ring buffer initialized: ${ringSize} slots, ${bytesPerLayer} bytes/layer`);
   }
 
-  // ======== Private: Uncompressed Streaming ========
-
-  private async _loadUncompressedStreamingTextureArray(
-    gl: WebGL2RenderingContext, ktx2Data: Uint8Array, metadata: Metadata
-  ): Promise<boolean> {
-    try {
-      this._log('[AlphaVideoGpu] Starting uncompressed streaming playback...');
-      const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
-      const vkFormat = view.getUint32(12, true);
-      const width = view.getUint32(20, true);
-      const height = view.getUint32(24, true);
-      const layerCount = view.getUint32(32, true);
-      const supercompressionScheme = view.getUint32(44, true);
-
-      if (supercompressionScheme !== 0) throw new Error('Uncompressed streaming requires supercompressionScheme=0');
-
-      const level0Offset = Number(view.getBigUint64(80, true));
-      const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
-
-      this._log(`[AlphaVideoGpu] Uncompressed streaming: ${width}x${height}, ${layerCount} layers, ${bytesPerLayer} bytes/layer`);
-
-      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
-      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
-      await this._prepareAstc(gl, vkFormat);
-
-      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
-
-      this._streamingMode = true;
-      this._streamingLayerCount = layerCount;
-      this._streamingLevel0Offset = level0Offset;
-      this._streamingFrameCache = new Map();
-      this._streamingDecodePos = layerCount;
-      this._streamingFramesReady = layerCount;
-
-      const fullDataRef = ktx2Data;
-      const actualRingSize = this._streamingRingActualSize;
-
-      // Every frame is a view into the file, so the "cache" holds nothing and copies nothing
-      const frameView = (frameIndex: number): Uint8Array | undefined => {
-        const frameOffset = level0Offset + (frameIndex * bytesPerLayer);
-        if (frameIndex < 0 || frameOffset + bytesPerLayer > fullDataRef.length) return undefined;
-        return new Uint8Array(fullDataRef.buffer, fullDataRef.byteOffset + frameOffset, bytesPerLayer);
-      };
-
-      for (let i = 0; i < actualRingSize; i++) {
-        gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
-        this._uploadLayer(gl, i, width, height, astcFormat, frameView(i)!);
-        this._streamingRingSlots[i] = i;
-      }
-
-      const fileFrames = {
-        get: frameView,
-        has: (frameIndex: number): boolean => frameIndex >= 0 && frameIndex < layerCount,
-        set: () => {},
-        delete: () => {},
-        clear: () => {},
-        size: 0,
-        keys: () => [][Symbol.iterator](),
-      };
-      this._streamingFrameCache = fileFrames as any;
-
-      this._textureArray = this._streamingRingBuffer;
-
-      this._log(`[AlphaVideoGpu] ✓ Uncompressed streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
-      return true;
-    } catch (error) {
-      if (error instanceof AlphaVideoGpuError) throw error;
-      console.error('[AlphaVideoGpu] Uncompressed streaming load failed:', error);
-      return false;
-    }
-  }
-
-  // ======== Private: Internal Zstd Streaming ========
-
-  private async _loadInternalZstdStreamingTextureArray(
-    gl: WebGL2RenderingContext, ktx2Data: Uint8Array, metadata: Metadata
-  ): Promise<boolean> {
-    try {
-      this._log('[AlphaVideoGpu] Starting internal zstd streaming playback...');
-      const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
-      const vkFormat = view.getUint32(12, true);
-      const width = view.getUint32(20, true);
-      const height = view.getUint32(24, true);
-      const layerCount = view.getUint32(32, true);
-
-      const level0Offset = Number(view.getBigUint64(80, true));
-      const level0Length = Number(view.getBigUint64(88, true));
-      const level0UncompressedLength = Number(view.getBigUint64(96, true));
-
-      const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
-
-      this._log(`[AlphaVideoGpu] Internal zstd streaming: ${width}x${height}, ${layerCount} layers, compressed=${level0Length}, uncompressed=${level0UncompressedLength}`);
-
-      const astcFormat = ASTC_FORMAT_MAP[vkFormat];
-      if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
-      await this._prepareAstc(gl, vkFormat);
-
-      const decoder = await this._ensureZstdDecoder();
-      const compressedData = new Uint8Array(ktx2Data.buffer, ktx2Data.byteOffset + level0Offset, level0Length);
-
-      this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
-
-      this._streamingMode = true;
-      this._streamingLayerCount = layerCount;
-      this._streamingLevel0Offset = level0Offset;
-      this._streamingFrameCache = new Map();
-      this._streamingDecodePos = 0;
-      this._streamingFramesReady = 0;
-
-      const stream = new ZstdLayerStream(decoder, compressedData, bytesPerLayer, level0UncompressedLength);
-      this._zstdStream = stream;
-      this._log(stream.seekTable
-        ? `[AlphaVideoGpu] Seek table: ${stream.seekTable.compressedOffsets.length} seek points`
-        : '[AlphaVideoGpu] No seek table: seeks decode from the start');
-
-      // Pre-decode initial frames
-      const actualRingSize = this._streamingRingActualSize;
-      const prefetchCount = Math.min(this._streamingPrefetchAhead, layerCount);
-      this._log(`[AlphaVideoGpu] Pre-decoding ${prefetchCount} frames...`);
-
-      for (let i = 0; i < prefetchCount && !this._streamingCancelled; i++) {
-        const frameData = stream.readLayer();
-        if (!frameData) break;
-        this._streamingFrameCache.set(i, frameData);
-        this._streamingDecodePos = i + 1;
-        this._streamingFramesReady = i + 1;
-        if (i < actualRingSize) {
-          gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
-          this._uploadLayer(gl, i, width, height, astcFormat, frameData);
-          this._streamingRingSlots[i] = i;
-        }
-      }
-
-      this._textureArray = this._streamingRingBuffer;
-
-      this._startBackgroundDecompression();
-
-      this._log(`[AlphaVideoGpu] ✓ Internal zstd streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
-      return true;
-    } catch (error) {
-      if (error instanceof AlphaVideoGpuError) throw error;
-      console.error('[AlphaVideoGpu] Internal zstd streaming load failed:', error);
-      return false;
-    }
-  }
-
-  // ======== Private: Background Decompression (internal zstd) ========
+  // ======== Private: Streaming ========
 
   /**
-   * Decodes ahead of playback, and catches up to a seek target, in slices of DECODE_SLICE_MS
-   * so a long catch-up doesn't hold up drawing or input.
+   * Plays the level a layer at a time: zstd-decoded, or read straight from the file when
+   * uncompressed. The first frames are read before the load finishes; the rest are read
+   * ahead of playback by the background decode loop.
+   */
+  private async _loadStreamingTextureArray(
+    gl: WebGL2RenderingContext, header: Uint8Array, reader: SourceReader, metadata: Metadata, loadId: number
+  ): Promise<void> {
+    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    const vkFormat = view.getUint32(12, true);
+    const width = view.getUint32(20, true);
+    const height = view.getUint32(24, true);
+    const layerCount = view.getUint32(32, true);
+    const supercompressionScheme = view.getUint32(44, true);
+    const level0Offset = Number(view.getBigUint64(80, true));
+    const level0Length = Number(view.getBigUint64(88, true));
+    const level0UncompressedLength = Number(view.getBigUint64(96, true));
+    const bytesPerLayer = getASTCBytesPerLayer(width, height, vkFormat);
+
+    this._log(`[AlphaVideoGpu] Streaming: ${width}x${height}, ${layerCount} layers, level ${level0Length} bytes (${level0UncompressedLength} decoded), ${bytesPerLayer} bytes/layer`);
+
+    const astcFormat = ASTC_FORMAT_MAP[vkFormat];
+    if (!astcFormat) throw new Error(`Unsupported ASTC VkFormat: ${vkFormat}`);
+    await this._prepareAstc(gl, vkFormat);
+    this._checkLoad(loadId);
+
+    const level: LevelData = {
+      length: level0Length,
+      read: (offset, length, signal) =>
+        reader.read(level0Offset + offset, Math.min(length, level0Length - offset), signal),
+    };
+    let stream: LayerStream;
+    if (supercompressionScheme === 2) {
+      const decoder = await this._ensureZstdDecoder();
+      this._checkLoad(loadId);
+      const zstdStream = await ZstdLayerStream.open(decoder, level, bytesPerLayer, level0UncompressedLength);
+      if (loadId !== this._loadId) {
+        zstdStream.close();
+        throw new SupersededLoad();
+      }
+      this._log(zstdStream.seekTable
+        ? `[AlphaVideoGpu] Seek table: ${zstdStream.seekTable.compressedOffsets.length} seek points`
+        : '[AlphaVideoGpu] No seek table: seeks decode from the start');
+      stream = zstdStream;
+    } else {
+      stream = new UncompressedLayerStream(level, bytesPerLayer, layerCount);
+    }
+
+    this._initStreamingRingBuffer(gl, width, height, astcFormat, layerCount, vkFormat);
+
+    this._streamingMode = true;
+    this._streamingLayerCount = layerCount;
+    this._streamingLevel0Offset = level0Offset;
+    this._streamingFrameCache = new Map();
+    this._streamingDecodePos = 0;
+    this._streamingFramesReady = 0;
+    this._layerStream = stream;
+
+    // Pre-decode initial frames
+    const actualRingSize = this._streamingRingActualSize;
+    const prefetchCount = Math.min(this._streamingPrefetchAhead, layerCount);
+    this._log(`[AlphaVideoGpu] Pre-decoding ${prefetchCount} frames...`);
+
+    for (let i = 0; i < prefetchCount && !this._streamingCancelled; i++) {
+      const frameData = await stream.readLayer();
+      this._checkLoad(loadId);
+      if (!frameData) break;
+      this._streamingFrameCache.set(i, frameData);
+      this._streamingDecodePos = i + 1;
+      this._streamingFramesReady = i + 1;
+      if (i < actualRingSize) {
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._streamingRingBuffer);
+        this._uploadLayer(gl, i, width, height, astcFormat, frameData);
+        this._streamingRingSlots[i] = i;
+      }
+    }
+
+    this._textureArray = this._streamingRingBuffer;
+
+    this._startBackgroundDecompression();
+
+    this._log(`[AlphaVideoGpu] ✓ Streaming ready: ${metadata.frameCount} frames @ ${metadata.frameRate} fps`);
+  }
+
+  // ======== Private: Background Decode ========
+
+  /**
+   * Reads and decodes ahead of playback, and catches up to a seek target, in slices of
+   * DECODE_SLICE_MS so a long catch-up doesn't hold up drawing or input. A seek during a read
+   * interrupts it (readLayer returns null) and the loop carries on from the new position.
    */
   private _startBackgroundDecompression(): void {
-    if (this._backgroundDecodeRunning) return;
-    this._backgroundDecodeRunning = true;
+    const stream = this._layerStream;
+    if (!stream || this._backgroundDecodeStream === stream) return;
+    this._backgroundDecodeStream = stream;
     const decompressLoop = async () => {
       const layerCount = this._streamingLayerCount;
       // In RAM mode frames past the cache window would be evicted as soon as they're decoded
@@ -836,20 +833,23 @@ export class KTX2PlayerCore {
         ? this._streamingPrefetchAhead
         : Math.min(this._streamingPrefetchAhead, this._streamingCacheSize);
       let sliceEnd = performance.now() + DECODE_SLICE_MS;
-      // The flag clears as the loop ends, not a task later: a restart in between would see it
+      // The stream clears as the loop ends, not a task later: a restart in between would see it
       // still set, start nothing, and leave playback waiting for frames
       try {
-        while (!this._streamingCancelled && this._zstdStream && this._zstdStream.position < layerCount) {
-          const stream = this._zstdStream;
+        while (!this._streamingCancelled && this._layerStream === stream && stream.position < layerCount) {
           if (performance.now() >= sliceEnd) {
             await yieldToEventLoop();
             sliceEnd = performance.now() + DECODE_SLICE_MS;
           } else if (stream.skipping) {
-            stream.skip(sliceEnd);
+            await stream.skip(sliceEnd);
           } else if (stream.position - this._currentFrame < aheadLimit) {
             const frameIndex = stream.position;
-            const frameData = stream.readLayer();
-            if (!frameData) break;
+            const frameData = await stream.readLayer();
+            if (this._layerStream !== stream) break;
+            if (!frameData) {
+              if (stream.atEnd) break;
+              continue;
+            }
             this._streamingFrameCache.set(frameIndex, frameData);
             this._streamingDecodePos = stream.position;
             this._streamingFramesReady = stream.position;
@@ -860,11 +860,13 @@ export class KTX2PlayerCore {
           }
         }
       } catch (error) {
-        console.error('[AlphaVideoGpu] Streaming decode failed:', error);
-        this._setState('error');
-        this._onError?.(error as Error);
+        if (this._layerStream === stream && !isAbortError(error)) {
+          console.error('[AlphaVideoGpu] Streaming decode failed:', error);
+          this._setState('error');
+          this._onError?.(error as Error);
+        }
       } finally {
-        this._backgroundDecodeRunning = false;
+        if (this._backgroundDecodeStream === stream) this._backgroundDecodeStream = null;
       }
     };
     decompressLoop();
@@ -934,16 +936,16 @@ export class KTX2PlayerCore {
   // ======== Private: Handle Streaming Loop ========
 
   private _handleStreamingLoop(): void {
-    // Uncompressed streaming reads any frame straight from the file
-    if (!this._zstdStream) return;
+    if (!this._layerStream) return;
     this._streamingLoopCount++;
-    this._log(`[AlphaVideoGpu] 🔄 Loop #${this._streamingLoopCount} - restarting decompression`);
-    this._decodeFrom(0);
+    this._log(`[AlphaVideoGpu] 🔄 Loop #${this._streamingLoopCount}`);
+    // A clip that fits the buffered frames plays on from them
+    this._moveStreamTo(0);
   }
 
   /** Starts the streaming decoder, unless it is already running. */
   private _kickStreamingDecode(): void {
-    if (!this._streamingMode || !this._zstdStream || this._streamingCancelled) return;
+    if (!this._streamingMode || !this._layerStream || this._streamingCancelled) return;
     this._startBackgroundDecompression();
   }
 
@@ -953,7 +955,7 @@ export class KTX2PlayerCore {
    * reaches target sooner (see ZstdLayerStream.moveTo).
    */
   private _moveStreamTo(target: number): void {
-    if (!this._zstdStream) return;
+    if (!this._layerStream) return;
     const decodePos = this._streamingDecodePos;
     let buffered = target < decodePos;
     for (let f = target; buffered && f < decodePos; f++) {
@@ -962,15 +964,15 @@ export class KTX2PlayerCore {
     if (!buffered) this._decodeFrom(target);
   }
 
-  /** Frees the zstd decoder's WASM buffers. */
-  private _closeZstdStream(): void {
-    this._zstdStream?.close();
-    this._zstdStream = null;
+  /** Stops the stream's reads and frees the zstd decoder's WASM buffers. */
+  private _closeLayerStream(): void {
+    this._layerStream?.close();
+    this._layerStream = null;
   }
 
   /** Drops the decoded frames and has the decoder produce target next. */
   private _decodeFrom(target: number): void {
-    const stream = this._zstdStream;
+    const stream = this._layerStream;
     if (!stream) return;
     this._streamingFrameCache.clear();
     stream.moveTo(target);

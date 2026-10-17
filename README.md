@@ -369,13 +369,15 @@ Sizes outside their range are clamped to it. Where the frames live, and which si
 
 | Form | iOS | Android | Web | Notes |
 |------|-----|---------|-----|-------|
-| `https://…`, `http://…` | ✓ | ✓ | ✓ | Downloaded once into the app cache, then read from disk. Web caches in IndexedDB. |
+| `https://…`, `http://…` | ✓ | ✓ | ✓ | Downloaded once into the app cache, then read from disk. The web reads it with range requests, keeping what it played in OPFS (or IndexedDB). `source.headers` go with every request (web only for now). |
 | `file:///abs/path`, `/abs/path` | ✓ | ✓ | — | Read in place. |
 | `asset://path/in/bundle` | ✓ | ✓ | ✓ | Android: APK `assets/`. iOS: the app bundle's resource folder. Web: the site root (`/path/in/bundle`). |
 | `content://…` | — | ✓ | — | Read through the `ContentResolver`. |
 | bare resource name | — | ✓ | — | A `res/raw` resource, which is what `require()` resolves to in an Android release build. |
 
 Nothing is copied: bundled assets, raw resources and local files are read where they are.
+
+On the web, `source` can also be a `Blob` or `File`, or a byte source, `{ size, read(offset, length, signal) }`, that reads the file from the app's own code (a fetcher, a cache, decryption). See [the web package's README](web/README.md#sources-and-storage).
 
 #### Cache keys
 
@@ -385,7 +387,7 @@ Downloads are named by `cacheKey` if you give one, otherwise by a hash of the UR
 <AlphaVideoGpuView source={{ uri: presignedUrl, cacheKey: 'videos/glow.ktx2' }} />
 ```
 
-`cacheKey` can also be passed as a top-level prop; it wins over `source.cacheKey`. Native downloads go to the app's cache directory (`<cache>/<cacheKey>`, or `<cache>/alpha-video-gpu/<sha256>`), so the OS may clear them.
+`cacheKey` can also be passed as a top-level prop; it wins over `source.cacheKey`. Native downloads go to the app's cache directory (`<cache>/<cacheKey>`, or `<cache>/alpha-video-gpu/<sha256>`), so the OS may clear them. On the web, stored clips are named the same way, and the browser may evict them.
 
 #### Bundled with `require()`
 
@@ -475,13 +477,15 @@ const player = createAlphaVideoGpuPlayer(document.querySelector('canvas')!, {
   streamingPrefetchAhead: 30,  // stream: frames decoded ahead, 5 to 100
   frameEvents: true,           // the web default; false calls onFrameUpdate only after seeks
   verbose: false,              // true logs info traces to the browser console
+  storage: 'auto',             // where played bytes are kept: OPFS, else IndexedDB; or 'indexeddb', 'cache', 'memory', 'none'
+  maxStorageBytes: 512 * 1024 * 1024, // this player's cap across every clip, least recently played evicted first
   onLoad: ({ width, height, frameCount, frameRate }) => {},
   onStateChange: (state) => {},
   onFrameUpdate: (frame, total) => {},
   onFinished: () => {},
   onError: (error) => console.error(error),  // an AlphaVideoGpuError; see its `code`
 });
-player.setSource('https://example.com/video.ktx2', 'intro.ktx2');  // cacheKey names the IndexedDB entry
+player.setSource('https://example.com/video.ktx2', { cacheKey: 'intro.ktx2', headers: {} });  // also a Blob, bytes or a byte source
 player.setPaused(false);
 // player.play(), player.pause(), player.resume(), player.stop(), player.seekToFrame(n),
 // player.seekToTime(seconds), player.destroy()
@@ -493,7 +497,7 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 
 <AlphaVideoGpuPlayer
   src="https://example.com/video.ktx2"
-  cacheKey="intro.ktx2"          // names the IndexedDB entry; default, the URL
+  cacheKey="intro.ktx2"          // names the stored copy; default, the URL
   width={300}
   height={300}
   className="video"
@@ -744,7 +748,7 @@ Not ideal for:
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `source` | `{ uri: string, cacheKey?: string }` | — | What to play; see [Sources](#sources) |
+| `source` | `{ uri: string, cacheKey?: string, headers? }` | — | What to play; see [Sources](#sources). On web also a `Blob` or a byte source |
 | `style` | `ViewStyle` | — | Container style |
 | `autoPlay` | `boolean` | `true` | Start playback once loaded |
 | `loop` | `boolean` | `true` | Loop playback |
@@ -790,7 +794,7 @@ xcodebuild -scheme AlphaVideoGPU -destination 'generic/platform=iOS Simulator' b
 Tests that run on the host, on the fixtures in `tests/fixtures/` (test-card encodes, described in `expected.json`):
 
 ```bash
-cd web && npm test                                    # web: parsers, seek table, streaming zstd reads and seeks
+cd web && npm test                                    # web: parsers, seek table, streaming zstd and uncompressed reads and seeks
 cd android && ./gradlew testReleaseUnitTest           # Android: the seek table parser (JUnit)
 clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test   # iOS: seek table, reads and seeks
 ```

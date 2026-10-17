@@ -5,6 +5,30 @@
  * and all wrapper implementations (React Native Web, React, Vanilla JS).
  */
 
+import type { ByteSource, ByteStore, StorageKind } from 'alpha-video-source';
+
+/**
+ * What a player plays: a URL (http(s), relative, or asset://path), a Blob or File, bytes in
+ * memory, or a ByteSource that reads by offset (an app's own fetcher or cache).
+ */
+export type KTX2Source = string | Blob | ArrayBuffer | Uint8Array | ByteSource;
+
+export interface KTX2SourceOptions {
+  /**
+   * Names the stored copy, for URLs that change while the file doesn't (presigned URLs).
+   * Defaults to the URL. A Blob or ByteSource is stored only with storage set and a cacheKey.
+   */
+  cacheKey?: string;
+  /** Sent with every request for a URL, e.g. Authorization. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * Where streamed bytes are kept between plays: 'auto' (OPFS, else IndexedDB), 'opfs',
+ * 'indexeddb', 'cache' (the Cache API), 'memory' (this page only), 'none', or your own store.
+ */
+export type KTX2Storage = StorageKind | ByteStore;
+
 export interface Metadata {
   frameCount: number;
   frameWidth: number;
@@ -52,6 +76,14 @@ export interface KTX2PlayerCoreOptions {
   memoryStrategy?: MemoryStrategy;
   /** Log info traces to the console (warnings and errors always log). Default: false */
   verbose?: boolean;
+  /**
+   * Where a URL's bytes are kept between plays, read back by range. Default: 'auto' for URLs,
+   * 'none' for Blobs, memory and ByteSources. With 'none', a clip under 16 MB still stays in
+   * memory for loops.
+   */
+  storage?: KTX2Storage;
+  /** Cap on the bytes stored across every clip, evicting the least recently played. Default: 512 MB */
+  maxStorageBytes?: number;
 
   // Dependency injection — allows different bundling strategies
   /** ZSTDDecoder class constructor (for zstd decompression) */

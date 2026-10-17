@@ -3,7 +3,21 @@ import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { ZSTDDecoder } from '../src/zstddec-stream-bundled.js';
 import { ZstdLayerStream, type ZstdStreamingDecoder } from '../src/zstd-layer-stream';
-import { parseZstdSeekTable, seekPointBefore } from '../src/zstd-seek-table';
+import { UncompressedLayerStream, type LevelData } from '../src/layer-stream';
+import { parseZstdSeekTable, readZstdSeekTable, seekPointBefore } from '../src/zstd-seek-table';
+
+/** The level as LevelData, optionally slow, with every read's offset recorded. */
+function levelData(level: Uint8Array, options: { delayMs?: number; reads?: number[] } = {}): LevelData {
+  return {
+    length: level.length,
+    async read(offset, length, signal) {
+      options.reads?.push(offset);
+      if (options.delayMs) await new Promise((resolve) => setTimeout(resolve, options.delayMs));
+      signal?.throwIfAborted();
+      return level.subarray(offset, Math.min(offset + length, level.length));
+    },
+  };
+}
 
 const fixturesDir = path.resolve(__dirname, '../../tests/fixtures');
 
@@ -65,6 +79,38 @@ describe('parseZstdSeekTable', () => {
     expect(parseZstdSeekTable(levelWith([]))).toBeNull();
     expect(parseZstdSeekTable(new Uint8Array(8))).toBeNull();
   });
+
+  it('reads a table from just the level tail, given where the tail starts', () => {
+    const level = levelWith(frames);
+    expect(parseZstdSeekTable(level.subarray(220), undefined, 220)?.compressedOffsets).toEqual([0, 100, 150]);
+    expect(parseZstdSeekTable(level.subarray(220))).toBeNull();
+  });
+});
+
+describe('readZstdSeekTable', () => {
+  const frames: [number, number][] = [[100, 4000], [50, 4000], [70, 2000]];
+
+  it('reads the footer, then only the table', async () => {
+    const level = levelWith(frames);
+    const reads: Array<[number, number]> = [];
+    const read = async (offset: number, length: number) => {
+      reads.push([offset, length]);
+      return level.subarray(offset, offset + length);
+    };
+    expect((await readZstdSeekTable(read, level.length, 10000))?.decompressedOffsets).toEqual([0, 4000, 8000]);
+    expect(reads).toEqual([[level.length - 9, 9], [220, level.length - 220]]);
+  });
+
+  it('reads only the footer of a level without a table', async () => {
+    const level = new Uint8Array(1000);
+    let reads = 0;
+    const read = async (offset: number, length: number) => {
+      reads++;
+      return level.subarray(offset, offset + length);
+    };
+    expect(await readZstdSeekTable(read, level.length)).toBeNull();
+    expect(reads).toBe(1);
+  });
 });
 
 describe('seekPointBefore', () => {
@@ -103,18 +149,26 @@ const zstdFixtures: Fixture[] = Object.entries(expected)
   .filter(([name, e]: [string, any]) => name !== '_comment' && e.supercompression === 2 && /astc4x4(_seek)?\.ktx2$/.test(name))
   .map(([name, e]: [string, any]) => loadFixture(name, e));
 
-/** Records where in the level each decoder run starts. */
-function recordingDecoder(decoder: ZstdStreamingDecoder, level: Uint8Array, starts: number[]): ZstdStreamingDecoder {
+/** Records where in the level each decoder run starts: the first level read after it is created. */
+function recordingRuns(decoder: ZstdStreamingDecoder, level: Uint8Array, starts: number[]) {
+  let started = false;
+  const data = levelData(level);
   return {
-    decodeStreaming(chunks) {
-      const iterator = chunks[Symbol.iterator]();
-      const first = iterator.next();
-      if (!first.done) starts.push(first.value.byteOffset - level.byteOffset);
-      return decoder.decodeStreaming((function* () {
-        if (!first.done) yield first.value;
-        yield* { [Symbol.iterator]: () => iterator };
-      })());
-    },
+    decoder: {
+      decodeStreaming: (chunks: Iterable<Uint8Array>) => decoder.decodeStreaming(chunks),
+      createStreamingDecoder: () => {
+        started = true;
+        return decoder.createStreamingDecoder!();
+      },
+    } as ZstdStreamingDecoder,
+    level: {
+      length: data.length,
+      read(offset: number, length: number, signal?: AbortSignal) {
+        if (started) starts.push(offset);
+        started = false;
+        return data.read(offset, length, signal);
+      },
+    } as LevelData,
   };
 }
 
@@ -139,48 +193,109 @@ describe.each(zstdFixtures)('ZstdLayerStream on $name', (fixture) => {
     expect(table?.compressedOffsets.length).toBe(fixture.seekPoints);
   });
 
-  it('reads every layer in order, then nothing', () => {
-    const stream = new ZstdLayerStream(decoder, fixture.level, fixture.bytesPerLayer);
-    for (let i = 0; i < fixture.layers; i++) expect(sameBytes(stream.readLayer(), layerAt(i))).toBe(true);
-    expect(stream.readLayer()).toBeNull();
+  const open = (level: LevelData = levelData(fixture.level), withDecoder: ZstdStreamingDecoder = decoder) =>
+    ZstdLayerStream.open(withDecoder, level, fixture.bytesPerLayer, fixture.bytesPerLayer * fixture.layers);
+
+  it('reads every layer in order, then nothing', async () => {
+    const stream = await open();
+    for (let i = 0; i < fixture.layers; i++) expect(sameBytes(await stream.readLayer(), layerAt(i))).toBe(true);
+    expect(stream.atEnd).toBe(false);
+    expect(await stream.readLayer()).toBeNull();
+    expect(stream.atEnd).toBe(true);
     stream.close();
   });
 
-  it('reads the right layer after seeks in any direction', () => {
-    const stream = new ZstdLayerStream(decoder, fixture.level, fixture.bytesPerLayer);
+  it('reads the right layer after seeks in any direction', async () => {
+    const stream = await open();
     for (const target of [37, 38, 59, 1, 29, 30, 31, 0, 45, 44, 59, 0]) {
       stream.moveTo(target);
       expect(stream.position).toBe(target);
-      expect(sameBytes(stream.readLayer(), layerAt(target))).toBe(true);
+      expect(sameBytes(await stream.readLayer(), layerAt(target))).toBe(true);
     }
     stream.close();
   });
 
-  it('skips in slices that stop at the deadline', () => {
-    const stream = new ZstdLayerStream(decoder, fixture.level, fixture.bytesPerLayer);
+  it('skips in slices that stop at the deadline', async () => {
+    const stream = await open();
     stream.moveTo(fixture.layers - 1);
-    stream.skip(0);  // a deadline already past does nothing
+    await stream.skip(0);  // a deadline already past does nothing
     expect(stream.skipping).toBe(fixture.layers - 1 > 0);
-    stream.skip();
+    await stream.skip();
     expect(stream.skipping).toBe(false);
-    expect(sameBytes(stream.readLayer(), layerAt(fixture.layers - 1))).toBe(true);
+    expect(sameBytes(await stream.readLayer(), layerAt(fixture.layers - 1))).toBe(true);
     stream.close();
   });
 
-  it('starts at the nearest seek point, or carries on when that is no further', () => {
+  it('starts at the nearest seek point, or carries on when that is no further', async () => {
     const starts: number[] = [];
-    const stream = new ZstdLayerStream(recordingDecoder(decoder, fixture.level, starts), fixture.level, fixture.bytesPerLayer);
+    const runs = recordingRuns(decoder, fixture.level, starts);
+    const stream = await open(runs.level, runs.decoder);
     const table = stream.seekTable;
     const pointFor = (layer: number) => seekPointBefore(table, layer * fixture.bytesPerLayer).compressedOffset;
 
-    stream.readLayer();             // decoder now at layer 1
+    await stream.readLayer();       // decoder now at layer 1
     stream.moveTo(2);               // a step ahead: carry on
-    stream.readLayer();
+    await stream.readLayer();
     stream.moveTo(50);              // far ahead: the seek point (or carry on, with one stream)
-    stream.readLayer();
+    await stream.readLayer();
     stream.moveTo(10);              // behind: restart
-    stream.readLayer();
+    await stream.readLayer();
     expect(starts).toEqual(table ? [0, pointFor(50), pointFor(10)] : [0, 0]);
     stream.close();
+  });
+
+  it('returns null from a read that a seek interrupts, then reads the new target', async () => {
+    const stream = await open(levelData(fixture.level, { delayMs: 2 }));
+    const interrupted = stream.readLayer();
+    stream.moveTo(40);
+    expect(await interrupted).toBeNull();
+    expect(stream.atEnd).toBe(false);
+    expect(stream.position).toBe(40);
+    expect(sameBytes(await stream.readLayer(), layerAt(40))).toBe(true);
+    stream.close();
+  });
+
+  it('returns null from a read that close interrupts', async () => {
+    const stream = await open(levelData(fixture.level, { delayMs: 2 }));
+    const interrupted = stream.readLayer();
+    stream.close();
+    expect(await interrupted).toBeNull();
+  });
+
+  it('reads the whole level first for a decoder without createStreamingDecoder', async () => {
+    const reads: number[] = [];
+    const pullOnly: ZstdStreamingDecoder = { decodeStreaming: (chunks) => decoder.decodeStreaming(chunks) };
+    const stream = await open(levelData(fixture.level, { reads }), pullOnly);
+    const readsAtOpen = reads.length;
+    stream.moveTo(33);
+    expect(sameBytes(await stream.readLayer(), layerAt(33))).toBe(true);
+    expect(reads.length).toBe(readsAtOpen);
+    stream.close();
+  });
+});
+
+describe('UncompressedLayerStream', () => {
+  const bytesPerLayer = 64;
+  const layers = 10;
+  const level = Uint8Array.from({ length: bytesPerLayer * layers }, (_, i) => Math.floor(i / bytesPerLayer));
+
+  it('reads each layer from where it sits, after seeks too', async () => {
+    const stream = new UncompressedLayerStream(levelData(level), bytesPerLayer, layers);
+    expect((await stream.readLayer())![0]).toBe(0);
+    stream.moveTo(7);
+    expect((await stream.readLayer())![0]).toBe(7);
+    expect(stream.position).toBe(8);
+    stream.moveTo(9);
+    await stream.readLayer();
+    expect(await stream.readLayer()).toBeNull();
+    expect(stream.atEnd).toBe(true);
+  });
+
+  it('returns null from a read that a seek interrupts', async () => {
+    const stream = new UncompressedLayerStream(levelData(level, { delayMs: 2 }), bytesPerLayer, layers);
+    const interrupted = stream.readLayer();
+    stream.moveTo(5);
+    expect(await interrupted).toBeNull();
+    expect((await stream.readLayer())![0]).toBe(5);
   });
 });

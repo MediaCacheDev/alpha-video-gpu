@@ -20,6 +20,9 @@ export { KTX2PlayerCore as AlphaVideoGpuCore };
 export type {
   KTX2PlayerCoreOptions as AlphaVideoGpuOptions,
   KTX2LoadEvent as AlphaVideoGpuLoadEvent,
+  KTX2Source as AlphaVideoGpuSource,
+  KTX2SourceOptions as AlphaVideoGpuSourceOptions,
+  KTX2Storage as AlphaVideoGpuStorage,
   PlayerState,
   MemoryStrategy,
   Metadata,
@@ -33,7 +36,16 @@ export {
   getASTCBytesPerLayer,
 } from './ktx2-parser';
 
-export { getCachedFile, setCachedFile } from './cache';
+export { STORAGE_NAMESPACE } from './source';
+export {
+  blobSource,
+  createStore,
+  httpSource,
+  memorySource,
+  HttpSourceError,
+  SourceChangedError,
+} from 'alpha-video-source';
+export type { ByteSource, ByteStore, SourceInfo, StorageKind, HttpSourceOptions } from 'alpha-video-source';
 
 export { AlphaVideoGpuError } from './errors';
 export type { AlphaVideoGpuErrorCode } from './errors';

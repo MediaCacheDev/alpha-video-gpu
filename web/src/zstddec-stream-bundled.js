@@ -124,13 +124,12 @@ var ZSTDDecoder = /*#__PURE__*/function () {
     instance.exports.free(uncompressedPtr);
     return dec;
   };
-  // Modified from zstddec 0.2.0-alpha.4: a native generator whose finally frees the WASM
-  // buffers, so a stream closed early with return() doesn't leak them (the original freed them
-  // only after the last chunk).
-  _proto.decodeStreaming = function* decodeStreaming(arrays) {
+  // Added to zstddec 0.2.0-alpha.4: a streaming decoder that is handed its input one array at a
+  // time, so the input can arrive asynchronously (range reads) while the decoder keeps its state.
+  // decode(array) yields that array's output; finished() is true between frames; free() releases
+  // the WASM buffers and may be called with a decode generator suspended.
+  _proto.createStreamingDecoder = function createStreamingDecoder() {
     if (!instance) throw new Error('ZSTDDecoder: Await .init() before decoding.');
-    var buffInSize = instance.exports.ZSTD_DStreamInSize();
-    var buffIn = instance.exports.malloc(buffInSize);
     var buffOutSize = instance.exports.ZSTD_DStreamOutSize();
     var buffOut = instance.exports.malloc(buffOutSize);
     var dctxPtr = instance.exports.ZSTD_createDCtx();
@@ -140,11 +139,11 @@ var ZSTDDecoder = /*#__PURE__*/function () {
     var inputPtr = instance.exports.malloc(sizeOfPointer + sizeOfSizeT * 2);
     var outputPtr = instance.exports.malloc(sizeOfPointer + sizeOfSizeT * 2);
     var lastRet = 0;
-    var compressedPtr = 0;
-    try {
-      for (var _iterator2 = _createForOfIteratorHelperLoose(arrays), _step2; !(_step2 = _iterator2()).done;) {
-        var array = _step2.value;
-        compressedPtr = instance.exports.malloc(array.byteLength);
+    var freed = false;
+    function* decode(array) {
+      if (freed) throw new Error('ZSTDDecoder: the streaming decoder was freed');
+      var compressedPtr = instance.exports.malloc(array.byteLength);
+      try {
         heap.set(array, compressedPtr);
         // set input struct fields: src, size, pos
         heapView.setInt32(inputPtr, compressedPtr, true);
@@ -166,18 +165,39 @@ var ZSTDDecoder = /*#__PURE__*/function () {
           // 0 means the frame is done and flushed; calling again would start reading a next one
           outputFull = outputPos === buffOutSize && lastRet !== 0;
           if (outputPos > 0) yield heap.slice(buffOut, buffOut + outputPos);
+          if (freed) return;
         }
+      } finally {
         instance.exports.free(compressedPtr);
-        compressedPtr = 0;
       }
-      if (lastRet !== 0) throw new Error('Incomplete stream, more data expected.');
+    }
+    return {
+      decode: decode,
+      finished: function finished() {
+        return lastRet === 0;
+      },
+      free: function free() {
+        if (freed) return;
+        freed = true;
+        instance.exports.ZSTD_freeDCtx(dctxPtr);
+        instance.exports.free(buffOut);
+        instance.exports.free(inputPtr);
+        instance.exports.free(outputPtr);
+      }
+    };
+  };
+  // Modified from zstddec 0.2.0-alpha.4: a native generator whose finally frees the WASM
+  // buffers, so a stream closed early with return() doesn't leak them (the original freed them
+  // only after the last chunk).
+  _proto.decodeStreaming = function* decodeStreaming(arrays) {
+    var stream = this.createStreamingDecoder();
+    try {
+      for (var _iterator2 = _createForOfIteratorHelperLoose(arrays), _step2; !(_step2 = _iterator2()).done;) {
+        yield* stream.decode(_step2.value);
+      }
+      if (!stream.finished()) throw new Error('Incomplete stream, more data expected.');
     } finally {
-      if (compressedPtr) instance.exports.free(compressedPtr);
-      instance.exports.ZSTD_freeDCtx(dctxPtr);
-      instance.exports.free(buffIn);
-      instance.exports.free(buffOut);
-      instance.exports.free(inputPtr);
-      instance.exports.free(outputPtr);
+      stream.free();
     }
   };
   return ZSTDDecoder;
