@@ -150,16 +150,22 @@ var ZSTDDecoder = /*#__PURE__*/function () {
         heapView.setInt32(inputPtr, compressedPtr, true);
         heapView.setInt32(inputPtr + sizeOfPointer, array.byteLength, true);
         heapView.setInt32(inputPtr + sizeOfPointer + sizeOfSizeT, 0, true);
-        // we must repeat as long as ZSTD_inBuffer.size < ZSTD_inBuffer.pos
-        while (heapView.getUint32(inputPtr + sizeOfPointer + sizeOfSizeT, true) < heapView.getUint32(inputPtr + sizeOfPointer, true)) {
+        // Repeat while input is left, and while the output buffer came back full: the decoder
+        // may still hold output after taking the last input byte.
+        var outputFull = false;
+        while (outputFull || heapView.getUint32(inputPtr + sizeOfPointer + sizeOfSizeT, true) < heapView.getUint32(inputPtr + sizeOfPointer, true)) {
           // set output struct fields: src, size, pos
           heapView.setInt32(outputPtr, buffOut, true);
           heapView.setInt32(outputPtr + sizeOfPointer, buffOutSize, true);
           heapView.setInt32(outputPtr + sizeOfPointer + sizeOfSizeT, 0, true);
           lastRet = instance.exports.ZSTD_decompressStream(dctxPtr, outputPtr, inputPtr);
+          // zstd's error codes are the top size_t values, which arrive here as negative i32s
+          if (lastRet < 0) throw new Error('zstd: corrupt or unsupported data');
           // see how many bytes were written to the output buffer
           var outputPos = heapView.getUint32(outputPtr + sizeOfPointer + sizeOfSizeT, true);
-          yield heap.slice(buffOut, buffOut + outputPos);
+          // 0 means the frame is done and flushed; calling again would start reading a next one
+          outputFull = outputPos === buffOutSize && lastRet !== 0;
+          if (outputPos > 0) yield heap.slice(buffOut, buffOut + outputPos);
         }
         instance.exports.free(compressedPtr);
         compressedPtr = 0;

@@ -14,6 +14,7 @@
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
+    "!android/src/test",
     "!react-native/android/build",
     "!react-native/android/.gradle",
     "!react-native/android/.cxx",

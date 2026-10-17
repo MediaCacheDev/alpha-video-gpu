@@ -13,6 +13,11 @@ First public release.
 - Playback control: `play`, `pause`, `stop`, `seekToFrame` and `seekToTime` on every platform, plus `paused`, `autoPlay`, `loop` and `playbackSpeed`.
 - Events: `onLoad`, `onFrameUpdate` (with `enableFrameEvents`), `onStateChange`, `onFinished` and `onError`. On the web, `onError` reports `ASTC_UNSUPPORTED` or `WEBGL_UNSUPPORTED` in `code`.
 - A software ASTC decoder for emulators, devices and browsers without ASTC. On the web it's the same decoder compiled to WebAssembly, loaded only by browsers without `WEBGL_compressed_texture_astc`; they report `ASTC_UNSUPPORTED` only if WebAssembly is blocked as well.
+- Streaming seeks start at seek points. When a zstd level ends with a seek table (zstd's seekable format, written by alpha-video-gpu-encoder's `--seek-interval`), a seek starts decoding at the zstd frame before its target, or carries on from the decoder if that is closer. Files without a table play as before, and seek from the start of the file.
+  - A long catch-up to a seek runs in slices: 8 ms per task on the web, per display tick on iOS, and 16 ms per render-loop pass on Android, so drawing, input, later seeks and teardown aren't held up.
+  - Streamed zstd levels made of several frames decode on every platform. iOS stopped decoding at each frame end, and its seeks stopped skipping there, landing on the wrong frame.
+  - Decoders no longer lose the last bytes when the input runs out while zstd still holds output (Android, iOS and the web). The web decoder also stops on corrupt data, where it used to loop forever.
+  - The web player feeds zstd 256 KB of input at a time and decodes straight into frame buffers. Before, every start copied the whole level into WebAssembly memory, and each frame was gathered by re-copying a growing buffer.
 - Web streaming no longer stalls when a seek restarts decoding in the same task as an earlier seek or `play()` (seen with `memoryStrategy="ram"`, after a seek back to the start).
 - Colours reach the screen exactly as encoded on every platform. iOS devices sample ASTC as plain (LDR) data, like Android and the web; before 1.0.0 they sampled it as sRGB, which darkened mid-tones by about half and gave semi-transparent edges dark fringes.
 - React Native: one `AlphaVideoGpuView` for Android, iOS and react-native-web, on both the new architecture (Fabric) and the old one.

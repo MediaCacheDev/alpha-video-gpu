@@ -4,14 +4,15 @@ const params = new URLSearchParams(location.search);
 const cardsDir = params.get('cards') ?? '../../../tests/fixtures';
 const only = params.get('only') ? new RegExp(params.get('only')) : null;
 const CARDS = ['card_256x256', 'card_383x217'];
-const FIXTURES = ['astc4x4.ktx2', 'astc4x4_stream.ktx2', 'astc4x4_nozstd.ktx2', 'astc6x6.ktx2', 'astc8x8.ktx2'];
+const FIXTURES = ['astc4x4.ktx2', 'astc4x4_stream.ktx2', 'astc4x4_seek.ktx2', 'astc4x4_nozstd.ktx2', 'astc6x6.ktx2', 'astc8x8.ktx2'];
 const MODES = [
   { stream: true, memoryStrategy: 'vram' },
   { stream: true, memoryStrategy: 'ram' },
   { stream: false, memoryStrategy: 'vram' },
   { stream: false, memoryStrategy: 'ram' },
 ];
-const SEEKS = [0, 1, 29, 30, 31, 37, 59];
+// Forward, then back: with a seek table the backward ones start the decoder at a seek point
+const SEEKS = [0, 1, 29, 30, 31, 37, 59, 44, 10, 11, 3];
 const PLAYBACK_MS = 3000;
 
 const logEl = document.getElementById('log');
@@ -68,6 +69,7 @@ async function runCase(card, fixture, mode, layout) {
     }
 
     player.seekToFrame(0);
+    for (let t = performance.now(); performance.now() - t < 2000 && readFrame(canvas, layout) !== 0; await nextFrame());
     player.play();
     const codes = [];
     for (let t = performance.now(); performance.now() - t < PLAYBACK_MS; await nextFrame()) codes.push(readFrame(canvas, layout));

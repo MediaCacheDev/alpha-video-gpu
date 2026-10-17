@@ -19,6 +19,11 @@
 
 #pragma clang diagnostic pop
 
+#include "zstd_seek.h"
+
+// How long a display tick spends catching up to a seek; the rest goes on over the next ticks
+static const CFTimeInterval kSeekSkipSliceSeconds = 0.008;
+
 #define AVG_VLOG(fmt, ...) do { if (self.verbose) NSLog(@"AlphaVideoGpuView: " fmt, ##__VA_ARGS__); } while (0)
 
 #pragma mark - Source resolution
@@ -197,7 +202,12 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   // Streaming decompression state
   ZSTD_DStream *_dstream;
   NSData *_compressedData;
-  size_t _compressedDataPos;
+  // Reads _compressedData through _dstream
+  AVGZstdStream _zstdStream;
+  // Empty when the level is one zstd stream
+  AVGZstdSeekTable _seekTable;
+  // Decoded bytes still to drop before _decoderPosition: a seek catching up
+  uint64_t _pendingSkipBytes;
   NSMutableData *_frameAccumulator;
   uint32_t _streamBytesPerLayer;
   uint64_t _streamLevel0Offset;
@@ -275,7 +285,9 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     _useVramStrategy = NO;
     _dstream = NULL;
     _compressedData = nil;
-    _compressedDataPos = 0;
+    memset(&_zstdStream, 0, sizeof(_zstdStream));
+    memset(&_seekTable, 0, sizeof(_seekTable));
+    _pendingSkipBytes = 0;
     _frameAccumulator = nil;
     _streamBytesPerLayer = 0;
     _streamLevel0Offset = 0;
@@ -719,6 +731,9 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     return;
   }
   
+  // A seek still catching up: nothing past it can be decoded yet
+  if (![self skipPendingBytesUntil:CACurrentMediaTime() + kSeekSkipSliceSeconds]) return;
+  
   // Calculate how many frames to decode ahead
   // Use relative distance to handle wraparound correctly (matching Android approach)
   NSInteger vPosModulus = self.totalFrames * 2;  // Bounded virtual position space
@@ -747,25 +762,16 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     }
   }
   
-  size_t outputBufferSize = ZSTD_DStreamOutSize();
-  NSMutableData *decompressBuffer = [NSMutableData dataWithLength:outputBufferSize];
-  
-  ZSTD_inBuffer input = { _compressedData.bytes, _compressedData.length, _compressedDataPos };
-  
   while (framesToDecode > 0) {
     // Check if we need to restart decompression for looping
     if (_decoderPosition >= self.totalFrames) {
       _decoderPosition = 0;
       _decoderLoopIteration++;
       
-      // Reinitialize decompression stream
-      ZSTD_initDStream(_dstream);
-      input.pos = 0;
-      _compressedDataPos = 0;
+      avg_zstd_stream_restart(&_zstdStream, 0);
       [_frameAccumulator setLength:0];
       
-      AVG_VLOG(@"Decoder wrap-around: loop %ld, resetting input.pos from %zu to 0", 
-            (long)_decoderLoopIteration, input.pos);
+      AVG_VLOG(@"Decoder wrap-around: loop %ld, decoding from the start", (long)_decoderLoopIteration);
       
       // After wrap-around, recalculate how many frames we need to decode
       // Use the same formula as at the start of the method
@@ -776,38 +782,24 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
         AVG_VLOG(@"After wrap-around: already ahead enough, stopping decode");
         break;
       }
-      AVG_VLOG(@"After wrap-around: newDecodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld, inputSize=%zu",
-            (long)newDecodeVPos, (long)newFramesAhead, (long)framesToDecode, input.size);
+      AVG_VLOG(@"After wrap-around: newDecodeVPos=%ld, framesAhead=%ld, framesToDecode=%ld",
+            (long)newDecodeVPos, (long)newFramesAhead, (long)framesToDecode);
       // Don't continue - fall through to decompress the header and first frames
       // The continue was causing us to skip decompression after wrap-around
     }
     
-    // Decompress until we have a full frame
-    int decompressLoopCount = 0;
-    while (_frameAccumulator.length < _streamBytesPerLayer && input.pos < input.size) {
-      ZSTD_outBuffer output = { decompressBuffer.mutableBytes, outputBufferSize, 0 };
-      size_t result = ZSTD_decompressStream(_dstream, &output, &input);
-      if (ZSTD_isError(result)) {
-        NSLog(@"AlphaVideoGpuView: Decompression error: %s", ZSTD_getErrorName(result));
-        break;
-      }
-      if (output.pos > 0) {
-        [_frameAccumulator appendBytes:decompressBuffer.bytes length:output.pos];
-      }
-      decompressLoopCount++;
-      if (result == 0) {
-        AVG_VLOG(@"ZSTD stream ended at decoderPos=%ld, inputPos=%zu/%zu, accumLen=%lu",
-              (long)_decoderPosition, input.pos, input.size, (unsigned long)_frameAccumulator.length);
-        break;  // Stream ended
-      }
-    }
-    
-    // Log if we exited without a full frame
-    if (_frameAccumulator.length < _streamBytesPerLayer && decompressLoopCount == 0) {
-      static int noProgressCount = 0;
-      if (noProgressCount++ < 10) {
-        AVG_VLOG(@"No decompression progress - accumLen=%lu, bytesPerLayer=%u, inputPos=%zu/%zu, decoderPos=%ld",
-              (unsigned long)_frameAccumulator.length, _streamBytesPerLayer, input.pos, input.size, (long)_decoderPosition);
+    // Decompress the rest of the frame straight into the accumulator, across zstd frame ends
+    NSUInteger held = _frameAccumulator.length;
+    if (held < _streamBytesPerLayer) {
+      const char *error = NULL;
+      [_frameAccumulator setLength:_streamBytesPerLayer];
+      size_t got = avg_zstd_stream_read(&_zstdStream, (uint8_t *)_frameAccumulator.mutableBytes + held,
+                                        _streamBytesPerLayer - held, &error);
+      [_frameAccumulator setLength:held + got];
+      if (error) NSLog(@"AlphaVideoGpuView: Decompression error: %s", error);
+      if (_frameAccumulator.length < _streamBytesPerLayer) {
+        AVG_VLOG(@"ZSTD stream ended at decoderPos=%ld, accumLen=%lu",
+              (long)_decoderPosition, (unsigned long)_frameAccumulator.length);
       }
     }
     
@@ -877,34 +869,33 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
       break;  // No more data available
     }
   }
-  
-  _compressedDataPos = input.pos;
 }
 
-/** Decompresses and drops the next bytes of frame data, for a seek. */
-- (void)skipDecodedBytes:(uint64_t)bytes
+/**
+ * Decompresses and drops the bytes a seek still has to get past, until the deadline
+ * (CACurrentMediaTime()); YES once none are left.
+ */
+- (BOOL)skipPendingBytesUntil:(CFTimeInterval)deadline
 {
-  NSMutableData *decompressBuffer = [NSMutableData dataWithLength:ZSTD_DStreamOutSize()];
-  ZSTD_inBuffer input = { _compressedData.bytes, _compressedData.length, _compressedDataPos };
-  uint64_t held = MIN((uint64_t)_frameAccumulator.length, bytes);
+  if (_pendingSkipBytes == 0) return YES;
+  uint64_t held = MIN((uint64_t)_frameAccumulator.length, _pendingSkipBytes);
   [_frameAccumulator replaceBytesInRange:NSMakeRange(0, (NSUInteger)held) withBytes:NULL length:0];
-  bytes -= held;
-  while (bytes > 0) {
-    ZSTD_outBuffer output = { decompressBuffer.mutableBytes, decompressBuffer.length, 0 };
-    size_t result = ZSTD_decompressStream(_dstream, &output, &input);
-    if (ZSTD_isError(result)) {
-      NSLog(@"AlphaVideoGpuView: Decompression error while seeking: %s", ZSTD_getErrorName(result));
+  _pendingSkipBytes -= held;
+
+  NSMutableData *scratch = [NSMutableData dataWithLength:ZSTD_DStreamOutSize()];
+  while (_pendingSkipBytes > 0) {
+    const char *error = NULL;
+    size_t want = (size_t)MIN((uint64_t)scratch.length, _pendingSkipBytes);
+    size_t got = avg_zstd_stream_read(&_zstdStream, scratch.mutableBytes, want, &error);
+    if (error) NSLog(@"AlphaVideoGpuView: Decompression error while seeking: %s", error);
+    if (got == 0) {
+      _pendingSkipBytes = 0;  // past the end of the data
       break;
     }
-    if (output.pos > bytes) {
-      [_frameAccumulator appendBytes:(const uint8_t *)decompressBuffer.bytes + bytes length:output.pos - (size_t)bytes];
-      bytes = 0;
-    } else {
-      bytes -= output.pos;
-    }
-    if (result == 0 || (output.pos == 0 && input.pos >= input.size)) break;
+    _pendingSkipBytes -= got;
+    if (_pendingSkipBytes > 0 && CACurrentMediaTime() >= deadline) return NO;
   }
-  _compressedDataPos = input.pos;
+  return YES;
 }
 
 /**
@@ -927,13 +918,19 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   } else if (_dstream) {
     BOOL samePass = _decoderLoopIteration % 2 == _playbackLoopIteration % 2;
     if (samePass && target >= self.currentFrame && target < _decoderPosition) return;
-    if (samePass && target >= _decoderPosition) {
-      [self skipDecodedBytes:(uint64_t)(target - _decoderPosition) * _streamBytesPerLayer];
+    // Carry on decoding when that is no further from the target than the nearest seek point
+    // (the level start, without a seek table). The skip itself happens over the next display
+    // ticks, in decodeFramesAhead.
+    uint64_t bytesPerLayer = _streamBytesPerLayer;
+    uint64_t targetBytes = (uint64_t)target * bytesPerLayer;
+    AVGZstdSeekPoint point = avg_zstd_seek_point_before(&_seekTable, targetBytes);
+    uint64_t decoded = (uint64_t)_decoderPosition * bytesPerLayer + _frameAccumulator.length - _pendingSkipBytes;
+    if (samePass && target >= _decoderPosition && avg_zstd_carry_on(decoded, point)) {
+      _pendingSkipBytes += (uint64_t)(target - _decoderPosition) * bytesPerLayer;
     } else {
-      ZSTD_initDStream(_dstream);
-      _compressedDataPos = 0;
+      avg_zstd_stream_restart(&_zstdStream, point.compressedOffset);
       [_frameAccumulator setLength:0];
-      [self skipDecodedBytes:(uint64_t)target * _streamBytesPerLayer];
+      _pendingSkipBytes = targetBytes - point.decompressedOffset;
     }
     _decoderPosition = target;
     _decoderLoopIteration = 0;
@@ -2022,7 +2019,15 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     self->_compressedData = [NSData dataWithBytesNoCopy:(void *)compressedDataPtr 
                                                  length:level0Length 
                                            freeWhenDone:NO];
-    self->_compressedDataPos = 0;
+    self->_zstdStream = (AVGZstdStream){dstream, compressedDataPtr, (size_t)level0Length, 0, false};
+    avg_zstd_seek_table_free(&self->_seekTable);
+    if (avg_zstd_seek_table_parse(compressedDataPtr, (size_t)level0Length,
+                                  (uint64_t)bytesPerLayer * layerCount, &self->_seekTable)) {
+      AVG_VLOG(@"Seek table: %zu seek points", self->_seekTable.count);
+    } else {
+      AVG_VLOG(@"No seek table: seeks decode from the start");
+    }
+    self->_pendingSkipBytes = 0;
     self->_frameAccumulator = [NSMutableData data];
     self->_streamBytesPerLayer = bytesPerLayer;
     self->_streamLevel0Offset = 0;  // _compressedData starts at the level0 data
@@ -2412,6 +2417,9 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     _dstream = NULL;
   }
   _compressedData = nil;
+  memset(&_zstdStream, 0, sizeof(_zstdStream));
+  avg_zstd_seek_table_free(&_seekTable);
+  _pendingSkipBytes = 0;
   _frameAccumulator = nil;
   _ringSlots = nil;
   _frameCache = nil;

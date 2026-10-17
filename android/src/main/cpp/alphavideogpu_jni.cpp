@@ -418,6 +418,8 @@ struct StreamingDecompressState {
     const uint8_t* input_data = nullptr;
     size_t input_size = 0;
     size_t input_pos = 0;
+    // The last call filled the output mid-frame: zstd may hold more even with no input left
+    bool output_pending = false;
     
     ~StreamingDecompressState() {
         if (dstream) {
@@ -533,8 +535,8 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingDecompress
         return -1;  // Error
     }
     
-    // Check if we've consumed all input
-    if (state->input_pos >= state->input_size) {
+    // Check if we've consumed all input and zstd has nothing left to flush
+    if (state->input_pos >= state->input_size && !state->output_pending) {
         return (1LL << 32);  // Done, 0 bytes written
     }
     
@@ -568,13 +570,41 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingDecompress
     
     // Update input position
     state->input_pos += input.pos;
+    // 0 means the frame is done and flushed; a level can hold several frames back to back
+    state->output_pending = output.pos == output.size && result != 0;
     
     // Check if done
-    bool isDone = (state->input_pos >= state->input_size) && (result == 0);
+    bool isDone = state->input_pos >= state->input_size && !state->output_pending;
     
     // Return: high 32 bits = status (0=more, 1=done), low 32 bits = bytes written
     jlong status = isDone ? 1 : 0;
     return (status << 32) | (jlong)output.pos;
+}
+
+/**
+ * Starts the stream again at a zstd frame boundary of its input, such as a seek point from the
+ * level's seek table (0 is the level's start). The mapping is kept.
+ */
+JNIEXPORT jboolean JNICALL
+Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingRestartAt(JNIEnv *env, jclass clazz,
+                                                                                jlong stream_id,
+                                                                                jlong compressed_offset) {
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    auto it = g_streaming_states.find(stream_id);
+    if (it == g_streaming_states.end() || !it->second->dstream) return JNI_FALSE;
+    StreamingDecompressState* state = it->second.get();
+    if (compressed_offset < 0 || (size_t)compressed_offset > state->input_size) {
+        LOGE("Restart offset %lld is outside the stream (%zu bytes)", (long long)compressed_offset, state->input_size);
+        return JNI_FALSE;
+    }
+    size_t reset = ZSTD_DCtx_reset(state->dstream, ZSTD_reset_session_only);
+    if (ZSTD_isError(reset)) {
+        LOGE("Failed to reset ZSTD_DStream: %s", ZSTD_getErrorName(reset));
+        return JNI_FALSE;
+    }
+    state->input_pos = (size_t)compressed_offset;
+    state->output_pending = false;
+    return JNI_TRUE;
 }
 
 /**

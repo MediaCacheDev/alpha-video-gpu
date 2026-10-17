@@ -30,7 +30,7 @@ player.seekToTime(1.5);
 player.destroy();
 ```
 
-A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before the source loads are ignored. `stop()` pauses on the first frame. `setPaused(paused)` is the `paused` prop: it holds playback, and unpausing plays again when `autoPlay` is on.
+A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before the source loads are ignored. While streaming, a seek outside the buffered frames starts the zstd decoder at the file's nearest seek point (the encoder writes one every 8 MB of ASTC by default), or at the start of a file written as one stream. `stop()` pauses on the first frame. `setPaused(paused)` is the `paused` prop: it holds playback, and unpausing plays again when `autoPlay` is on.
 
 `setSource(uri, cacheKey?)` caches downloads in IndexedDB, under `cacheKey` when given (for URLs that change while the file doesn't). `AlphaVideoGpuCore` is the player class itself, for supplying your own decoders.
 

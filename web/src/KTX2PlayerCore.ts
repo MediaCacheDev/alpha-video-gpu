@@ -32,6 +32,7 @@ import {
 import { getCachedFile, setCachedFile } from './cache';
 import { AlphaVideoGpuError } from './errors';
 import type { SoftwareAstcDecoder } from './software-astc';
+import { ZstdLayerStream } from './zstd-layer-stream';
 
 // Re-export types for convenience
 export type {
@@ -49,6 +50,15 @@ function resolveWebUri(uri: string): string {
 
 function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+/** How long the streaming decoder works before letting the page draw and handle input. */
+const DECODE_SLICE_MS = 8;
+
+function yieldToEventLoop(): Promise<void> {
+  const scheduler = (globalThis as any).scheduler;
+  if (typeof scheduler?.yield === 'function') return scheduler.yield();
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 // ============================================================================
@@ -116,16 +126,14 @@ export class KTX2PlayerCore {
   private _streamingDecodePos = 0;
   private _streamingFramesReady = 0;
   private _streamingLoopCount = 0;
-  private _streamingCompressedChunks: Uint8Array[] | null = null;
-  private _streamingDecompressState: any = null;
+  // The zstd level's decoder; null for uncompressed streaming
+  private _zstdStream: ZstdLayerStream | null = null;
   private _streamingBytesPerLayer = 0;
   private _streamingWidth = 0;
   private _streamingHeight = 0;
   private _streamingLayerCount = 0;
   private _streamingLevel0Offset = 0;
   private _streamingAstcFormat = 0;
-  // Frames decoded before this one are dropped: the decoder is catching up to a seek
-  private _streamingSkipTo = 0;
   private _backgroundDecodeRunning = false;
 
   // A clip that doesn't loop has reached its last frame; playing again starts it over
@@ -306,7 +314,6 @@ export class KTX2PlayerCore {
       this._streamingCancelled = false;
       this._currentFrame = 0;
       this._ended = false;
-      this._streamingSkipTo = 0;
 
       const gl = this._gl || this._initGL();
       if (!gl) return;
@@ -363,9 +370,7 @@ export class KTX2PlayerCore {
     }
     this._streamingMode = false;
     this._streamingFrameCache.clear();
-    this._streamingCompressedChunks = null;
-    this._closeStreamingGenerator();
-    this._streamingDecompressState = null;
+    this._closeZstdStream();
     this._ramFrameData = null;
     this._ramHeavyMode = false;
     this._loadedSource = null;
@@ -489,9 +494,7 @@ export class KTX2PlayerCore {
     if (this._streamingRingBuffer) { gl.deleteTexture(this._streamingRingBuffer); this._streamingRingBuffer = null; }
     this._streamingMode = false;
     this._streamingFrameCache.clear();
-    this._streamingCompressedChunks = null;
-    this._closeStreamingGenerator();
-    this._streamingDecompressState = null;
+    this._closeZstdStream();
   }
 
   private _cleanupRamState(): void {
@@ -779,15 +782,12 @@ export class KTX2PlayerCore {
       this._streamingFrameCache = new Map();
       this._streamingDecodePos = 0;
       this._streamingFramesReady = 0;
-      this._streamingCompressedChunks = [compressedData];
 
-      const generator = decoder.decodeStreaming(this._streamingCompressedChunks);
-      this._streamingDecompressState = {
-        generator,
-        frameAccumulator: new Uint8Array(0),
-        totalBytesDecoded: 0,
-        totalFramesDecoded: 0,
-      };
+      const stream = new ZstdLayerStream(decoder, compressedData, bytesPerLayer, level0UncompressedLength);
+      this._zstdStream = stream;
+      this._log(stream.seekTable
+        ? `[AlphaVideoGpu] Seek table: ${stream.seekTable.compressedOffsets.length} seek points`
+        : '[AlphaVideoGpu] No seek table: seeks decode from the start');
 
       // Pre-decode initial frames
       const actualRingSize = this._streamingRingActualSize;
@@ -795,7 +795,7 @@ export class KTX2PlayerCore {
       this._log(`[AlphaVideoGpu] Pre-decoding ${prefetchCount} frames...`);
 
       for (let i = 0; i < prefetchCount && !this._streamingCancelled; i++) {
-        const frameData = await this._decodeNextFrame();
+        const frameData = stream.readLayer();
         if (!frameData) break;
         this._streamingFrameCache.set(i, frameData);
         this._streamingDecodePos = i + 1;
@@ -820,40 +820,12 @@ export class KTX2PlayerCore {
     }
   }
 
-  // ======== Private: Decode Next Frame (internal zstd) ========
-
-  private async _decodeNextFrame(): Promise<Uint8Array | null> {
-    const state = this._streamingDecompressState;
-    if (!state || !state.generator) return null;
-
-    const bytesPerLayer = this._streamingBytesPerLayer;
-
-    while (state.frameAccumulator.length < bytesPerLayer) {
-      const result = state.generator.next();
-      if (result.done) {
-        if (state.frameAccumulator.length >= bytesPerLayer) break;
-        return null;
-      }
-      const chunk = result.value as Uint8Array;
-      if (chunk && chunk.length > 0) {
-        const newAccum = new Uint8Array(state.frameAccumulator.length + chunk.length);
-        newAccum.set(state.frameAccumulator);
-        newAccum.set(chunk, state.frameAccumulator.length);
-        state.frameAccumulator = newAccum;
-      }
-    }
-
-    if (state.frameAccumulator.length >= bytesPerLayer) {
-      const frameData = state.frameAccumulator.slice(0, bytesPerLayer);
-      state.frameAccumulator = state.frameAccumulator.slice(bytesPerLayer);
-      state.totalFramesDecoded++;
-      return frameData;
-    }
-    return null;
-  }
-
   // ======== Private: Background Decompression (internal zstd) ========
 
+  /**
+   * Decodes ahead of playback, and catches up to a seek target, in slices of DECODE_SLICE_MS
+   * so a long catch-up doesn't hold up drawing or input.
+   */
   private _startBackgroundDecompression(): void {
     if (this._backgroundDecodeRunning) return;
     this._backgroundDecodeRunning = true;
@@ -863,26 +835,34 @@ export class KTX2PlayerCore {
       const aheadLimit = this._useVramStrategy
         ? this._streamingPrefetchAhead
         : Math.min(this._streamingPrefetchAhead, this._streamingCacheSize);
+      let sliceEnd = performance.now() + DECODE_SLICE_MS;
       // The flag clears as the loop ends, not a task later: a restart in between would see it
       // still set, start nothing, and leave playback waiting for frames
       try {
-        while (!this._streamingCancelled && this._streamingDecodePos < layerCount) {
-          const framesAhead = this._streamingDecodePos - this._currentFrame;
-          if (framesAhead < aheadLimit) {
-            const frameData = await this._decodeNextFrame();
-            if (frameData) {
-              const frameIndex = this._streamingDecodePos;
-              if (frameIndex >= this._streamingSkipTo) this._streamingFrameCache.set(frameIndex, frameData);
-              this._streamingDecodePos++;
-              this._streamingFramesReady = this._streamingDecodePos;
-              this._evictOldFramesFromCache(this._currentFrame);
-            } else {
-              break;
-            }
+        while (!this._streamingCancelled && this._zstdStream && this._zstdStream.position < layerCount) {
+          const stream = this._zstdStream;
+          if (performance.now() >= sliceEnd) {
+            await yieldToEventLoop();
+            sliceEnd = performance.now() + DECODE_SLICE_MS;
+          } else if (stream.skipping) {
+            stream.skip(sliceEnd);
+          } else if (stream.position - this._currentFrame < aheadLimit) {
+            const frameIndex = stream.position;
+            const frameData = stream.readLayer();
+            if (!frameData) break;
+            this._streamingFrameCache.set(frameIndex, frameData);
+            this._streamingDecodePos = stream.position;
+            this._streamingFramesReady = stream.position;
+            this._evictOldFramesFromCache(this._currentFrame);
           } else {
             await new Promise(resolve => setTimeout(resolve, 16));
+            sliceEnd = performance.now() + DECODE_SLICE_MS;
           }
         }
+      } catch (error) {
+        console.error('[AlphaVideoGpu] Streaming decode failed:', error);
+        this._setState('error');
+        this._onError?.(error as Error);
       } finally {
         this._backgroundDecodeRunning = false;
       }
@@ -955,73 +935,48 @@ export class KTX2PlayerCore {
 
   private _handleStreamingLoop(): void {
     // Uncompressed streaming reads any frame straight from the file
-    if (!this._streamingDecompressState) return;
+    if (!this._zstdStream) return;
     this._streamingLoopCount++;
     this._log(`[AlphaVideoGpu] 🔄 Loop #${this._streamingLoopCount} - restarting decompression`);
-    this._restartStreamingDecode(0);
+    this._decodeFrom(0);
   }
 
   /** Starts the streaming decoder, unless it is already running. */
   private _kickStreamingDecode(): void {
-    const state = this._streamingDecompressState;
-    if (!this._streamingMode || !state || this._streamingCancelled) return;
+    if (!this._streamingMode || !this._zstdStream || this._streamingCancelled) return;
     this._startBackgroundDecompression();
   }
 
   /**
    * Points the streaming decoder at target. Frames from target up to the decoder that are all
-   * still buffered are kept; a target ahead of the decoder is skipped to; otherwise decoding
-   * starts over.
+   * still buffered are kept; otherwise decoding carries on or starts at a seek point, whichever
+   * reaches target sooner (see ZstdLayerStream.moveTo).
    */
   private _moveStreamTo(target: number): void {
-    const state = this._streamingDecompressState;
-    if (!state) return;
+    if (!this._zstdStream) return;
     const decodePos = this._streamingDecodePos;
     let buffered = target < decodePos;
     for (let f = target; buffered && f < decodePos; f++) {
       buffered = this._streamingFrameCache.has(f) || this._streamingRingSlots.includes(f);
     }
-    if (buffered) return;
-
-    if (target >= decodePos && decodePos < this._streamingLayerCount) {
-      this._streamingFrameCache.clear();
-      this._streamingSkipTo = target;
-      this._kickStreamingDecode();
-    } else {
-      this._restartStreamingDecode(target);
-    }
+    if (!buffered) this._decodeFrom(target);
   }
 
-  /** Closes the zstd stream, which frees its WASM buffers; a no-op once it has finished. */
-  private _closeStreamingGenerator(): void {
-    try {
-      this._streamingDecompressState?.generator?.return?.();
-    } catch { /* already closed */ }
+  /** Frees the zstd decoder's WASM buffers. */
+  private _closeZstdStream(): void {
+    this._zstdStream?.close();
+    this._zstdStream = null;
   }
 
-  /** Decodes from the start again, dropping the frames before skipTo. */
-  private _restartStreamingDecode(skipTo: number): void {
+  /** Drops the decoded frames and has the decoder produce target next. */
+  private _decodeFrom(target: number): void {
+    const stream = this._zstdStream;
+    if (!stream) return;
     this._streamingFrameCache.clear();
-    this._streamingDecodePos = 0;
-    this._streamingFramesReady = 0;
-    this._streamingSkipTo = skipTo;
-
-    const state = this._streamingDecompressState;
-    this._closeStreamingGenerator();
-
-    const compressedChunks = this._streamingCompressedChunks;
-    if (compressedChunks && compressedChunks.length > 0 && this._zstdDecoder?.decodeStreaming) {
-      const generator = this._zstdDecoder.decodeStreaming(compressedChunks);
-
-      if (state) {
-        state.generator = generator;
-        state.frameAccumulator = new Uint8Array(0);
-        state.totalBytesDecoded = 0;
-        state.totalFramesDecoded = 0;
-      }
-
-      this._kickStreamingDecode();
-    }
+    stream.moveTo(target);
+    this._streamingDecodePos = target;
+    this._streamingFramesReady = target;
+    this._kickStreamingDecode();
   }
 
   /** Draws the shown frame once it is decoded, for a seek while not playing. */

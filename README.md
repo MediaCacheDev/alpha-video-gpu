@@ -347,7 +347,7 @@ function MyComponent() {
 }
 ```
 
-A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first frame), `seekToFrame(frame)` and `seekToTime(seconds)`. A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before `onLoad` are ignored. With `stream`, a seek outside the buffered frames decodes again from the start of the file, or onwards from the decoder for a seek ahead of it. `autoPlay` sets how a video starts: off, it waits for `play()`. `paused` is a hold to turn on and off, for example while the screen is hidden; unpausing plays again when `autoPlay` is on, and with `autoPlay` off it takes `play()`. A clip that doesn't loop stops on its last frame, and `play()` starts it over.
+A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first frame), `seekToFrame(frame)` and `seekToTime(seconds)`. A seek shows the frame, clamped to the clip, and playback carries on from it or stays paused; seeks before `onLoad` are ignored. With `stream`, a seek outside the buffered frames decodes again, from the nearest seek point before it or onwards from the decoder, whichever is closer. Files from the encoder have a seek point every 8 MB of ASTC by default (its `--seek-interval`), so a seek decodes at most that much, a few milliseconds. A file written as one zstd stream (`--seek-interval 0`, or an older encoder) has only the start of the file. Seeking far into one of those decodes everything before the target, in slices that don't block the UI. `autoPlay` sets how a video starts: off, it waits for `play()`. `paused` is a hold to turn on and off, for example while the screen is hidden; unpausing plays again when `autoPlay` is on, and with `autoPlay` off it takes `play()`. A clip that doesn't loop stops on its last frame, and `play()` starts it over.
 
 
 ### Options
@@ -638,6 +638,12 @@ Streaming enables playback of arbitrarily long videos with **fixed memory footpr
 
 The encoder's defaults (ASTC texture array, KTX2-internal zstd) already produce a streamable file; play it with `stream`.
 
+#### Seeking in zstd files
+
+A zstd decoder can only start at the beginning of a zstd frame. By default the encoder starts a new frame every 8 MB of ASTC and ends the level with a seek table in zstd's [seekable format](https://github.com/facebook/zstd/tree/dev/contrib/seekable_format). A streaming seek then starts at the frame before its target, unless carrying on from the decoder is closer. On an M4 Pro the slowest seek took 6 ms, against 1.5 s (5 minutes of 360p) and 2.9 s (60 s of 1080p) for the same clips as one stream; the 8 MB seek points cost 0.8% and 1.6% in size.
+
+`--seek-interval 0` writes one stream instead, the smallest file, for clips that only play and loop. Players that don't know the table, and every other zstd tool, read both layouts as ordinary zstd. This player reads one-stream files too, and seeks in them by decoding from the start.
+
 ---
 
 ## Uncompressed ASTC Streaming
@@ -780,6 +786,16 @@ cd web && npm ci && npm run build                     # web: dist/
 cd android && ./gradlew assembleRelease               # Android: the AAR (needs the Android SDK and NDK)
 xcodebuild -scheme AlphaVideoGPU -destination 'generic/platform=iOS Simulator' build   # iOS, from the repo root
 ```
+
+Tests that run on the host, on the fixtures in `tests/fixtures/` (test-card encodes, described in `expected.json`):
+
+```bash
+cd web && npm test                                    # web: parsers, seek table, streaming zstd reads and seeks
+cd android && ./gradlew testReleaseUnitTest           # Android: the seek table parser (JUnit)
+clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test   # iOS: seek table, reads and seeks
+```
+
+`web/test/browser/` plays the cards in a browser (see the web README); the demo app's pixel tests play them on Android and iOS.
 
 A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
 

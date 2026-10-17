@@ -69,6 +69,8 @@ repositories {
 
 dependencies {
     implementation 'androidx.annotation:annotation:1.9.1'
+    // JVM tests of the pure-Java parts (./gradlew test), on the fixtures in ../tests/fixtures
+    testImplementation 'junit:junit:4.13.2'
 }
 
 if (project == rootProject) {

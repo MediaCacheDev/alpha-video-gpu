@@ -71,6 +71,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     private static final int GL_COMPRESSED_RGBA_ASTC_10x10_KHR = 0x93BB;
     private static final int GL_COMPRESSED_RGBA_ASTC_12x10_KHR = 0x93BC;
     private static final int GL_COMPRESSED_RGBA_ASTC_12x12_KHR = 0x93BD;
+
+    // How long the zstd stream decoder catches up to a seek before the render loop runs again
+    private static final long SKIP_SLICE_NANOS = 16_000_000L;
     
     private PlayerCallback playerCallback;
     
@@ -1096,6 +1099,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         if (level0UncompressedLength != expectedUncompressed) {
             Log.w(TAG, "Uncompressed size mismatch: header=" + level0UncompressedLength + ", expected=" + expectedUncompressed);
         }
+        final ZstdSeekTable seekTable = ZstdSeekTable.parse(headerData, level0Offset, level0Length, level0UncompressedLength);
+        logI(seekTable != null ? "Seek table: " + seekTable.size() + " seek points" : "No seek table: seeks decode from the start");
         
         // Initialize internal zstd streaming decompression over a memory-mapped range
         final long[] streamId = {0};
@@ -1213,6 +1218,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             int currentVirtualDecodePos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
             int framesToDecode = (currentVirtualDecodePos - virtualPlaybackPos + vPosModulus) % vPosModulus;
             int targetFramesAhead = PREFETCH_AHEAD;
+            // A long catch-up to a seek goes on over several calls, so new seeks and stops get in
+            long skipDeadline = System.nanoTime() + SKIP_SLICE_NANOS;
             
             while (framesToDecode < targetFramesAhead) {
                 // Once decompression has ended and the last frames are out of the accumulator (a
@@ -1223,24 +1230,15 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     // Restart decompression for next loop
                     decoderLoopIteration[0]++;
                     decodePos[0] = 0;
-                    decompressEnded[0] = false;
                     frameAccumulatorBuffer.clear();  // Both modes use DirectByteBuffer now
-                    AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                    try {
-                        streamId[0] = openInternalZstdStream(local, finalLevel0Offset, finalLevel0Length);
-                    } catch (IOException e) {
-                        Log.e(TAG, "Cannot reopen " + local + " for the next loop: " + e.getMessage());
-                        streamId[0] = 0;
-                    }
-                    if (streamId[0] == 0) {
-                        decompressEnded[0] = true;
-                        break;
-                    }
+                    decompressEnded[0] = !restartInternalZstdStream(streamId, local, finalLevel0Offset, finalLevel0Length, 0);
+                    if (decompressEnded[0]) break;
                     logI("Internal zstd prefetch wrap-around: restarting for loop " + decoderLoopIteration[0]);
                     continue;
                 }
                 
                 while (bytesToSkip[0] > 0 && !decompressEnded[0]) {
+                    if (System.nanoTime() > skipDeadline) return;
                     decompressBuffer.clear();
                     long result = AlphaVideoGpuNative.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
                     if (result == -1) { decompressEnded[0] = true; break; }
@@ -1409,20 +1407,20 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     // Frames from the shown one up to the decoder are buffered (in the cache or the ring)
                     boolean buffered = samePass && seek >= currentFrame && seek < decodePos[0];
                     if (!buffered) {
-                        if (samePass && seek >= decodePos[0] && !decompressEnded[0]) {
+                        // Carry on decoding when that is no further from the target than the
+                        // nearest seek point (the level start, without a seek table)
+                        long target = (long) seek * finalBytesPerLayer;
+                        long[] seekPoint = ZstdSeekTable.seekPointBefore(seekTable, target);
+                        long decoded = (long) decodePos[0] * finalBytesPerLayer
+                            + frameAccumulatorBuffer.position() - bytesToSkip[0];
+                        if (samePass && seek >= decodePos[0] && !decompressEnded[0] && decoded >= seekPoint[1]) {
                             skipDecodedBytes(frameAccumulatorBuffer, bytesToSkip,
                                 (long) (seek - decodePos[0]) * finalBytesPerLayer);
                         } else {
-                            AlphaVideoGpuNative.nativeStreamingDecompressEnd(streamId[0]);
-                            try {
-                                streamId[0] = openInternalZstdStream(local, finalLevel0Offset, finalLevel0Length);
-                            } catch (IOException e) {
-                                Log.e(TAG, "Cannot reopen " + local + " to seek: " + e.getMessage());
-                                streamId[0] = 0;
-                            }
-                            decompressEnded[0] = streamId[0] == 0;
+                            decompressEnded[0] = !restartInternalZstdStream(
+                                streamId, local, finalLevel0Offset, finalLevel0Length, seekPoint[0]);
                             frameAccumulatorBuffer.clear();
-                            bytesToSkip[0] = (long) seek * finalBytesPerLayer;
+                            bytesToSkip[0] = target - seekPoint[1];
                         }
                         decodePos[0] = seek;
                         decoderLoopIteration[0] = 0;
@@ -1449,6 +1447,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 boolean frameInGpu = ringSlots[currentGpuSlot] == virtualPlaybackPos;
                 boolean frameInCpuCache = frameCache.containsKey(virtualPlaybackPos);
                 if (!frameInGpu && !frameInCpuCache) {
+                    // Still catching up to a seek: decodeFrames goes on with it
+                    if (bytesToSkip[0] > 0 && !decompressEnded[0]) continue;
                     Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
                     Thread.sleep(8);
                     continue;
@@ -2023,6 +2023,24 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             return AlphaVideoGpuSource.file(file.getPath());
         }
         return AlphaVideoGpuSource.parse(uri);
+    }
+
+    /**
+     * Points the stream at a zstd frame of the level (0 is its start), opening it again if an
+     * earlier open failed. False when the stream can't be used.
+     */
+    private boolean restartInternalZstdStream(long[] streamId, AlphaVideoGpuSource local,
+                                              long level0Offset, long level0Length, long compressedOffset) {
+        if (streamId[0] == 0) {
+            try {
+                streamId[0] = openInternalZstdStream(local, level0Offset, level0Length);
+            } catch (IOException e) {
+                Log.e(TAG, "Cannot reopen " + local + ": " + e.getMessage());
+                return false;
+            }
+            if (streamId[0] == 0) return false;
+        }
+        return AlphaVideoGpuNative.nativeStreamingRestartAt(streamId[0], compressedOffset);
     }
 
     /** Starts a zstd stream over the level0 data of an internally compressed KTX2, memory-mapped in place. */
