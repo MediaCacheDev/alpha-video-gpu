@@ -6,6 +6,7 @@
 #include <GLES3/gl3ext.h>
 #include <GLES2/gl2ext.h>
 #include <EGL/egl.h>
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <string>
@@ -16,6 +17,8 @@
 
 #define ZSTD_STATIC_LINKING_ONLY
 #include "zstd/zstd.h"
+
+#include "source_jni.h"
 
 // Software ASTC decoder, for GPUs without ASTC (emulators)
 #include "astc_decomp.h"
@@ -409,17 +412,28 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeLoadTextureArray(JN
 struct StreamingDecompressState {
     ZSTD_DStream* dstream = nullptr;
     
-    // Memory-mapped file (preferred - zero copy)
+    // A local file: memory-mapped, zero copy
     int fd = -1;
     void* mmap_ptr = nullptr;
     size_t mmap_size = 0;
     
-    // Unified input pointer and size
+    // A URL or data source: read from a range reader into `chunk`, which holds the level's bytes
+    // [chunk_start, chunk_start + chunk_length)
+    std::shared_ptr<avsource::RangeReader> reader;
+    int64_t level_offset = 0;
+    std::vector<uint8_t> chunk;
+    size_t chunk_start = 0;
+    size_t chunk_length = 0;
+    
+    // The mapping's bytes (null when reading from a reader), the level's size, and where the
+    // decoder is in it
     const uint8_t* input_data = nullptr;
     size_t input_size = 0;
     size_t input_pos = 0;
     // The last call filled the output mid-frame: zstd may hold more even with no input left
     bool output_pending = false;
+    // Why the last call failed
+    std::string error;
     
     ~StreamingDecompressState() {
         if (dstream) {
@@ -504,6 +518,34 @@ static jlong registerStream(std::unique_ptr<StreamingDecompressState> state) {
     return streamId;
 }
 
+// Bytes of the level read from a reader at a time
+static constexpr size_t kReaderChunkBytes = 256 * 1024;
+
+// Status values in the high 32 bits of nativeStreamingDecompressContinueToBuffer's result
+static constexpr jlong kStreamMore = 0, kStreamDone = 1, kStreamPending = 2;
+
+/**
+ * For a stream over a reader: makes `chunk` hold the bytes at input_pos, reading them if they're
+ * there. Returns kStreamMore when it does, kStreamPending while they're on their way, or -1 with
+ * `error` set if they can't be fetched.
+ */
+static jlong fillChunk(StreamingDecompressState* state) {
+    if (state->input_pos >= state->chunk_start && state->input_pos < state->chunk_start + state->chunk_length) {
+        return kStreamMore;
+    }
+    size_t want = std::min(kReaderChunkBytes, state->input_size - state->input_pos);
+    int64_t n = state->reader->tryRead(state->level_offset + (int64_t)state->input_pos, state->chunk.data(), (int64_t)want);
+    if (n == avsource::RangeReader::kPending) return kStreamPending;
+    if (n <= 0) {
+        std::string why = state->reader->lastError();
+        state->error = n == 0 ? "the file ends inside the level" : (why.empty() ? "reading failed" : why);
+        return -1;
+    }
+    state->chunk_start = state->input_pos;
+    state->chunk_length = (size_t)n;
+    return kStreamMore;
+}
+
 /**
  * Continue streaming decompression into a direct ByteBuffer (zero-copy).
  * This avoids allocating new byte arrays on each call.
@@ -511,8 +553,9 @@ static jlong registerStream(std::unique_ptr<StreamingDecompressState> state) {
  * @param stream_id The stream ID from init
  * @param output_buffer A direct ByteBuffer to write decompressed data into
  * @param max_output_bytes Maximum bytes to decompress
- * @return Status: -1 = error, 0 = more data, 1 = done, or positive = bytes written
- *         High 32 bits = status, low 32 bits = bytes written
+ * @return -1 on an error (nativeStreamingError says why), else the status in the high 32 bits
+ *         (0 = more to come, 1 = done, 2 = pending: a reader's bytes are on their way, call again
+ *         later) and the bytes written in the low 32 bits
  */
 JNIEXPORT jlong JNICALL
 Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingDecompressContinueToBuffer(JNIEnv *env, jclass clazz,
@@ -537,7 +580,7 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingDecompress
     
     // Check if we've consumed all input and zstd has nothing left to flush
     if (state->input_pos >= state->input_size && !state->output_pending) {
-        return (1LL << 32);  // Done, 0 bytes written
+        return (kStreamDone << 32);  // Done, 0 bytes written
     }
     
     // Get direct buffer address
@@ -547,12 +590,26 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingDecompress
         return -1;  // Error
     }
     
-    // Setup input/output buffers
-    ZSTD_inBuffer input = {
-        state->input_data + state->input_pos,
-        state->input_size - state->input_pos,
-        0
-    };
+    // Setup input/output buffers: the mapping from the position on, or the chunk read from the
+    // reader. zstd may have output left to flush without new input.
+    ZSTD_inBuffer input = {nullptr, 0, 0};
+    size_t input_base = state->input_pos;
+    if (state->reader) {
+        if (state->input_pos < state->input_size) {
+            jlong filled = fillChunk(state);
+            if (filled == -1) {
+                LOGE("Streaming read failed for stream %lld: %s", (long long)stream_id, state->error.c_str());
+                return -1;
+            }
+            if (filled == kStreamPending && !state->output_pending) return (kStreamPending << 32);
+            if (filled == kStreamMore) {
+                input_base = state->chunk_start;
+                input = {state->chunk.data(), state->chunk_length, state->input_pos - state->chunk_start};
+            }
+        }
+    } else {
+        input = {state->input_data + state->input_pos, state->input_size - state->input_pos, 0};
+    }
     
     ZSTD_outBuffer output = {
         buffer_ptr,
@@ -564,12 +621,13 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingDecompress
     size_t result = ZSTD_decompressStream(state->dstream, &output, &input);
     
     if (ZSTD_isError(result)) {
+        state->error = ZSTD_getErrorName(result);
         LOGE("Streaming decompression error for stream %lld: %s", (long long)stream_id, ZSTD_getErrorName(result));
         return -1;  // Error
     }
     
     // Update input position
-    state->input_pos += input.pos;
+    state->input_pos = input_base + input.pos;
     // 0 means the frame is done and flushed; a level can hold several frames back to back
     state->output_pending = output.pos == output.size && result != 0;
     
@@ -1081,6 +1139,38 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeInternalZstdStreami
     LOGI("Internal zstd streaming initialized: stream %lld, offset=%lld, size=%lld",
          (long long)streamId, (long long)data_offset, (long long)compressed_size);
     return streamId;
+}
+
+/**
+ * The same over a range reader (an AlphaVideoGpuReader reference, of which the stream keeps its
+ * own): the level is read 256 KB at a time as it decodes, without waiting, so a call whose bytes
+ * haven't arrived returns the pending status.
+ *
+ * @param level_offset Offset of the compressed level0 data in the file
+ */
+JNIEXPORT jlong JNICALL
+Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeReaderZstdStreamingInit(JNIEnv *env, jclass clazz,
+                                                                     jlong reader_reference,
+                                                                     jlong level_offset,
+                                                                     jlong compressed_size) {
+    auto reader = readerFromReference(reader_reference);
+    if (!reader || level_offset < 0 || compressed_size <= 0) return 0;
+    auto state = std::make_unique<StreamingDecompressState>();
+    state->reader = std::move(reader);
+    state->level_offset = level_offset;
+    state->input_size = (size_t)compressed_size;
+    state->chunk.resize(kReaderChunkBytes);
+    return registerStream(std::move(state));
+}
+
+/** Why the stream's last call returned -1, or null. */
+JNIEXPORT jstring JNICALL
+Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeStreamingError(JNIEnv *env, jclass clazz,
+                                                            jlong stream_id) {
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    auto it = g_streaming_states.find(stream_id);
+    if (it == g_streaming_states.end() || it->second->error.empty()) return nullptr;
+    return env->NewStringUTF(it->second->error.c_str());
 }
 
 } // extern "C"

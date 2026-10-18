@@ -1,0 +1,7 @@
+dev.mediacache.alphavideo.gpu.media3-pngs-0 /Users/daniel/code/ktx2player/android/media3/build/generated/res/pngs/release
+dev.mediacache.alphavideo.gpu.media3-resValues-1 /Users/daniel/code/ktx2player/android/media3/build/generated/res/resValues/release
+dev.mediacache.alphavideo.gpu.media3-mergeReleaseResources-2 /Users/daniel/code/ktx2player/android/media3/build/intermediates/incremental/release/mergeReleaseResources/merged.dir
+dev.mediacache.alphavideo.gpu.media3-mergeReleaseResources-3 /Users/daniel/code/ktx2player/android/media3/build/intermediates/incremental/release/mergeReleaseResources/stripped.dir
+dev.mediacache.alphavideo.gpu.media3-release-4 /Users/daniel/code/ktx2player/android/media3/build/intermediates/merged_res/release/mergeReleaseResources
+dev.mediacache.alphavideo.gpu.media3-main-5 /Users/daniel/code/ktx2player/android/media3/src/main/res
+dev.mediacache.alphavideo.gpu.media3-release-6 /Users/daniel/code/ktx2player/android/media3/src/release/res

@@ -1,10 +1,10 @@
 #import "AlphaVideoGPU.h"
+#import "AlphaVideoGpuSource.h"
 #import <TargetConditionals.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <unistd.h>
-#import <CommonCrypto/CommonDigest.h>
 
 // Third-party sources compiled into this file, with their own warnings left alone
 #pragma clang diagnostic push
@@ -24,98 +24,25 @@
 // How long a display tick spends catching up to a seek; the rest goes on over the next ticks
 static const CFTimeInterval kSeekSkipSliceSeconds = 0.008;
 
+// The store's cap when maxStorageBytes isn't set
+static const int64_t kAVGDefaultMaxStorageBytes = 512LL * 1024 * 1024;
+// Bytes of a level read from a reader at a time
+static const size_t kAVGReaderChunkBytes = 256 * 1024;
+// Bytes read first from a reader for the header and metadata, which most files fit in
+static const int64_t kAVGHeaderGuessBytes = 16 * 1024;
+
+static_assert(AVGSourceReaderPending == AVG_ZSTD_READ_PENDING, "a pending read means the same to both");
+
 #define AVG_VLOG(fmt, ...) do { if (self.verbose) NSLog(@"AlphaVideoGpuView: " fmt, ##__VA_ARGS__); } while (0)
 
 #pragma mark - Source resolution
-
-static NSString *AVGSHA256Hex(NSString *text) {
-  NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-  CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
-  NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-  for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
-    [hex appendFormat:@"%02x", digest[i]];
-  }
-  return hex;
-}
-
-static BOOL AVGFileHasData(NSString *path) {
-  NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-  return attributes != nil && attributes.fileSize > 0;
-}
 
 static BOOL AVGIsRemote(NSString *uri) {
   return [uri hasPrefix:@"https://"] || [uri hasPrefix:@"http://"];
 }
 
-/** Downloads urlString into Caches unless it's already there. Blocks; call off the main thread. */
-static NSString *AVGDownload(NSString *urlString, NSString *cacheKey, NSString **error) {
-  NSURL *url = [NSURL URLWithString:urlString];
-  if (!url) {
-    *error = [NSString stringWithFormat:@"Invalid URL: %@", urlString];
-    return nil;
-  }
-
-  NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
-                        stringByStandardizingPath];
-  NSString *cachePath;
-  if (cacheKey.length > 0) {
-    cachePath = [[cacheDir stringByAppendingPathComponent:cacheKey] stringByStandardizingPath];
-    if (![cachePath hasPrefix:[cacheDir stringByAppendingString:@"/"]]) {
-      *error = [NSString stringWithFormat:@"cacheKey must stay inside the cache directory: %@", cacheKey];
-      return nil;
-    }
-  } else {
-    cachePath = [[cacheDir stringByAppendingPathComponent:@"alpha-video-gpu"]
-                 stringByAppendingPathComponent:AVGSHA256Hex(urlString)];
-  }
-  if (AVGFileHasData(cachePath)) {
-    return cachePath;
-  }
-
-  __block NSString *failure = nil;
-  dispatch_semaphore_t done = dispatch_semaphore_create(0);
-  NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
-      completionHandler:^(NSURL *location, NSURLResponse *response, NSError *downloadError) {
-    NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
-        ? ((NSHTTPURLResponse *)response).statusCode : 200;
-    if (downloadError || !location) {
-      failure = [NSString stringWithFormat:@"Download failed: %@", downloadError.localizedDescription ?: @"unknown error"];
-    } else if (status != 200) {
-      failure = [NSString stringWithFormat:@"Download failed: HTTP %ld for %@", (long)status, urlString];
-    } else {
-      // The temporary file is deleted when this handler returns, so move it now. Another view
-      // may have finished the same download first, in which case its file is used.
-      NSFileManager *fileManager = [NSFileManager defaultManager];
-      [fileManager createDirectoryAtPath:[cachePath stringByDeletingLastPathComponent]
-             withIntermediateDirectories:YES attributes:nil error:nil];
-      NSError *moveError = nil;
-      if (![fileManager moveItemAtPath:location.path toPath:cachePath error:&moveError] && !AVGFileHasData(cachePath)) {
-        failure = [NSString stringWithFormat:@"Cannot write cache file: %@", moveError.localizedDescription];
-      }
-    }
-    dispatch_semaphore_signal(done);
-  }];
-  [task resume];
-  dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
-
-  if (failure) {
-    *error = failure;
-    return nil;
-  }
-  return cachePath;
-}
-
-/**
- * Turns a source URI into a local file path. https:// and http:// are downloaded into Caches
- * (named by cacheKey, or a hash of the URL), asset:// maps into the app bundle, and file:// and
- * absolute paths pass through. Blocks; call off the main thread.
- */
-static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **error) {
-  if (AVGIsRemote(uri)) {
-    return AVGDownload(uri, cacheKey, error);
-  }
-
+/** The file an asset:// (in the app bundle), file:// or absolute-path source names. */
+static NSString *AVGLocalPath(NSString *uri, NSString **error) {
   NSString *path = nil;
   if ([uri hasPrefix:@"asset://"]) {
     NSString *relative = [uri substringFromIndex:@"asset://".length];
@@ -144,6 +71,19 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   return path;
 }
 
+/** A level's bytes through a reader, for AVGZstdStream's read function. */
+typedef struct {
+  void *reader;  // the view's AVGSourceReader, which it holds while the stream reads
+  uint64_t levelOffset;
+} AVGLevelInput;
+
+static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, size_t length) {
+  AVGLevelInput *input = (AVGLevelInput *)context;
+  return [(__bridge AVGSourceReader *)input->reader tryReadAt:(int64_t)(input->levelOffset + offset)
+                                                         into:buffer
+                                                       length:length];
+}
+
 @interface AlphaVideoGpuView () <MTKViewDelegate>
 
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
@@ -168,8 +108,20 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   BOOL _useCompressedFormat;
   id<MTLSamplerState> _samplerState;
   NSString *_sourceUri;
-  // The local file the current source resolved to (a download, a bundle file or a path)
+  // The local file the current source resolved to (a bundle file or a path)
   NSString *_localPath;
+  // What a URL or data source is read through, while it plays
+  AVGSourceReader *_reader;
+  // The headers and data source the current source was opened with
+  NSDictionary<NSString *, NSString *> *_playingHeaders;
+  NSString *_playingDataSource;
+  // A whole file read from _reader, which _mmapData points into in place of a mapping
+  NSData *_heldFileData;
+  // The zstd stream's input from _reader, and the buffer it reads into
+  AVGLevelInput _levelInput;
+  NSMutableData *_streamChunk;
+  // Streaming stopped on a read or decompression error
+  BOOL _streamFailed;
   // Bumped for every new source, so a slow download for an old one is dropped
   NSUInteger _sourceGeneration;
   // The cache key the loaded/loading source belongs to. Compared against self.cacheKey
@@ -307,6 +259,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     // Default values
     self.autoPlay = YES;
     self.stream = YES;
+    self.storage = nil;
     
     [self setupMetal];
     [self setupVertexData];
@@ -429,7 +382,8 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   }
   
   // Check if source changed
-  if ([_sourceUri isEqualToString:uri] && (_isSourceLoaded || _isSourceLoading)) {
+  BOOL sameReads = [self readsAsPlaying];
+  if ([_sourceUri isEqualToString:uri] && sameReads && (_isSourceLoaded || _isSourceLoading)) {
     AVG_VLOG(@"Source unchanged and already loaded/loading, skipping");
     return;
   }
@@ -438,7 +392,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   // while still addressing the same object. When the cache key matches what is already
   // on screen this is a credential refresh, not a new asset, and reloading would
   // interrupt a loop that is supposed to run until unmount.
-  if (self.cacheKey.length > 0 && [self.cacheKey isEqualToString:_loadedCacheKey]
+  if (self.cacheKey.length > 0 && [self.cacheKey isEqualToString:_loadedCacheKey] && sameReads
       && (_isSourceLoaded || _isSourceLoading)) {
     AVG_VLOG(@"Same cacheKey (%@), ignoring URL change", self.cacheKey);
     _source = [uri copy];
@@ -446,6 +400,8 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     return;
   }
   
+  // Frees the previous source: its decoder, mapping or reader, and frames
+  [self cleanup];
   _source = [uri copy];
   _sourceUri = [uri copy];
   _loadedCacheKey = [self.cacheKey copy];
@@ -461,29 +417,99 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   [self resolveAndLoadSource];
 }
 
-/** Resolves _sourceUri to a local file off the main thread, then loads it. */
+/** Whether the headers and data source set are the ones the current source was opened with. */
+- (BOOL)readsAsPlaying
+{
+  NSString *dataSource = self.dataSource.length > 0 ? self.dataSource : nil;
+  return [self.headers ?: @{} isEqualToDictionary:_playingHeaders ?: @{}]
+      && (dataSource == _playingDataSource || [dataSource isEqualToString:_playingDataSource]);
+}
+
+- (void)setStorage:(NSString *)storage
+{
+  _storage = [@[ @"disk", @"memory", @"none" ] containsObject:storage] ? [storage copy] : @"auto";
+}
+
+/**
+ * Opens _sourceUri off the main thread, then loads it: a URL or a data source through a reader,
+ * anything else as a local file. Starts on the next main-queue turn, so that properties set in
+ * the same turn as source (React Native's, in any order) apply to it.
+ */
 - (void)resolveAndLoadSource
 {
   NSUInteger generation = ++_sourceGeneration;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (generation != self->_sourceGeneration) return;
+    if (self->_isDestroyed) {
+      self->_isSourceLoading = NO;
+      return;
+    }
+    [self openSource:generation];
+  });
+}
+
+- (void)openSource:(NSUInteger)generation
+{
   NSString *uri = _sourceUri;
-  NSString *cacheKey = self.cacheKey;
+  _loadedCacheKey = [self.cacheKey copy];
+  _playingHeaders = [self.headers copy] ?: @{};
+  _playingDataSource = self.dataSource.length > 0 ? [self.dataSource copy] : nil;
+  NSString *dataSourceName = _playingDataSource;
+  BOOL readsRanges = dataSourceName != nil || AVGIsRemote(uri);
+  id<AlphaVideoGpuDataSource> dataSource = nil;
+  if (dataSourceName) {
+    dataSource = [AlphaVideoGpuDataSources dataSourceNamed:dataSourceName];
+    if (!dataSource) {
+      [self notifyError:[NSString stringWithFormat:@"No data source is registered as \"%@\" (AlphaVideoGpuDataSources)",
+                                                   dataSourceName]];
+      return;
+    }
+  }
+  NSDictionary<NSString *, NSString *> *headers = _playingHeaders;
+  // auto: the disk for URLs; a data source's caching is its own
+  NSString *storage = ![self.storage isEqualToString:@"auto"] ? self.storage : dataSource ? @"none" : @"disk";
+  NSString *key = self.cacheKey.length > 0 ? self.cacheKey : uri;
+  int64_t maxStorageBytes = self.maxStorageBytes > 0 ? self.maxStorageBytes : kAVGDefaultMaxStorageBytes;
   AVG_VLOG(@"Resolving source %@", uri);
 
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     NSString *error = nil;
-    NSString *path = AVGResolveSource(uri, cacheKey, &error);
+    NSString *path = nil;
+    AVGSourceReader *reader = nil;
+    if (readsRanges) {
+      NSURL *url = [NSURL URLWithString:uri];
+      reader = url ? [AVGSourceReader openURL:url
+                                   dataSource:dataSource
+                                      headers:headers
+                                      storage:storage
+                                          key:key
+                              maxStorageBytes:maxStorageBytes
+                                        error:&error]
+                   : nil;
+      if (!reader) error = [NSString stringWithFormat:@"Loading %@ failed: %@", uri, error ?: @"not a URL"];
+    } else {
+      path = AVGLocalPath(uri, &error);
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (generation != self->_sourceGeneration) return;
+      if (generation != self->_sourceGeneration) {
+        [reader close];
+        return;
+      }
       if (self->_isDestroyed) {
+        [reader close];
         self->_isSourceLoading = NO;
         return;
       }
-      if (!path) {
+      if (reader) {
+        AVG_VLOG(@"Opened %@ (%lld bytes, storage %@)", uri, reader.size, storage);
+        self->_reader = reader;
+        [self loadKTX2FromReader:reader];
+      } else if (path) {
+        self->_localPath = path;
+        [self loadKTX2FromFile:path];
+      } else {
         [self notifyError:error];
-        return;
       }
-      self->_localPath = path;
-      [self loadKTX2FromFile:path];
     });
   });
 }
@@ -713,20 +739,108 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     
     // Continue on main thread with parsed metadata
     dispatch_async(dispatch_get_main_queue(), ^{
-      [self applyMetadataAndLoadTextures:metadata sourcePath:path];
+      [self applyMetadataAndLoadTextures:metadata sourcePath:path fileData:nil reader:nil];
     });
   });
+}
+
+/**
+ * Loads from a reader: the header and metadata first, then a streamed zstd level as it plays, or
+ * anything else read whole into memory.
+ */
+- (void)loadKTX2FromReader:(AVGSourceReader *)reader
+{
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    NSString *error = nil;
+    NSData *fileData = [self readHeaderFrom:reader error:&error];
+    NSDictionary *metadata = fileData ? [self extractKTX2Metadata:fileData] : nil;
+    if (fileData && !metadata) {
+      error = @"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.";
+    }
+    uint32_t supercompression = metadata ? avg_read_u32le((const uint8_t *)fileData.bytes + 44) : 0;
+    if (metadata && self.stream && supercompression == 0) {
+      fileData = [reader readAll:&error];
+      if (!fileData) metadata = nil;
+      if (metadata && [self checkAndPlayUncompressedStreamingFromData:fileData metadata:metadata]) return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (reader != self->_reader) return;
+      if (!metadata) {
+        [self notifyError:error];
+        return;
+      }
+      [self applyMetadataAndLoadTextures:metadata sourcePath:nil fileData:fileData reader:reader];
+    });
+  });
+}
+
+/** The header through the key/value data, where the metadata is. */
+- (NSData *)readHeaderFrom:(AVGSourceReader *)reader error:(NSString **)error
+{
+  int64_t size = reader.size;
+  if (size < 0) {
+    *error = @"The file's size isn't known (the server sent no Content-Length or Content-Range)";
+    return nil;
+  }
+  if (size < 104) {
+    *error = [NSString stringWithFormat:@"Not a KTX2 file (%lld bytes)", size];
+    return nil;
+  }
+  int64_t first = MIN(size, kAVGHeaderGuessBytes);
+  NSData *header = [reader readAt:0 length:first error:error];
+  if (!header) return nil;
+  const uint8_t *bytes = (const uint8_t *)header.bytes;
+  int64_t kvdEnd = (int64_t)avg_read_u32le(bytes + 56) + avg_read_u32le(bytes + 60);
+  if (kvdEnd > first && kvdEnd <= size) header = [reader readAt:0 length:kvdEnd error:error];
+  return header;
+}
+
+/**
+ * The seek table from a level's last bytes, or an empty one when it has none. NO with error set
+ * when they can't be read.
+ */
+- (BOOL)readSeekTable:(AVGZstdSeekTable *)table
+                 from:(AVGSourceReader *)reader
+          levelOffset:(uint64_t)levelOffset
+          levelLength:(uint64_t)levelLength
+   decompressedLength:(uint64_t)decompressedLength
+                error:(NSString **)error
+{
+  memset(table, 0, sizeof(*table));
+  uint64_t guess = MIN(levelLength, (uint64_t)AVG_ZSTD_SEEK_TAIL_GUESS);
+  NSData *tail = [reader readAt:(int64_t)(levelOffset + levelLength - guess) length:(int64_t)guess error:error];
+  if (!tail) return NO;
+  uint64_t needed = avg_zstd_seek_table_tail_size((const uint8_t *)tail.bytes, tail.length);
+  if (needed > guess && needed <= levelLength) {
+    tail = [reader readAt:(int64_t)(levelOffset + levelLength - needed) length:(int64_t)needed error:error];
+    if (!tail) return NO;
+  }
+  avg_zstd_seek_table_parse_tail((const uint8_t *)tail.bytes, tail.length, levelLength, decompressedLength, table);
+  return YES;
+}
+
+/** Ends streaming on a read or decompression error, with onError. */
+- (void)failStream:(const char *)error
+{
+  if (_streamFailed) return;
+  _streamFailed = YES;
+  NSString *why = @(error);
+  if (_reader && strcmp(error, "reading failed") == 0) why = _reader.lastError;
+  _frameOwed = NO;
+  [self pause];
+  [self updateDisplayLink];
+  [self notifyError:[NSString stringWithFormat:@"Reading %@ failed: %@", _sourceUri, why]];
 }
 
 #pragma mark - On-Demand Frame Decoding
 
 - (void)decodeFramesAhead:(NSInteger)currentVirtualPos
 {
-  if (!_dstream || !_compressedData || !_streamingRingBufferMode) {
+  if (!_dstream || (!_zstdStream.data && !_zstdStream.read) || !_streamingRingBufferMode || _streamFailed) {
     static int skipCount = 0;
     if (skipCount++ < 5) {
-      AVG_VLOG(@"decodeFramesAhead skipping - dstream=%p, compressedData=%p, ringMode=%d",
-            _dstream, _compressedData, _streamingRingBufferMode);
+      AVG_VLOG(@"decodeFramesAhead skipping - dstream=%p, ringMode=%d, failed=%d",
+            _dstream, _streamingRingBufferMode, _streamFailed);
     }
     return;
   }
@@ -796,8 +910,12 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
       size_t got = avg_zstd_stream_read(&_zstdStream, (uint8_t *)_frameAccumulator.mutableBytes + held,
                                         _streamBytesPerLayer - held, &error);
       [_frameAccumulator setLength:held + got];
-      if (error) NSLog(@"AlphaVideoGpuView: Decompression error: %s", error);
-      if (_frameAccumulator.length < _streamBytesPerLayer) {
+      if (error) {
+        [self failStream:error];
+        return;
+      }
+      // Short of a frame while input is on its way: the next display tick carries on
+      if (_frameAccumulator.length < _streamBytesPerLayer && !_zstdStream.inputPending) {
         AVG_VLOG(@"ZSTD stream ended at decoderPos=%ld, accumLen=%lu",
               (long)_decoderPosition, (unsigned long)_frameAccumulator.length);
       }
@@ -887,8 +1005,12 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     const char *error = NULL;
     size_t want = (size_t)MIN((uint64_t)scratch.length, _pendingSkipBytes);
     size_t got = avg_zstd_stream_read(&_zstdStream, scratch.mutableBytes, want, &error);
-    if (error) NSLog(@"AlphaVideoGpuView: Decompression error while seeking: %s", error);
+    if (error) {
+      [self failStream:error];
+      return NO;
+    }
     if (got == 0) {
+      if (_zstdStream.inputPending) return NO;
       _pendingSkipBytes = 0;  // past the end of the data
       break;
     }
@@ -1210,10 +1332,29 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   _mmapFd = fd;
   _mmapData = mmapData;
   _mmapSize = fileSize;
+  return [self startUncompressedStreamingWithMetadata:metadata];
+}
+
+/** checkAndPlayUncompressedStreaming: for a whole file read from a reader, held in memory. */
+- (BOOL)checkAndPlayUncompressedStreamingFromData:(NSData *)fileData metadata:(NSDictionary *)metadata
+{
+  if (!self.stream || fileData.length < 104) return NO;
+  if (avg_read_u32le((const uint8_t *)fileData.bytes + 44) != 0) return NO;
+  if (![metadata[@"packingMode"] isEqual:@"array"]) return NO;
+  _heldFileData = fileData;
+  _mmapData = (void *)fileData.bytes;
+  _mmapSize = fileData.length;
+  _mmapFd = -1;
+  return [self startUncompressedStreamingWithMetadata:metadata];
+}
+
+/** Plays the uncompressed texture array at _mmapData: a mapping, or a file held in memory. */
+- (BOOL)startUncompressedStreamingWithMetadata:(NSDictionary *)metadata
+{
   _isUncompressedStreaming = YES;
   
   // Parse KTX2 header from mmap
-  const uint8_t *data = (const uint8_t *)mmapData;
+  const uint8_t *data = (const uint8_t *)_mmapData;
   uint32_t vkFormat = *(uint32_t *)(data + 12);
   uint32_t width = *(uint32_t *)(data + 20);
   uint32_t height = *(uint32_t *)(data + 24);
@@ -1602,7 +1743,14 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   }
 }
 
-- (void)applyMetadataAndLoadTextures:(NSDictionary *)metadata sourcePath:(NSString *)sourcePath
+/**
+ * With a reader, fileData holds the file from its start, through at least the header; otherwise
+ * it is nil and the file is at sourcePath.
+ */
+- (void)applyMetadataAndLoadTextures:(NSDictionary *)metadata
+                          sourcePath:(NSString *)sourcePath
+                            fileData:(NSData *)fileData
+                              reader:(AVGSourceReader *)reader
 {
   NSString *mode = metadata[@"mode"];
   NSString *packingMode = metadata[@"packingMode"];
@@ -1622,7 +1770,7 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   AVG_VLOG(@"Metadata: %ld frames, %ldx%ld, %.1f fps",
         (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight, self.frameRate);
   
-  [self loadTextureArray:metadata sourcePath:sourcePath];
+  [self loadTextureArray:metadata sourcePath:sourcePath fileData:fileData reader:reader];
 }
 
 /**
@@ -1688,14 +1836,17 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
  * Load a KTX2 texture array (one frame per layer).
  * Uses Metal's MTLTextureType2DArray for efficient frame switching.
  */
-- (void)loadTextureArray:(NSDictionary *)metadata sourcePath:(NSString *)filePath
+- (void)loadTextureArray:(NSDictionary *)metadata
+              sourcePath:(NSString *)filePath
+                fileData:(NSData *)fileData
+                  reader:(AVGSourceReader *)reader
 {
   // Check for streaming mode from stream prop (not metadata)
   BOOL streamMode = self.stream;
   
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
     // Load the KTX2 file
-    NSData *ktx2Data = [NSData dataWithContentsOfFile:filePath options:NSDataReadingMappedIfSafe error:nil];
+    NSData *ktx2Data = fileData ?: [NSData dataWithContentsOfFile:filePath options:NSDataReadingMappedIfSafe error:nil];
     
     if (!ktx2Data || ktx2Data.length < 104) {
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -1726,6 +1877,17 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
           width, height, layerCount, supercompressionScheme, streamMode, vkFormat);
     
     // Check for internal zstd streaming mode
+    if (streamMode && supercompressionScheme == 2 && reader) {
+      AVG_VLOG(@"Using internal zstd streaming mode, from a reader");
+      [self loadInternalZstdStreamingFromReader:reader
+                                          width:width
+                                         height:height
+                                     layerCount:layerCount
+                                   level0Offset:level0Offset
+                                   level0Length:level0Length
+                                       metadata:metadata];
+      return;
+    }
     if (streamMode && supercompressionScheme == 2 && filePath) {
       AVG_VLOG(@"Using internal zstd streaming mode");
       [self loadInternalZstdStreamingTextureArray:filePath
@@ -1735,6 +1897,25 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
                                      level0Offset:level0Offset
                                      level0Length:level0Length
                                          metadata:metadata];
+      return;
+    }
+
+    // Not streamed: a reader's file is read whole, past the header
+    if (reader && (int64_t)ktx2Data.length < reader.size) {
+      NSString *error = nil;
+      ktx2Data = [reader readAll:&error];
+      if (!ktx2Data) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (reader == self->_reader) [self notifyError:error];
+        });
+        return;
+      }
+      bytes = (const uint8_t *)[ktx2Data bytes];
+    }
+    if (level0Offset + level0Length > ktx2Data.length) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self notifyError:@"The KTX2 file is shorter than its level index says"];
+      });
       return;
     }
     
@@ -1976,6 +2157,111 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     return;
   }
   
+  const uint8_t *compressedDataPtr = (const uint8_t *)mmapData + offsetAdjustment;
+  uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
+  [self startInternalZstdStreaming:dstream
+                             width:width
+                            height:height
+                        layerCount:layerCount
+                          metadata:metadata
+                             adopt:^BOOL {
+    self->_compressedData = [NSData dataWithBytesNoCopy:(void *)compressedDataPtr
+                                                 length:level0Length
+                                           freeWhenDone:NO];
+    self->_zstdStream = (AVGZstdStream){dstream, compressedDataPtr, (size_t)level0Length, 0, false};
+    avg_zstd_seek_table_free(&self->_seekTable);
+    if (avg_zstd_seek_table_parse(compressedDataPtr, (size_t)level0Length,
+                                  (uint64_t)bytesPerLayer * layerCount, &self->_seekTable)) {
+      AVG_VLOG(@"Seek table: %zu seek points", self->_seekTable.count);
+    } else {
+      AVG_VLOG(@"No seek table: seeks decode from the start");
+    }
+
+    // Store mmap info for cleanup and loop restart
+    self->_mmapFd = fd;
+    self->_mmapData = mmapData;
+    self->_mmapSize = mmapLength;
+    return YES;
+  }];
+}
+
+/** loadInternalZstdStreamingTextureArray: for a level read through a reader as it plays. */
+- (void)loadInternalZstdStreamingFromReader:(AVGSourceReader *)reader
+                                      width:(uint32_t)width
+                                     height:(uint32_t)height
+                                 layerCount:(uint32_t)layerCount
+                               level0Offset:(uint64_t)level0Offset
+                               level0Length:(uint64_t)level0Length
+                                   metadata:(NSDictionary *)metadata
+{
+  uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
+  NSString *error = nil;
+  AVGZstdSeekTable table;
+  if (![self readSeekTable:&table
+                      from:reader
+               levelOffset:level0Offset
+               levelLength:level0Length
+        decompressedLength:(uint64_t)bytesPerLayer * layerCount
+                     error:&error]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (reader == self->_reader) [self notifyError:error];
+    });
+    return;
+  }
+  AVG_VLOG(@"%@", table.count > 0 ? [NSString stringWithFormat:@"Seek table: %zu seek points", table.count]
+                                  : @"No seek table: seeks decode from the start");
+
+  ZSTD_DStream *dstream = ZSTD_createDStream();
+  if (!dstream || ZSTD_isError(ZSTD_initDStream(dstream))) {
+    ZSTD_freeDStream(dstream);
+    avg_zstd_seek_table_free(&table);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self notifyError:@"Failed to create ZSTD_DStream"];
+    });
+    return;
+  }
+  NSMutableData *chunk = [NSMutableData dataWithLength:kAVGReaderChunkBytes];
+  __block AVGZstdSeekTable seekTable = table;
+  [self startInternalZstdStreaming:dstream
+                             width:width
+                            height:height
+                        layerCount:layerCount
+                          metadata:metadata
+                             adopt:^BOOL {
+    if (reader != self->_reader) {
+      ZSTD_freeDStream(dstream);
+      avg_zstd_seek_table_free(&seekTable);
+      return NO;
+    }
+    self->_streamChunk = chunk;
+    self->_levelInput.reader = (__bridge void *)reader;
+    self->_levelInput.levelOffset = level0Offset;
+    AVGZstdStream stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.dstream = dstream;
+    stream.size = (size_t)level0Length;
+    stream.read = AVGReadLevel;
+    stream.readContext = &self->_levelInput;
+    stream.chunk = (uint8_t *)chunk.mutableBytes;
+    stream.chunkCapacity = chunk.length;
+    self->_zstdStream = stream;
+    avg_zstd_seek_table_free(&self->_seekTable);
+    self->_seekTable = seekTable;
+    return YES;
+  }];
+}
+
+/**
+ * The setup both zstd streams share, on the main queue: adopt installs the stream's input
+ * (NO to drop it, for a source no longer showing), then the ring and the first frames.
+ */
+- (void)startInternalZstdStreaming:(ZSTD_DStream *)dstream
+                             width:(uint32_t)width
+                            height:(uint32_t)height
+                        layerCount:(uint32_t)layerCount
+                          metadata:(NSDictionary *)metadata
+                             adopt:(BOOL (^)(void))adopt
+{
   // Calculate bytes per layer using current ASTC block dimensions
   uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
   
@@ -1988,11 +2274,10 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   AVG_VLOG(@"Internal zstd streaming params: strategy=%@, gpuCache=%ld, bytesPerLayer=%u (ASTC %ux%u)",
         self.memoryStrategy, (long)gpuCacheSize, bytesPerLayer, _astcBlockWidth, _astcBlockHeight);
   
-  // Store streaming state
-  const uint8_t *compressedDataPtr = (const uint8_t *)mmapData + offsetAdjustment;
-  
   // Setup on main thread
   dispatch_sync(dispatch_get_main_queue(), ^{
+    if (!adopt()) return;
+
     // Apply metadata
     self.totalFrames = layerCount;
     self.frameWidth = width;
@@ -2016,26 +2301,10 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
     self->_playbackLoopIteration = 0;
     
     self->_dstream = dstream;
-    self->_compressedData = [NSData dataWithBytesNoCopy:(void *)compressedDataPtr 
-                                                 length:level0Length 
-                                           freeWhenDone:NO];
-    self->_zstdStream = (AVGZstdStream){dstream, compressedDataPtr, (size_t)level0Length, 0, false};
-    avg_zstd_seek_table_free(&self->_seekTable);
-    if (avg_zstd_seek_table_parse(compressedDataPtr, (size_t)level0Length,
-                                  (uint64_t)bytesPerLayer * layerCount, &self->_seekTable)) {
-      AVG_VLOG(@"Seek table: %zu seek points", self->_seekTable.count);
-    } else {
-      AVG_VLOG(@"No seek table: seeks decode from the start");
-    }
     self->_pendingSkipBytes = 0;
     self->_frameAccumulator = [NSMutableData data];
     self->_streamBytesPerLayer = bytesPerLayer;
-    self->_streamLevel0Offset = 0;  // _compressedData starts at the level0 data
-    
-    // Store mmap info for cleanup and loop restart
-    self->_mmapFd = fd;
-    self->_mmapData = mmapData;
-    self->_mmapSize = mmapLength;
+    self->_streamLevel0Offset = 0;  // the stream's offsets start at the level0 data
     
     // Create texture array with ring buffer size
     MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:self->_metalPixelFormat
@@ -2419,6 +2688,12 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   _compressedData = nil;
   memset(&_zstdStream, 0, sizeof(_zstdStream));
   avg_zstd_seek_table_free(&_seekTable);
+  _streamChunk = nil;
+  memset(&_levelInput, 0, sizeof(_levelInput));
+  _streamFailed = NO;
+  // Reads still waiting on it, for a load in flight, fail; the load then drops them
+  [_reader close];
+  _reader = nil;
   _pendingSkipBytes = 0;
   _frameAccumulator = nil;
   _ringSlots = nil;
@@ -2433,7 +2708,14 @@ static NSString *AVGResolveSource(NSString *uri, NSString *cacheKey, NSString **
   _mmapData = NULL;
   _mmapFd = -1;
   _mmapSize = 0;
-  if ((mmapData && mmapData != MAP_FAILED) || mmapFd >= 0) {
+  NSData *heldFileData = _heldFileData;
+  _heldFileData = nil;
+  if (heldFileData) {
+    // Not a mapping: released after the block in flight
+    dispatch_async(_astcDecodeQueue, ^{
+      (void)heldFileData;
+    });
+  } else if ((mmapData && mmapData != MAP_FAILED) || mmapFd >= 0) {
     dispatch_async(_astcDecodeQueue, ^{
       if (mmapData && mmapData != MAP_FAILED) munmap(mmapData, mmapSize);
       if (mmapFd >= 0) close(mmapFd);

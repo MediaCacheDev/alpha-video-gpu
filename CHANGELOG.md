@@ -1,6 +1,6 @@
 # Changelog
 
-The packages built from this repository share one version: `react-native-alpha-video-gpu` and `alpha-video-gpu-web` on npm, `dev.mediacache:alpha-video-gpu` on Maven Central, and the `AlphaVideoGPU` Swift package and `alpha-video-gpu` pod.
+The packages built from this repository share one version: `react-native-alpha-video-gpu` and `alpha-video-gpu-web` on npm, `dev.mediacache:alpha-video-gpu` and `dev.mediacache:alpha-video-gpu-media3` on Maven Central, and the `AlphaVideoGPU` Swift package and `alpha-video-gpu` pod.
 
 ## 1.0.0 - Unreleased
 
@@ -9,7 +9,13 @@ First public release.
 - Plays transparent animations stored as ASTC texture arrays in KTX2 files. Metal on iOS, OpenGL ES on Android, WebGL 2 on the web.
 - Streaming (`stream`, on by default) and preloaded playback, with frames in VRAM (`memoryStrategy="vram"`, the default) or RAM. Streaming takes KTX2-internal zstd and uncompressed (memory-mapped) files, with a bounded ring and frame cache.
 - Metadata from the encoder's `BasisPlayerMetadata` key. Files in the earlier experimental formats (Basis Universal UASTC, atlas packing, GLB containers, multi-part files, whole-file `.zst`) are rejected; they play on the `archive/basis-atlas-parts` branch.
-- Sources: `https://`, `file://`, absolute paths, `asset://` (Android assets, the iOS bundle, the web root), and on Android `content://` and `res/raw` names. Native downloads are cached once under `cacheKey`.
+- Sources: `https://`, `file://`, absolute paths, `asset://` (Android assets, the iOS bundle, the web root), and on Android `content://` and `res/raw` names.
+- Android and iOS read http(s) files by range requests as they play, through the C++ reader of [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source), instead of downloading them whole first. `source.headers` go with every request.
+  - A streamed zstd file starts after its header and seek table, and is then read 256 KB at a time as it decodes. A seek reads from its seek point. Uncompressed files, and every file with `stream` off, are read whole first. Servers without range support work too.
+  - Reads never block the render loop: a frame whose bytes haven't arrived is decoded on a later tick. A dropped connection is retried 3 times. A read that still fails reports `Reading <uri> failed: …` through `onError`, and a source that can't be opened reports `Loading <uri> failed: …`.
+  - `storage` (`'auto'`, `'disk'`, `'memory'`, `'none'`) keeps what was played between plays, partially: a clip played through plays again offline. `maxStorageBytes` caps it (512 MB by default), and `cacheKey` names the stored copy. Replaces the whole-file download cache.
+  - Data sources: an app registers one under a name (`AlphaVideoGpuDataSources`, on both platforms) and names it in `source.dataSource`, to read the bytes with its own HTTP client, cache or decryption. `dev.mediacache:alpha-video-gpu-media3` adapts any Media3 `DataSource.Factory` on Android. The interfaces have the WebM player's shape, as separate types.
+  - On iOS, setting `source` loads it on the next main-queue turn, so the other properties can be set in any order, and changing the source frees the previous one's resources first.
 - The web player reads files by range instead of downloading them whole, through [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source).
   - A URL streams after its first few hundred kilobytes, and a seek fetches from its seek point on. Servers without range support are read progressively.
   - `setSource(source, { cacheKey, headers })` also takes a `Blob` or `File`, an `ArrayBuffer` or `Uint8Array`, or a byte source (`{ size, read(offset, length, signal) }`) for an app's own fetcher or cache. `headers` go with every request. The React component and React Native Web take the same, through `src` or `source`.

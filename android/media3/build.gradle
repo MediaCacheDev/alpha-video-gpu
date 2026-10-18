@@ -1,0 +1,48 @@
+// dev.mediacache:alpha-video-gpu-media3: plays an app's Media3 DataSource.Factory through
+// AlphaVideoGpuDataSource. alpha-video-gpu (or the React Native package, which builds the same classes)
+// and Media3 come from the app, so this artifact is a few classes and pulls in neither.
+
+apply plugin: 'com.android.library'
+
+def safeExtGet(name, fallback) {
+    return rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback
+}
+
+group = 'dev.mediacache'
+version = '1.0.0'
+
+android {
+    namespace 'dev.mediacache.alphavideo.gpu.media3'
+    compileSdk safeExtGet('compileSdkVersion', 36)
+
+    defaultConfig {
+        minSdk safeExtGet('minSdkVersion', 24)
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    publishing {
+        singleVariant('release') {
+            withSourcesJar()
+            withJavadocJar()
+        }
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly rootProject
+    compileOnly 'androidx.media3:media3-datasource:1.8.0'
+}
+
+ext.publishArtifactId = 'alpha-video-gpu-media3'
+ext.publishDescription = 'Media3 DataSource.Factory adapter for alpha-video-gpu: plays transparent KTX2 animations through an app\'s own Media3 data sources (OkHttp, Cronet, caches).'
+ext.publishBundlesNatives = false
+apply from: rootProject.file('publish.gradle')

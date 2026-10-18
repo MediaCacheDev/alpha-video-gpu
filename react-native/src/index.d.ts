@@ -4,11 +4,15 @@ import type React from 'react';
 // Re-export native component types
 export * from './AlphaVideoGpuViewNativeComponent';
 
-// Source type for the wrapper component (see SourceType for the URI forms)
-export type AlphaVideoGpuSource = import('./AlphaVideoGpuViewNativeComponent').SourceType & {
-  /** Web only for now: sent with every request for the URL, e.g. Authorization */
-  headers?: Record<string, string>;
-};
+// Source type for the wrapper component (see SourceType for the URI forms, headers and dataSource)
+export type AlphaVideoGpuSource = import('./AlphaVideoGpuViewNativeComponent').SourceType;
+
+/**
+ * Where a URL's or data source's bytes are kept between plays, read back by range: 'disk' (the
+ * cache folder; the browser's storage on web), 'memory' (for the app's lifetime) or 'none'. 'auto',
+ * the default, is 'disk' for URLs and 'none' for a data source, whose caching is its own.
+ */
+export type AlphaVideoGpuStorage = 'auto' | 'disk' | 'memory' | 'none';
 
 /** Web only: reads the file by offset (an app's own fetcher or cache); the smallest is `{ size, read }`. */
 export interface AlphaVideoGpuByteSource {
@@ -28,8 +32,12 @@ export interface AlphaVideoGpuViewProps {
   loop?: boolean;
   /** Playback speed multiplier (default: 1.0) */
   playbackSpeed?: number;
-  /** Cache key for remote downloads (same as `source.cacheKey`) */
+  /** What the store keeps the source under, instead of its URL (same as `source.cacheKey`) */
   cacheKey?: string;
+  /** Where a URL's or data source's bytes are kept between plays. Default: 'auto' */
+  storage?: AlphaVideoGpuStorage;
+  /** The store's cap in bytes, over every clip, least recently played out first. Default: 512 MB */
+  maxStorageBytes?: number;
   /** Pause playback */
   paused?: boolean;
   /** View style */

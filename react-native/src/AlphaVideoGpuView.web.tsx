@@ -24,8 +24,8 @@ export type { AlphaVideoGpuErrorCode, AlphaVideoGpuLoadEvent, PlayerState, ByteS
 
 /**
  * Where to load from (on web, `asset://` and http(s) URLs apply):
- * - `https://…` / `http://…`: downloaded once into the app cache (named by `cacheKey`, else a hash of the URL);
- *   on web read with range requests into the browser's storage (OPFS, else IndexedDB)
+ * - `https://…` / `http://…`: read by range as it plays, and kept as `storage` says (on web in the
+ *   browser's storage, OPFS, else IndexedDB)
  * - `file:///abs/path` or `/abs/path`: read in place
  * - `asset://relative/path`: Android APK `assets/`, the iOS app bundle, or the site root on web
  * - Android only: `content://…`, or a res/raw name (what `require()` resolves to in a release build)
@@ -34,10 +34,12 @@ export type { AlphaVideoGpuErrorCode, AlphaVideoGpuLoadEvent, PlayerState, ByteS
  */
 export interface SourceType {
   uri?: string;
-  /** Stable identity for the cache, for URLs that change while the file doesn't (presigned URLs) */
+  /** What the store keeps the source under, for URLs that change while the file doesn't (presigned URLs) */
   cacheKey?: string;
-  /** Web: sent with every request for the URL, e.g. Authorization */
+  /** Sent with every request for the URL, e.g. Authorization; given to a `dataSource` too */
   headers?: Record<string, string>;
+  /** iOS and Android: a data source registered in native code under this name */
+  dataSource?: string;
 }
 
 export interface AlphaVideoGpuViewProps {
@@ -48,6 +50,10 @@ export interface AlphaVideoGpuViewProps {
   /** Pause playback and decompression (useful for screen focus/blur) */
   paused?: boolean;
   cacheKey?: string;
+  /** Where a URL's bytes are kept between plays; on web 'disk' is the browser's storage. Read on mount */
+  storage?: 'auto' | 'disk' | 'memory' | 'none';
+  /** The store's cap in bytes (default 512 MB). Read on mount */
+  maxStorageBytes?: number;
   style?: any;
   // Events have the native shape, so the same handlers work on every platform
   /** Called when file metadata is loaded, provides dimensions and frame info */
@@ -94,6 +100,8 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   playbackSpeed = 1.0,
   paused = false,
   cacheKey,
+  storage,
+  maxStorageBytes,
   style,
   onLoad,
   onStateChange,
@@ -148,6 +156,8 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
       memoryStrategy,
       verbose,
       frameEvents: enableFrameEvents,
+      storage: storage === 'disk' ? 'auto' : storage,
+      maxStorageBytes: maxStorageBytes && maxStorageBytes > 0 ? maxStorageBytes : undefined,
       ZSTDDecoderClass: ZSTDDecoder,
       onStateChange: state => callbacksRef.current.onStateChange?.({ nativeEvent: { state } }),
       onLoad: event => callbacksRef.current.onLoad?.({ nativeEvent: event }),

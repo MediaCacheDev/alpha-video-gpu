@@ -53,6 +53,20 @@ static void test_table(void) {
   length = level_with(level, frames, 0, false);
   CHECK(!avg_zstd_seek_table_parse(level, length, 0, &table), "no frames");
   CHECK(!avg_zstd_seek_table_parse(level, 8, 0, &table), "too short");
+
+  // From the level's last bytes only, as read over the network
+  length = level_with(level, frames, 3, true);
+  uint64_t tail = avg_zstd_seek_table_tail_size(level, length);
+  CHECK(tail == 8 + 3 * 12 + 9, "tail size %llu", (unsigned long long)tail);
+  CHECK(avg_zstd_seek_table_parse_tail(level + length - tail, (size_t)tail, length, 10000, &table) &&
+        table.count == 3 && table.compressedOffsets[2] == 150, "parse the exact tail");
+  avg_zstd_seek_table_free(&table);
+  CHECK(avg_zstd_seek_table_parse_tail(level + length - tail - 7, (size_t)tail + 7, length, 10000, &table) &&
+        table.count == 3, "parse a longer tail");
+  avg_zstd_seek_table_free(&table);
+  CHECK(!avg_zstd_seek_table_parse_tail(level + length - tail + 1, (size_t)tail - 1, length, 10000, &table),
+        "a tail one byte short");
+  CHECK(avg_zstd_seek_table_tail_size(level, length - 1) == 0, "no footer");
   AVGZstdSeekPoint p = avg_zstd_seek_point_before(NULL, 12345);
   CHECK(p.compressedOffset == 0 && p.decompressedOffset == 0, "no table");
 }
@@ -73,6 +87,40 @@ static uint64_t u64le(const uint8_t *p) {
   return (uint64_t)avg_read_u32le(p) | ((uint64_t)avg_read_u32le(p + 4) << 32);
 }
 
+/**
+ * The level over a slow network: every other call is pending, the others copy at most 777 bytes,
+ * and from failAt on reads fail.
+ */
+typedef struct {
+  const uint8_t *level;
+  uint64_t length;
+  uint64_t failAt;
+  unsigned calls;
+} Network;
+
+static int64_t network_read(void *context, uint64_t offset, uint8_t *buffer, size_t length) {
+  Network *net = (Network *)context;
+  if (net->calls++ % 2 == 0) return AVG_ZSTD_READ_PENDING;
+  if (offset >= net->failAt) return -1;
+  if (offset >= net->length) return 0;
+  uint64_t n = net->length - offset;
+  if (n > length) n = length;
+  if (n > 777) n = 777;
+  memcpy(buffer, net->level + offset, (size_t)n);
+  return (int64_t)n;
+}
+
+/** Reads until want bytes are out or the stream ends, calling again while input is pending. */
+static size_t read_all(AVGZstdStream *stream, uint8_t *out, size_t want, const char **error) {
+  size_t got = 0;
+  for (int calls = 0; got < want && calls < 10000000; calls++) {
+    size_t n = avg_zstd_stream_read(stream, out + got, want - got, error);
+    got += n;
+    if (n == 0 && !stream->inputPending) break;
+  }
+  return got;
+}
+
 /** The player's seek, as in moveStreamTo: carry on or restart, then skip to target. */
 typedef struct {
   AVGZstdStream stream;
@@ -90,13 +138,13 @@ static void reader_seek(Reader *r, uint64_t target, uint8_t *scratch, size_t scr
   }
   while (r->decoded < target) {
     size_t want = (size_t)(target - r->decoded < scratchSize ? target - r->decoded : scratchSize);
-    size_t got = avg_zstd_stream_read(&r->stream, scratch, want, NULL);
+    size_t got = read_all(&r->stream, scratch, want, NULL);
     if (got == 0) break;
     r->decoded += got;
   }
 }
 
-static void test_fixture(const char *name, size_t expectedSeekPoints) {
+static void test_fixture(const char *name, size_t expectedSeekPoints, bool overNetwork) {
   char path[512];
   snprintf(path, sizeof(path), "tests/fixtures/%s", name);
   size_t fileSize = 0;
@@ -113,20 +161,42 @@ static void test_fixture(const char *name, size_t expectedSeekPoints) {
   CHECK(hasTable == (expectedSeekPoints > 0) && table.count == expectedSeekPoints,
         "%s: %zu seek points, expected %zu", name, table.count, expectedSeekPoints);
 
+  if (hasTable) {
+    // As the player reads it from a URL: a guess at the tail, then exactly what the footer asks for
+    size_t guess = (size_t)(length < AVG_ZSTD_SEEK_TAIL_GUESS ? length : AVG_ZSTD_SEEK_TAIL_GUESS);
+    uint64_t tail = avg_zstd_seek_table_tail_size(level + length - guess, guess);
+    AVGZstdSeekTable fromTail;
+    CHECK(tail > 0 && tail <= guess &&
+          avg_zstd_seek_table_parse_tail(level + length - tail, (size_t)tail, length, whole, &fromTail) &&
+          fromTail.count == table.count &&
+          memcmp(fromTail.compressedOffsets, table.compressedOffsets, table.count * sizeof(uint64_t)) == 0,
+          "%s: the table from the tail", name);
+    avg_zstd_seek_table_free(&fromTail);
+  }
+
   uint8_t *expected = (uint8_t *)malloc((size_t)whole);
   CHECK(ZSTD_decompress(expected, (size_t)whole, level, (size_t)length) == whole, "%s: ZSTD_decompress", name);
 
   // In order, in reads of 1 KB to a few layers, across frame ends, then the end
   Reader r = {{ZSTD_createDStream(), level, (size_t)length, 0, false}, hasTable ? &table : NULL, 0, 0};
+  Network net = {level, length, UINT64_MAX, 0};
+  uint8_t chunk[4096];
+  if (overNetwork) {
+    r.stream.data = NULL;
+    r.stream.read = network_read;
+    r.stream.readContext = &net;
+    r.stream.chunk = chunk;
+    r.stream.chunkCapacity = sizeof(chunk);
+  }
   avg_zstd_stream_restart(&r.stream, 0);
   uint8_t *out = (uint8_t *)malloc((size_t)whole);
   size_t got = 0, step = 1024;
-  for (size_t n; (n = avg_zstd_stream_read(&r.stream, out + got, step < whole - got ? step : (size_t)(whole - got), NULL)) > 0; step = step * 3 + 1) {
+  for (size_t n; (n = read_all(&r.stream, out + got, step < whole - got ? step : (size_t)(whole - got), NULL)) > 0; step = step * 3 + 1) {
     got += n;
     if (got == whole) break;
   }
   CHECK(got == whole && memcmp(out, expected, (size_t)whole) == 0, "%s: sequential read, %zu of %llu bytes", name, got, (unsigned long long)whole);
-  CHECK(avg_zstd_stream_read(&r.stream, out, 1, NULL) == 0 && avg_zstd_stream_ended(&r.stream), "%s: ends after the data", name);
+  CHECK(read_all(&r.stream, out, 1, NULL) == 0 && avg_zstd_stream_ended(&r.stream), "%s: ends after the data", name);
 
   // Seeks forward and back, each followed by reading the target layer
   avg_zstd_stream_restart(&r.stream, 0);
@@ -137,13 +207,24 @@ static void test_fixture(const char *name, size_t expectedSeekPoints) {
   for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
     uint32_t layer = targets[i] < layers ? targets[i] : layers - 1;
     reader_seek(&r, (uint64_t)layer * bytesPerLayer, scratch, 64 * 1024);
-    size_t n = avg_zstd_stream_read(&r.stream, out, bytesPerLayer, NULL);
+    size_t n = read_all(&r.stream, out, bytesPerLayer, NULL);
     r.decoded += n;
     CHECK(n == bytesPerLayer && memcmp(out, expected + (size_t)layer * bytesPerLayer, bytesPerLayer) == 0,
           "%s: layer %u after seeking", name, layer);
   }
   // The 4 backward seeks restart; with seek points, so do the jumps past one (to 29, 37, 59, 58)
   CHECK(r.restarts == (hasTable ? 8 : 4), "%s: %d restarts", name, r.restarts);
+
+  if (overNetwork) {
+    // A read failing partway ends the stream with an error, after the bytes before it
+    net.failAt = length / 2;
+    avg_zstd_stream_restart(&r.stream, 0);
+    r.stream.chunkLength = 0;
+    const char *error = NULL;
+    got = read_all(&r.stream, out, (size_t)whole, &error);
+    CHECK(error != NULL && strcmp(error, "reading failed") == 0 && got < whole && avg_zstd_stream_ended(&r.stream),
+          "%s: a failed read ends the stream (%s, %zu bytes)", name, error ? error : "no error", got);
+  }
 
   ZSTD_freeDStream(r.stream.dstream);
   avg_zstd_seek_table_free(&table);
@@ -155,12 +236,14 @@ static void test_fixture(const char *name, size_t expectedSeekPoints) {
 
 int main(void) {
   test_table();
-  test_fixture("card_383x217/astc4x4.ktx2", 0);
-  test_fixture("card_383x217/astc4x4_stream.ktx2", 0);
-  test_fixture("card_383x217/astc4x4_seek.ktx2", 20);
-  test_fixture("card_256x256/astc4x4.ktx2", 0);
-  test_fixture("card_256x256/astc4x4_seek.ktx2", 15);
-  test_fixture("card_256x256/astc8x8.ktx2", 0);
+  for (int overNetwork = 0; overNetwork <= 1; overNetwork++) {
+    test_fixture("card_383x217/astc4x4.ktx2", 0, overNetwork);
+    test_fixture("card_383x217/astc4x4_stream.ktx2", 0, overNetwork);
+    test_fixture("card_383x217/astc4x4_seek.ktx2", 20, overNetwork);
+    test_fixture("card_256x256/astc4x4.ktx2", 0, overNetwork);
+    test_fixture("card_256x256/astc4x4_seek.ktx2", 15, overNetwork);
+    test_fixture("card_256x256/astc8x8.ktx2", 0, overNetwork);
+  }
   printf(failures ? "%d checks failed\n" : "all checks pass\n", failures);
   return failures ? 1 : 0;
 }

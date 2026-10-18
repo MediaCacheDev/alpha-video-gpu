@@ -12,15 +12,20 @@ import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNati
 
 /**
  * Where to load from:
- * - `https://…` / `http://…`: downloaded once into the app cache (named by `cacheKey`, else a hash of the URL)
+ * - `https://…` / `http://…`: read by range as it plays, and kept as `storage` says
  * - `file:///abs/path` or `/abs/path`: read in place
  * - `asset://relative/path`: Android APK `assets/`, the iOS app bundle, or the site root on web
  * - Android only: `content://…`, or a res/raw name (what `require()` resolves to in a release build)
+ * - with `dataSource`, any URI that data source reads
  */
 export interface SourceType {
   uri?: string;
-  /** Stable identity for the download cache, for URLs that change while the file doesn't (presigned URLs) */
+  /** What the store keeps the source under, for URLs that change while the file doesn't (presigned URLs) */
   cacheKey?: string;
+  /** Sent with every request for the URL, e.g. Authorization; given to a `dataSource` too */
+  headers?: Record<string, string>;
+  /** A data source registered in native code under this name (AlphaVideoGpuDataSources) */
+  dataSource?: string;
 }
 
 export interface AlphaVideoGpuLoadEvent {
@@ -34,6 +39,9 @@ export interface AlphaVideoGpuLoadEvent {
 type NativeSource = Readonly<{
   uri?: string;
   cacheKey?: string;
+  /** Request headers as name, value, name, value... (codegen has no string maps) */
+  headers?: ReadonlyArray<string>;
+  dataSource?: string;
 }>;
 
 type LoadEvent = Readonly<{
@@ -65,6 +73,10 @@ export interface NativeProps extends ViewProps {
   /** Pause playback and decompression (useful for screen focus/blur) */
   paused?: WithDefault<boolean, false>;
   cacheKey?: string;
+  /** Where a URL's or data source's bytes are kept between plays */
+  storage?: WithDefault<'auto' | 'disk' | 'memory' | 'none', 'auto'>;
+  /** The store's cap in bytes; 0 for the default (512 MB) */
+  maxStorageBytes?: WithDefault<Double, 0>;
 
   // Streaming parameters (with stream)
   /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */

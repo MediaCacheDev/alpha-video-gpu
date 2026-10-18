@@ -18,9 +18,16 @@ final class AlphaVideoGpuNative {
 
     // Streaming decompression methods (per-instance, returns/accepts stream ID)
     static native long nativeInternalZstdStreamingInit(int fd, long dataOffset, long compressedSize);  // Internal KTX2 zstd (supercompressionScheme=2); offset within the descriptor
-    static native long nativeStreamingDecompressContinueToBuffer(long streamId, java.nio.ByteBuffer outputBuffer, int maxOutputBytes);  // Zero-copy
+    static native long nativeReaderZstdStreamingInit(long readerReference, long levelOffset, long compressedSize);  // The same over an AlphaVideoGpuReader, without waiting for its bytes
+    static native long nativeStreamingDecompressContinueToBuffer(long streamId, java.nio.ByteBuffer outputBuffer, int maxOutputBytes);  // Zero-copy; status in the high 32 bits (STREAM_*)
     static native boolean nativeStreamingRestartAt(long streamId, long compressedOffset);  // At a zstd frame start in the level
+    static native String nativeStreamingError(long streamId);  // Why the last call returned -1
     static native void nativeStreamingDecompressEnd(long streamId);
+
+    /** nativeStreamingDecompressContinueToBuffer statuses: more to come, done, or a reader's bytes on their way. */
+    static final int STREAM_MORE = 0;
+    static final int STREAM_DONE = 1;
+    static final int STREAM_PENDING = 2;
 
     // Streaming texture array methods
     static native int nativeCreateTextureArray(int width, int height, int layerCount, boolean useAstc, int glFormat);

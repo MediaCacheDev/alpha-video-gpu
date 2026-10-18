@@ -200,7 +200,9 @@ cd ios && pod install
 import { AlphaVideoGpuView } from 'react-native-alpha-video-gpu';
 
 <AlphaVideoGpuView
-  source={{ uri: 'https://example.com/video.ktx2', cacheKey: 'intro.ktx2' }} // cacheKey: http(s) only
+  source={{ uri: 'https://example.com/video.ktx2', cacheKey: 'intro.ktx2' }} // cacheKey names the stored copy; default, the URL
+  storage="auto"              // where the bytes are kept between plays; see Streaming and storage
+  maxStorageBytes={512 * 1024 * 1024} // the store's cap, over every clip in it
   style={{ width: 300, height: 300 }}
   autoPlay={true}             // the default; false waits for play()
   loop={true}                 // the default; false plays once, then calls onFinished
@@ -235,11 +237,15 @@ dependencies {
 }
 ```
 
+To read videos through a Media3 `DataSource.Factory`, add `dev.mediacache:alpha-video-gpu-media3` too ([Data sources](#data-sources)).
+
 `AlphaVideoGpuView` is a `TextureView` in `dev.mediacache.alphavideo.gpu`. It takes the same sources and options as the React Native component, through setters:
 
 ```kotlin
 val view = AlphaVideoGpuView(context)
-view.setCacheKey("intro.ktx2")         // http(s) only: the download's name; default, a hash of the URL
+view.setCacheKey("intro.ktx2")         // what the stored copy is named; default, the URL
+view.setStorage("auto")                // where the bytes are kept between plays; see Streaming and storage
+view.setMaxStorageBytes(512L * 1024 * 1024)  // the store's cap, over every clip in it
 view.setAutoPlay(true)                 // the default; false waits for play()
 view.setLoop(true)                     // the default; false plays once, then calls onFinished
 view.setPaused(false)                  // a hold, for example while the screen is hidden
@@ -288,7 +294,9 @@ The module is `AlphaVideoGPU` either way.
 import AlphaVideoGPU
 
 let view = AlphaVideoGpuView(frame: CGRect(x: 0, y: 0, width: 200, height: 200))
-view.cacheKey = "intro.ktx2"           // http(s) only: the download's name; default, a hash of the URL
+view.cacheKey = "intro.ktx2"           // what the stored copy is named; default, the URL
+view.storage = "auto"                  // where the bytes are kept between plays; see Streaming and storage
+view.maxStorageBytes = 512 * 1024 * 1024  // the store's cap, over every clip in it
 view.autoPlay = true                   // the default; false waits for play
 view.loop = true                       // the default; false plays once, then calls onFinished
 view.playbackPaused = false            // a hold; MTKView's own `paused` is used by the view
@@ -305,7 +313,7 @@ view.onStateChange = { state in }
 view.onFrameUpdate = { frame, totalFrames in }
 view.onFinished = { }
 view.onError = { error in }
-view.source = "https://example.com/video.ktx2"  // set last: loading starts at once
+view.source = "https://example.com/video.ktx2"  // loads on the next main-queue turn
 container.addSubview(view)
 ```
 
@@ -324,7 +332,9 @@ function MyComponent() {
   return (
     <AlphaVideoGpuView
       ref={player}
-      source={{ uri: 'https://example.com/video.ktx2', cacheKey: 'intro.ktx2' }} // cacheKey: http(s) only
+      source={{ uri: 'https://example.com/video.ktx2', cacheKey: 'intro.ktx2' }} // cacheKey names the stored copy; default, the URL
+      storage="auto"              // where the bytes are kept between plays; see Streaming and storage
+      maxStorageBytes={512 * 1024 * 1024} // the store's cap, over every clip in it
       style={{ width: 300, height: 300 }}
       autoPlay={true}             // the default; false waits for play()
       loop={true}                 // the default; false plays once, then calls onFinished
@@ -352,7 +362,7 @@ A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first fram
 
 ### Options
 
-The examples under [Installation](#installation), [Usage](#usage) and [Web Support](#web-support) set every option, each to its default. The memory options (`stream`, `memoryStrategy` and the three sizes) are read when a source loads, so set them before the source; on the web, pass them when creating the player. `autoPlay`, `loop`, `paused`, `playbackSpeed`, `enableFrameEvents` and `verbose` can change at any time.
+The examples under [Installation](#installation), [Usage](#usage) and [Web Support](#web-support) set every option, each to its default. The memory options (`stream`, `memoryStrategy` and the three sizes) and the storage options (`storage`, `maxStorageBytes`, `cacheKey`) are read when a source loads, so set them before the source; on the web, pass them when creating the player, and `cacheKey` with `setSource`. `autoPlay`, `loop`, `paused`, `playbackSpeed`, `enableFrameEvents` and `verbose` can change at any time.
 
 Sizes outside their range are clamped to it. Where the frames live, and which size applies:
 
@@ -369,7 +379,8 @@ Sizes outside their range are clamped to it. Where the frames live, and which si
 
 | Form | iOS | Android | Web | Notes |
 |------|-----|---------|-----|-------|
-| `https://…`, `http://…` | ✓ | ✓ | ✓ | Downloaded once into the app cache, then read from disk. The web reads it with range requests, keeping what it played in OPFS (or IndexedDB). `source.headers` go with every request (web only for now). |
+| `https://…`, `http://…` | ✓ | ✓ | ✓ | Read by range requests as it plays, and kept between plays; see [Streaming and storage](#streaming-and-storage). `source.headers` go with every request. |
+| anything, with `source.dataSource` | ✓ | ✓ | — | Read by a data source the app registered under that name; see [Data sources](#data-sources). On the web, pass a byte source instead (below). |
 | `file:///abs/path`, `/abs/path` | ✓ | ✓ | — | Read in place. |
 | `asset://path/in/bundle` | ✓ | ✓ | ✓ | Android: APK `assets/`. iOS: the app bundle's resource folder. Web: the site root (`/path/in/bundle`). |
 | `content://…` | — | ✓ | — | Read through the `ContentResolver`. |
@@ -379,15 +390,86 @@ Nothing is copied: bundled assets, raw resources and local files are read where 
 
 On the web, `source` can also be a `Blob` or `File`, or a byte source, `{ size, read(offset, length, signal) }`, that reads the file from the app's own code (a fetcher, a cache, decryption). See [the web package's README](web/README.md#sources-and-storage).
 
+#### Streaming and storage
+
+An http(s) source is read by HTTP range requests as it plays, through the same reader on every platform ([alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source)). On Android and iOS:
+
+- With `stream` on and a zstd file (the encoder's default), playback starts after a few small reads: the header, and the seek table at the end of the level. The level is then read from its start, 256 KB at a time as the decoder needs it, and a seek reads from the seek point before its target. A file written as one zstd stream has no seek table, so a far seek reads on from where the decoder is.
+- An uncompressed file, and any file with `stream` off, is read whole before it plays, in one request.
+- A server without range support works too. The file is then read from the start, and a seek reads it again up to where it lands.
+- A dropped connection is retried 3 times, carrying on from where it stopped. A read that still fails is reported through `onError` as `Reading <uri> failed: …`, and playback stops on the last frame shown. A source that can't be opened (a 401, say) reports `Loading <uri> failed: …`.
+- If the network is slower than the clip, playback waits for the bytes and the UI stays responsive.
+- iOS needs the file's size, which servers send as `Content-Length` or `Content-Range`.
+
+`storage` sets where the bytes are kept between plays:
+
+| Value | Kept |
+|---|---|
+| `'auto'` (default) | `'disk'` for a URL, `'none'` for a data source |
+| `'disk'` | In the app's cache folder: `alpha-video-gpu` in `getCacheDir()` on Android, in `Caches` on iOS. The system may clear it when space runs low |
+| `'memory'` | In memory, for the app's lifetime |
+| `'none'` | Nowhere: each play fetches again |
+
+Storage is partial: it keeps the ranges played so far, and a clip held whole plays again without the network, offline too. `maxStorageBytes` (default 512 MB) caps the store across every clip, evicting the least recently played. Every view shares one disk store and one memory store, so the cap set last applies to it. A copy is dropped when the server's `ETag`, `Last-Modified` or length no longer matches it. A clip held whole isn't checked again; give a changed file a new `cacheKey` or URL.
+
+Local files, bundled files, `content://` URIs and `res/raw` resources are read in place and never stored. On react-native-web, `'disk'` is the browser's storage, as `'auto'` (OPFS, else IndexedDB); the web package also takes `'opfs'`, `'indexeddb'`, `'cache'` and stores of an app's own ([Web Support](#web-support)).
+
 #### Cache keys
 
-Downloads are named by `cacheKey` if you give one, otherwise by a hash of the URL. Set `cacheKey` when the URL changes while the file doesn't (presigned URLs), so a new URL still hits the cache and doesn't reload the view:
+Stored clips are named by `cacheKey` if you give one, otherwise by the URL. Set `cacheKey` when the URL changes while the file doesn't (presigned URLs), so a new URL still finds the stored copy, and doesn't reload a view that is already playing it:
 
 ```jsx
 <AlphaVideoGpuView source={{ uri: presignedUrl, cacheKey: 'videos/glow.ktx2' }} />
 ```
 
-`cacheKey` can also be passed as a top-level prop; it wins over `source.cacheKey`. Native downloads go to the app's cache directory (`<cache>/<cacheKey>`, or `<cache>/alpha-video-gpu/<sha256>`), so the OS may clear them. On the web, stored clips are named the same way, and the browser may evict them.
+`cacheKey` can also be passed as a top-level prop; it wins over `source.cacheKey`.
+
+#### Data sources
+
+An app that fetches, caches or decrypts the bytes itself registers a data source under a name, and names it in `source`. The player asks it for byte ranges as it plays, and passes `uri` and `headers` through, so the URI can be anything the data source understands:
+
+```tsx
+<AlphaVideoGpuView source={{ uri: 'https://cdn.example.com/intro.ktx2', dataSource: 'media3' }} />
+```
+
+A data source's bytes aren't stored by default, since it usually caches them itself; `storage="disk"` or `"memory"` stores them too. On the native views, call `setDataSource("name")` (Android) or set `dataSource = "name"` (iOS) before the source, with `setHeaders` or `headers`.
+
+The interfaces have the same shape as the WebM player's ([alpha-video](https://github.com/MediaCacheDev/alpha-video)), so one class can serve both players through a small adapter. They are separate types, so that the two packages version independently. Register a source with each player that should use it.
+
+**Android:** implement `dev.mediacache.alphavideo.gpu.AlphaVideoGpuDataSource`. `open(uri, position, headers)` starts a read at `position` and returns the file's size and version (`new Info(size, etag, lastModified)`). `read` and `close` follow, and `cancel` (optional) stops a read blocked on the network from another thread. Register a factory, which makes one per player:
+
+```kotlin
+AlphaVideoGpuDataSources.register("mine") { MyDataSource() }
+```
+
+To read through a Media3 `DataSource.Factory` (OkHttp, Cronet, a `CacheDataSource`), add the adapter, which uses the app's own `androidx.media3:media3-datasource` (compiled against 1.8.0):
+
+```gradle
+implementation 'dev.mediacache:alpha-video-gpu-media3:1.0.0'
+```
+
+```kotlin
+AlphaVideoGpuDataSources.register("media3", Media3AlphaVideoGpuDataSource.factory(dataSourceFactory))
+```
+
+The built-in fetcher is public too, to register with other timeouts or a user agent: `AlphaVideoGpuHttpDataSource.Factory().setConnectTimeoutMs(…).setReadTimeoutMs(…).setUserAgent(…)`.
+
+**iOS:** conform to `AlphaVideoGpuDataSource`. Each call reads a window of a few megabytes: call `response` once with the file's size and version, then `data` with the bytes in order, then `completion`. One instance serves every player, so a read mustn't depend on the one before:
+
+```swift
+final class MyDataSource: NSObject, AlphaVideoGpuDataSource {
+    func read(url: URL, offset: Int64, length: Int64, headers: [String: String],
+              response: @escaping (AlphaVideoGpuDataInfo) -> Void,
+              data: @escaping (Data) -> Void,
+              completion: @escaping (Error?) -> Void) -> AlphaVideoGpuCancellable {
+        // response(AlphaVideoGpuDataInfo(size: total, etag: etag, lastModified: nil)), data(…), completion(nil)
+    }
+}
+
+AlphaVideoGpuDataSources.register(MyDataSource(), name: "mine")
+```
+
+The WebM player's protocol has the same method, so one Swift class can't conform to both. Use two small classes that share the fetching code.
 
 #### Bundled with `require()`
 
@@ -415,7 +497,7 @@ const video = Image.resolveAssetSource(require('./assets/video.ktx2'));
 <AlphaVideoGpuView source={{ uri: video.uri }} />
 ```
 
-In debug builds that URI is the Metro dev server (`http://…`, downloaded and cached like any URL). In release builds it's a `file://` path in the iOS bundle, or a `res/raw` name on Android. On web, `Image.resolveAssetSource` doesn't exist; use the module value directly when it's a string, or `expo-asset`'s `Asset.fromModule(module).uri`.
+In debug builds that URI is the Metro dev server (`http://…`, read and stored like any URL). In release builds it's a `file://` path in the iOS bundle, or a `res/raw` name on Android. On web, `Image.resolveAssetSource` doesn't exist; use the module value directly when it's a string, or `expo-asset`'s `Asset.fromModule(module).uri`.
 
 #### Streaming from Android assets and resources
 
@@ -748,13 +830,15 @@ Not ideal for:
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `source` | `{ uri: string, cacheKey?: string, headers? }` | — | What to play; see [Sources](#sources). On web also a `Blob` or a byte source |
+| `source` | `{ uri: string, cacheKey?: string, headers?: Record<string, string>, dataSource?: string }` | — | What to play; see [Sources](#sources). On web also a `Blob` or a byte source, and `dataSource` has no effect |
 | `style` | `ViewStyle` | — | Container style |
 | `autoPlay` | `boolean` | `true` | Start playback once loaded |
 | `loop` | `boolean` | `true` | Loop playback |
 | `paused` | `boolean` | `false` | Pause playback (and streaming decompression) |
 | `playbackSpeed` | `number` | `1.0` | Speed multiplier |
-| `cacheKey` | `string` | — | Cache identity for downloads; overrides `source.cacheKey` |
+| `cacheKey` | `string` | — | Names the stored copy (default, the URL); overrides `source.cacheKey`. See [Cache keys](#cache-keys) |
+| `storage` | `"auto"` \| `"disk"` \| `"memory"` \| `"none"` | `"auto"` | Where the bytes are kept between plays; see [Streaming and storage](#streaming-and-storage) |
+| `maxStorageBytes` | `number` | 512 MB | The store's cap, over every clip in it |
 | `memoryStrategy` | `"vram"` \| `"ram"` | `"vram"` | Where frames are kept; see [Options](#options) |
 | `stream` | `boolean` | `true` | Stream a texture array with a ring buffer |
 | `streamingRingSize` | `number` | `16` | GPU texture slots for RAM-mode streaming (4–64) |
@@ -776,12 +860,14 @@ The events have the same shape on Android, iOS and web. Playback is controlled w
 
 | Path | What | Package |
 |---|---|---|
-| `android/` | The Android library: `AlphaVideoGpuView`, source loading, and the JNI code for zstd, the software ASTC decoder and texture uploads (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
-| `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++), with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
+| `android/` | The Android library: `AlphaVideoGpuView`, source loading and data sources, and the JNI code for zstd, the range reader, the software ASTC decoder and texture uploads (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
+| `android/media3/` | The adapter from a Media3 `DataSource.Factory` to a data source | `dev.mediacache:alpha-video-gpu-media3` |
+| `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++) and data sources, with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
 | `third_party/zstd/` | zstd 1.4.9 (single-file library), compiled into both native libraries | |
+| `third_party/alpha-video-source/` | The C++ range reader and stores of [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source), compiled into both native libraries. `scripts/vendor_alpha_video_source.sh` updates it | |
 | `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `react-native-alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
 | `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there builds `dist/` | npm `alpha-video-gpu-web` |
-| `scripts/publish-android.sh` | `local` publishes the Android library to `~/.m2`; `central` signs it and uploads it to the Maven Central Portal (see the script for the variables) | |
+| `scripts/publish-android.sh` | `local` publishes the Android library and the Media3 adapter to `~/.m2`; `central` signs them and uploads them to the Maven Central Portal (see the script for the variables) | |
 
 A clone builds with no setup step, since the decoders are in the repo (`third_party/` for the native libraries, `web/src/` for the web package):
 
@@ -799,7 +885,7 @@ cd android && ./gradlew testReleaseUnitTest           # Android: the seek table 
 clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test   # iOS: seek table, reads and seeks
 ```
 
-`web/test/browser/` plays the cards in a browser (see the web README); the demo app's pixel tests play them on Android and iOS.
+`web/test/browser/` plays the cards in a browser (see the web README); the demo app's pixel tests play them on Android and iOS, and its streaming tests (`npm run test:streaming`) play files from a local server, checking the range requests, storage, headers and data sources.
 
 A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
 

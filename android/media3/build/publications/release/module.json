@@ -1,0 +1,98 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "dev.mediacache",
+    "module": "alpha-video-gpu-media3",
+    "version": "1.0.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.0.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "alpha-video-gpu-media3-1.0.0.aar",
+          "url": "alpha-video-gpu-media3-1.0.0.aar",
+          "size": 3531,
+          "sha512": "faec2368afb6663ae54f2bc4840aea859941a8e40de36e2feea2b8b7f5c647cbaad5b8f98fd390f6772abddb69539f1d477f91c0fd7a4d5ba46fc47c00203540",
+          "sha256": "4d0634d8adcfad08fd4b3d659210eb76bf104c0e6a33cc7cfbc884533c18c226",
+          "sha1": "27c8fde2e93c452478fcf23e7d1c372eb98cd2a1",
+          "md5": "04d44497c63bce3aa617504f18b91084"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "alpha-video-gpu-media3-1.0.0.aar",
+          "url": "alpha-video-gpu-media3-1.0.0.aar",
+          "size": 3531,
+          "sha512": "faec2368afb6663ae54f2bc4840aea859941a8e40de36e2feea2b8b7f5c647cbaad5b8f98fd390f6772abddb69539f1d477f91c0fd7a4d5ba46fc47c00203540",
+          "sha256": "4d0634d8adcfad08fd4b3d659210eb76bf104c0e6a33cc7cfbc884533c18c226",
+          "sha1": "27c8fde2e93c452478fcf23e7d1c372eb98cd2a1",
+          "md5": "04d44497c63bce3aa617504f18b91084"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseSourcePublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "alpha-video-gpu-media3-1.0.0-sources.jar",
+          "url": "alpha-video-gpu-media3-1.0.0-sources.jar",
+          "size": 2507,
+          "sha512": "404c2793b0cba4f6eac100c34f7c27ccb3242322792887d702534bf2e9f076dbcc39e08ddbc9633abd83fac7b4ab0537ccf8e8e970eb9b2d55b2b452293e556d",
+          "sha256": "14542210a78691098dc871994ca9a21f0009ef0a00b3b624a9d8d90d58f095f6",
+          "sha1": "ab934cda666e2a26840af169583bed3423b1f60b",
+          "md5": "a511f3553aad178425c9355f3abbfe7e"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseJavaDocPublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "javadoc",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "alpha-video-gpu-media3-1.0.0-javadoc.jar",
+          "url": "alpha-video-gpu-media3-1.0.0-javadoc.jar",
+          "size": 268684,
+          "sha512": "dae56c31fa016c6cced34e60c102d2ceb1a507493145683be2119ea3b2bc079b2d85775ded7deb79702da6e5854dc6891d1ebf3a54595916cb91446e640bfbd4",
+          "sha256": "56603685cb3529ac2a52f67e89aee22d2797f11639d99b1320bfe2788a55b03c",
+          "sha1": "8ecdf052c8b38d7fde46b2865b5829b56f671174",
+          "md5": "382142f19687b179630bf976329d59d9"
+        }
+      ]
+    }
+  ]
+}

@@ -80,11 +80,19 @@ using namespace facebook::react;
   _player.streamingPrefetchAhead = newProps.streamingPrefetchAhead;
   _player.memoryStrategy = RCTNSStringFromString(toString(newProps.memoryStrategy));
   _player.verbose = newProps.verbose;
+  _player.storage = RCTNSStringFromString(toString(newProps.storage));
+  _player.maxStorageBytes = (int64_t)newProps.maxStorageBytes;
 
   // Setting source starts the load, which reads every other prop, the cache key included.
   NSString *cacheKey = RCTNSStringFromStringNilIfEmpty(newProps.cacheKey)
       ?: RCTNSStringFromStringNilIfEmpty(newProps.source.cacheKey);
   _player.cacheKey = cacheKey;
+  NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionary];
+  for (size_t i = 0; i + 1 < newProps.source.headers.size(); i += 2) {
+    headers[RCTNSStringFromString(newProps.source.headers[i])] = RCTNSStringFromString(newProps.source.headers[i + 1]);
+  }
+  _player.headers = headers;
+  _player.dataSource = RCTNSStringFromStringNilIfEmpty(newProps.source.dataSource);
   _player.source = RCTNSStringFromStringNilIfEmpty(newProps.source.uri);
 
   [super updateProps:props oldProps:oldProps];

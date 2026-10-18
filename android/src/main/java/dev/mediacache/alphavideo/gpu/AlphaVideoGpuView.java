@@ -3,6 +3,7 @@ package dev.mediacache.alphavideo.gpu;
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.SurfaceTexture;
+import android.net.Uri;
 import android.opengl.EGL14;
 import android.opengl.EGLConfig;
 import android.opengl.EGLContext;
@@ -21,6 +22,10 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -77,12 +82,27 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     
     private PlayerCallback playerCallback;
     
+    // Where what a reader fetches is kept: cacheDir/alpha-video-gpu on disk, or the memory store's name
+    private static final String STORE_NAME = "alpha-video-gpu";
+    public static final long DEFAULT_MAX_STORAGE_BYTES = 512L * 1024 * 1024;
+    public static final String STORAGE_AUTO = "auto";
+    public static final String STORAGE_DISK = "disk";
+    public static final String STORAGE_MEMORY = "memory";
+    public static final String STORAGE_NONE = "none";
+
     // Source
     private String mSource;
     private String mCacheKey;
+    private Map<String, String> mHeaders = Collections.emptyMap();
+    private String mDataSource;
+    private String mStorage = STORAGE_AUTO;
+    private long mMaxStorageBytes = DEFAULT_MAX_STORAGE_BYTES;
     // The cache key the currently running playback was started for. Compared against
     // mCacheKey to tell a re-signed URL for the same object apart from a new asset.
     private String mPlayingCacheKey;
+    // What the running playback reads with, taken when it starts
+    private Map<String, String> mPlayingHeaders = Collections.emptyMap();
+    private String mPlayingDataSource;
     private volatile boolean mSourceLoaded = false;
     
     // Playback settings
@@ -295,9 +315,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     }
 
     /**
-     * What to play, or null to stop: https:// or http:// (downloaded once, see
-     * {@link #setCacheKey}), file:// or an absolute path, asset:// (APK assets), content://,
-     * or a res/raw resource name. Playback starts once the view's surface exists.
+     * What to play, or null to stop: https:// or http:// (read by range as it plays, and kept as
+     * {@link #setStorage} says), file:// or an absolute path, asset:// (APK assets), content://,
+     * a res/raw resource name, or with {@link #setDataSource} any URI that data source reads.
+     * Set the other source properties first. Playback starts once the view's surface exists.
      */
     public void setSource(String source) {
         // Callers (React re-renders, for one) set the same source again, and for an unchanged source the
@@ -306,7 +327,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         // actually changed, or when nothing is currently playing (so a stalled or
         // finished player can still be revived by setting the same source again).
         boolean playing = isPlaybackRunning.get() && !shouldStop.get();
-        if (source != null && source.equals(mSource) && playing) {
+        boolean sameReads = mHeaders.equals(mPlayingHeaders) && Objects.equals(mDataSource, mPlayingDataSource);
+        if (source != null && source.equals(mSource) && playing && sameReads) {
             logD("setSource: unchanged and still playing, ignoring");
             return;
         }
@@ -316,7 +338,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         // identity, so when it matches what is already on screen this is a credential
         // refresh rather than a new asset, and restarting would visibly interrupt a
         // loop that is supposed to run until unmount.
-        if (source != null && playing
+        if (source != null && playing && sameReads
                 && mCacheKey != null && !mCacheKey.isEmpty()
                 && mCacheKey.equals(mPlayingCacheKey)) {
             logD("setSource: same cacheKey (" + mCacheKey + ") still playing, ignoring URL change");
@@ -335,9 +357,54 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         }
     }
     
+    /**
+     * Names what the store keeps a URL's bytes under, instead of the URL, for URLs that change
+     * while the file doesn't (presigned URLs). A source with the same cache key as the one playing
+     * keeps playing. Set it before the source.
+     */
     public void setCacheKey(String cacheKey) {
         mCacheKey = cacheKey;
         logD("setCacheKey: " + cacheKey);
+    }
+
+    /** Sent with every request for an http(s) source, and given to a data source; null for none. */
+    public void setHeaders(@Nullable Map<String, String> headers) {
+        mHeaders = headers == null || headers.isEmpty()
+            ? Collections.emptyMap() : Collections.unmodifiableMap(new LinkedHashMap<>(headers));
+    }
+
+    /**
+     * Reads the source through the data source registered under this name
+     * ({@link AlphaVideoGpuDataSources#register}), whatever its scheme; null for the built-in ones.
+     */
+    public void setDataSource(@Nullable String name) {
+        mDataSource = name == null || name.isEmpty() ? null : name;
+    }
+
+    /**
+     * Where a URL's or data source's bytes are kept between plays: {@code "disk"} (in the cache
+     * folder), {@code "memory"} (for the process's lifetime) or {@code "none"}. {@code "auto"}, the
+     * default, is disk for URLs and none for a data source, whose caching is its own. The store is
+     * partial: it keeps what has been played, and a clip held whole plays again offline.
+     */
+    public void setStorage(@Nullable String storage) {
+        switch (storage == null ? STORAGE_AUTO : storage) {
+            case STORAGE_DISK:
+            case STORAGE_MEMORY:
+            case STORAGE_NONE:
+                mStorage = storage;
+                break;
+            default:
+                mStorage = STORAGE_AUTO;
+        }
+    }
+
+    /**
+     * The cap of this player's store, over every clip in it, least recently played out first;
+     * 0 or less for the default, 512 MB. Every view shares the store, under the cap set last.
+     */
+    public void setMaxStorageBytes(long maxStorageBytes) {
+        mMaxStorageBytes = maxStorageBytes > 0 ? maxStorageBytes : DEFAULT_MAX_STORAGE_BYTES;
     }
     
     public void setAutoPlay(boolean autoPlay) {
@@ -481,6 +548,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         shouldStop.set(false);
         mPlayingCacheKey = mCacheKey;
+        mPlayingHeaders = mHeaders;
+        mPlayingDataSource = mDataSource;
         
         try {
             getOrCreateExecutor().execute(() -> {
@@ -513,16 +582,24 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     }
     
     private void playAnimation() {
+        final String uri = mSource;
         final AlphaVideoGpuSource local;
         try {
-            local = resolveSource(mSource, mPlayingCacheKey);
+            local = resolveSource(uri, mPlayingCacheKey);
         } catch (IOException | IllegalArgumentException e) {
-            if (shouldStop.get()) return;  // a cancelled download
-            mainHandler.post(() -> notifyError("Failed to load " + mSource + ": " + e.getMessage()));
+            if (shouldStop.get()) return;  // stopped while opening
+            mainHandler.post(() -> notifyError("Loading " + uri + " failed: " + e.getMessage()));
             return;
         }
-        if (shouldStop.get()) return;
-        
+        try {
+            if (!shouldStop.get()) playSource(local);
+        } finally {
+            AlphaVideoGpuReader reader = local.reader();
+            if (reader != null) reader.close();
+        }
+    }
+
+    private void playSource(AlphaVideoGpuSource local) {
         // Initialize OpenGL
         SurfaceTexture surfaceTexture = getSurfaceTexture();
         if (surfaceTexture == null || !initGL(surfaceTexture)) {
@@ -532,22 +609,17 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         astcSupported = detectASTCSupport();
         
-        // Check for uncompressed streaming mode BEFORE loading file into RAM
-        // This avoids allocating ~29MB per player instance for streaming files
-        if (checkAndPlayUncompressedStreaming(local)) {
-            return; // Handled by uncompressed streaming path
-        }
-        
-        // Read file data (only for non-streaming paths)
-        byte[] fileData = null;
+        // The header, level index and metadata only; streaming reads the level as it plays
+        byte[] header;
         try {
-            fileData = local.readAll(getContext());
+            header = readHeader(local);
         } catch (IOException e) {
-            mainHandler.post(() -> notifyError("Failed to read file: " + e.getMessage()));
+            if (shouldStop.get()) return;
+            mainHandler.post(() -> notifyError("Failed to read " + local + ": " + e.getMessage()));
             return;
         }
         
-        String metadataJson = extractKTX2Metadata(fileData);
+        String metadataJson = extractKTX2Metadata(header);
         if (metadataJson == null) {
             mainHandler.post(() -> notifyError("No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."));
             return;
@@ -562,11 +634,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         if (streamProp) {
             // Check supercompressionScheme from KTX2 header
-            int supercompressionScheme = getSupercompressionScheme(fileData);
+            int supercompressionScheme = getSupercompressionScheme(header);
             logI("Streaming mode enabled (stream=true), supercompression=" + supercompressionScheme);
             
             if (supercompressionScheme == 2) {
-                playInternalZstdStreamingAnimation(local, fileData);
+                playInternalZstdStreamingAnimation(local, header);
                 return;
             } else if (supercompressionScheme == 0) {
                 // Uncompressed - use mmap streaming
@@ -581,6 +653,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         try {
             loadTextureArray(local);
         } catch (Exception e) {
+            if (shouldStop.get()) return;
             mainHandler.post(() -> notifyError("Failed to load textures: " + e.getMessage()));
             return;
         }
@@ -739,131 +812,36 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     }
     
     /**
-     * With the stream prop, plays an uncompressed KTX2 texture array by mmap streaming.
-     * Reads only the header and metadata, so the file is never loaded into RAM.
-     * @return true if handled as uncompressed streaming, false otherwise
+     * The file's first bytes, through the end of its key/value data: the header, the level index
+     * and the metadata. 16 KB, or more when the key/value data runs past it.
      */
-    private boolean checkAndPlayUncompressedStreaming(AlphaVideoGpuSource local) {
-        if (!streamProp) return false;
-        logD("checkAndPlayUncompressedStreaming: checking " + local);
-        try {
-            // Read just the header (first 256 bytes is enough for KTX2 header + basic metadata check)
-            byte[] headerBytes = local.readHead(getContext(), 256);
-            if (headerBytes.length < 100) {
-                logD("checkAndPlayUncompressedStreaming: file too small (" + headerBytes.length + " bytes)");
-                return false; // Too small to be valid KTX2
-            }
-            
-            ByteBuffer header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN);
-            
-            // Check KTX2 magic number (first 12 bytes)
-            byte[] magic = new byte[12];
-            header.get(magic);
-            byte[] ktx2Magic = {(byte)0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, (byte)0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
-            boolean isKtx2 = java.util.Arrays.equals(magic, ktx2Magic);
-            if (!isKtx2) {
-                logD("checkAndPlayUncompressedStreaming: not a KTX2 file (magic mismatch)");
-                return false; // Not a KTX2 file
-            }
-            
-            // Check supercompressionScheme at offset 44
-            int supercompressionScheme = header.getInt(44);
-            logD("checkAndPlayUncompressedStreaming: supercompression=" + supercompressionScheme);
-            if (supercompressionScheme != 0) {
-                return false; // Not uncompressed - let other paths handle it
-            }
-            
-            // Read KVD offset and length from header (bytes 56-59 and 60-63, little-endian uint32)
-            int kvdByteOffset = header.getInt(56);
-            int kvdByteLength = header.getInt(60);
-            logD("checkAndPlayUncompressedStreaming: kvdOffset=" + kvdByteOffset + ", kvdLength=" + kvdByteLength);
-            
-            if (kvdByteLength == 0 || kvdByteOffset == 0) {
-                logD("checkAndPlayUncompressedStreaming: no metadata section");
-                return false; // No metadata
-            }
-            
-            // Read metadata section
-            byte[] metadataBytes = local.readRange(getContext(), kvdByteOffset, Math.min(kvdByteLength, 4096)); // Cap at 4KB for safety
-            
-            // Extract metadata JSON using the same logic as extractKTX2Metadata
-            String metadataJson = extractMetadataJsonFromKvdBytes(metadataBytes);
-            if (metadataJson == null) {
-                logD("checkAndPlayUncompressedStreaming: failed to extract metadata JSON from KVD");
-                return false;
-            }
-            
-            try {
-                parseMetadata(metadataJson);
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to parse metadata for uncompressed streaming: " + e.getMessage());
-                return false;
-            }
-            
-            logI("Uncompressed texture array with stream=true - using mmap streaming");
-            playUncompressedStreamingAnimation(local);
-            return true;
-            
-        } catch (Exception e) {
-            Log.w(TAG, "Error checking for uncompressed streaming: " + e.getMessage());
-            e.printStackTrace();
-            return false; // Fall back to normal path
-        }
+    private byte[] readHeader(AlphaVideoGpuSource local) throws IOException {
+        final int guess = 16 * 1024;
+        byte[] head = local.readHead(getContext(), guess);
+        if (head.length < 80) throw new IOException("Too short for a KTX2 file (" + head.length + " bytes)");
+        ByteBuffer header = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN);
+        long kvdEnd = (header.getInt(56) & 0xFFFFFFFFL) + (header.getInt(60) & 0xFFFFFFFFL);
+        if (kvdEnd <= head.length || head.length < guess) return head;
+        if (kvdEnd > 16L * 1024 * 1024) throw new IOException("Key/value data of " + kvdEnd + " bytes");
+        return local.readHead(getContext(), (int) kvdEnd);
     }
-    
+
     /**
-     * Extract BasisPlayerMetadata JSON from KVD (Key-Value Data) section bytes.
-     * Parses the KTX2 KVD format to find the BasisPlayerMetadata entry.
+     * The seek table at the end of the level, read from the level's last bytes; null when the
+     * level is one stream.
      */
-    private String extractMetadataJsonFromKvdBytes(byte[] kvdBytes) {
-        try {
-            if (kvdBytes == null || kvdBytes.length < 4) return null;
-            
-            int pos = 0;
-            int kvdEnd = kvdBytes.length;
-            
-            while (pos < kvdEnd) {
-                if (pos + 4 > kvdBytes.length) break;
-                
-                ByteBuffer entryBuf = ByteBuffer.wrap(kvdBytes, pos, 4).order(ByteOrder.LITTLE_ENDIAN);
-                int entryLength = entryBuf.getInt();
-                pos += 4;
-                
-                if (entryLength == 0 || pos + entryLength > kvdBytes.length) break;
-                
-                // Find key (NUL-terminated string)
-                int keyEnd = pos;
-                while (keyEnd < pos + entryLength && kvdBytes[keyEnd] != 0) {
-                    keyEnd++;
-                }
-                
-                String key = new String(kvdBytes, pos, keyEnd - pos, "UTF-8");
-                
-                if ("BasisPlayerMetadata".equals(key)) {
-                    // Value starts after key's NUL terminator
-                    int valueStart = keyEnd + 1;
-                    int valueEnd = pos + entryLength;
-                    
-                    // Find actual value end (may have NUL terminator)
-                    while (valueEnd > valueStart && kvdBytes[valueEnd - 1] == 0) {
-                        valueEnd--;
-                    }
-                    
-                    String metadataJson = new String(kvdBytes, valueStart, valueEnd - valueStart, "UTF-8");
-                    logD("extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
-                    return metadataJson;
-                }
-                
-                // Move to next entry (with padding to 4-byte alignment)
-                pos += entryLength;
-                pos += (4 - (entryLength % 4)) % 4;
-            }
-            
-            return null;
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to extract KVD metadata: " + e.getMessage());
-            return null;
+    @Nullable
+    private ZstdSeekTable readSeekTable(AlphaVideoGpuSource local, long levelOffset, long levelLength,
+                                        long decompressedLength) throws IOException {
+        if (levelLength <= 0) return null;
+        long levelEnd = levelOffset + levelLength;
+        int count = (int) Math.min(levelLength, ZstdSeekTable.TAIL_GUESS);
+        byte[] tail = local.readRange(getContext(), levelEnd - count, count);
+        long needed = ZstdSeekTable.tailBytesNeeded(tail);
+        if (needed > tail.length && needed <= levelLength && needed <= Integer.MAX_VALUE) {
+            tail = local.readRange(getContext(), levelEnd - needed, (int) needed);
         }
+        return ZstdSeekTable.parseTail(tail, levelLength, decompressedLength);
     }
     
     /**
@@ -876,21 +854,19 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         logI("Starting uncompressed streaming animation: " + local);
         
         // Memory-map the file for zero-copy reads - do this FIRST to avoid loading file into RAM.
-        // The mapping stays valid after the descriptor and channel are closed.
+        // A URL or data source is read whole into memory instead: uncompressed frames are as
+        // large as decoded ones, so such files are for local playback, and zstd ones stream.
         final ByteBuffer mmapBuffer;
-        try (AssetFileDescriptor afd = local.openFd(getContext());
-             FileInputStream in = new FileInputStream(afd.getFileDescriptor())) {
-            java.nio.channels.FileChannel channel = in.getChannel();
-            long start = afd.getStartOffset();
-            long length = afd.getLength() >= 0 ? afd.getLength() : channel.size() - start;
-            mmapBuffer = channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, start, length);
-            mmapBuffer.order(ByteOrder.LITTLE_ENDIAN);
-            logI("Memory-mapped file: " + length + " bytes");
+        try {
+            mmapBuffer = local.reader() != null ? local.readAllDirect(getContext()) : mapLocalFile(local);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to memory-map " + local + ": " + e.getMessage());
+            if (shouldStop.get()) return;
+            Log.e(TAG, "Failed to read " + local + ": " + e.getMessage());
             mainHandler.post(() -> notifyError("Failed to stream " + local + ": " + e.getMessage()));
             return;
         }
+        mmapBuffer.order(ByteOrder.LITTLE_ENDIAN);
+        logI("Streaming from " + mmapBuffer.capacity() + " bytes " + (local.reader() != null ? "in memory" : "mapped"));
         
         // Parse KTX2 header directly from mmap buffer (no RAM copy needed)
         int vkFormat = mmapBuffer.getInt(12);
@@ -1063,13 +1039,27 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         logI("Uncompressed streaming animation ended");
     }
     
+    /** Memory-maps a local file; the mapping stays valid after the descriptor and channel are closed. */
+    private ByteBuffer mapLocalFile(AlphaVideoGpuSource local) throws IOException {
+        try (AssetFileDescriptor afd = local.openFd(getContext());
+             FileInputStream in = new FileInputStream(afd.getFileDescriptor())) {
+            java.nio.channels.FileChannel channel = in.getChannel();
+            long start = afd.getStartOffset();
+            long length = afd.getLength() >= 0 ? afd.getLength() : channel.size() - start;
+            return channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, start, length);
+        }
+    }
+    
     /**
      * Play streaming animation from KTX2 file with internal zstd compression (supercompressionScheme=2).
      * Only the level0 data is compressed, so the header is read directly and the layers are
      * decompressed as they play.
      * 
+     * A URL or data source is read as it decodes, without waiting: frames whose bytes haven't
+     * arrived are simply not ready yet, and the shown frame stays.
+     *
      * @param local The .ktx2 file
-     * @param headerData Already-read file data containing the KTX2 header (used to get level0 offset/size)
+     * @param headerData The file's header, through its key/value data (level0 offset and size)
      */
     private void playInternalZstdStreamingAnimation(AlphaVideoGpuSource local, byte[] headerData) {
         logI("Starting internal zstd streaming animation: " + local);
@@ -1099,7 +1089,14 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         if (level0UncompressedLength != expectedUncompressed) {
             Log.w(TAG, "Uncompressed size mismatch: header=" + level0UncompressedLength + ", expected=" + expectedUncompressed);
         }
-        final ZstdSeekTable seekTable = ZstdSeekTable.parse(headerData, level0Offset, level0Length, level0UncompressedLength);
+        final ZstdSeekTable seekTable;
+        try {
+            seekTable = readSeekTable(local, level0Offset, level0Length, level0UncompressedLength);
+        } catch (IOException e) {
+            if (shouldStop.get()) return;
+            mainHandler.post(() -> notifyError("Failed to read " + local + ": " + e.getMessage()));
+            return;
+        }
         logI(seekTable != null ? "Seek table: " + seekTable.size() + " seek points" : "No seek table: seeks decode from the start");
         
         // Initialize internal zstd streaming decompression over a memory-mapped range
@@ -1169,6 +1166,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         // Decompression state - NO header to skip since we start at level0 data directly
         final int[] decodePos = {0};
         final boolean[] decompressEnded = {false};
+        // The last decode stopped for bytes still on their way (a URL or data source)
+        final boolean[] inputPending = {false};
+        // Why the stream failed (corrupt data, or a read that failed after retries), else null
+        final String[] streamError = {null};
         // The frames before a seek target
         final long[] bytesToSkip = {0};
         
@@ -1220,6 +1221,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             int targetFramesAhead = PREFETCH_AHEAD;
             // A long catch-up to a seek goes on over several calls, so new seeks and stops get in
             long skipDeadline = System.nanoTime() + SKIP_SLICE_NANOS;
+            inputPending[0] = false;
+            if (streamError[0] != null) return;
             
             while (framesToDecode < targetFramesAhead) {
                 // Once decompression has ended and the last frames are out of the accumulator (a
@@ -1241,9 +1244,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     if (System.nanoTime() > skipDeadline) return;
                     decompressBuffer.clear();
                     long result = AlphaVideoGpuNative.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
-                    if (result == -1) { decompressEnded[0] = true; break; }
+                    if (result == -1) { streamError[0] = streamFailure(local, streamId[0]); return; }
                     int status = (int)(result >> 32);
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
+                    if (status == AlphaVideoGpuNative.STREAM_PENDING) { inputPending[0] = true; return; }
                     if (bytesWritten >= bytesToSkip[0]) {
                         decompressBuffer.position((int) bytesToSkip[0]);
                         decompressBuffer.limit(bytesWritten);
@@ -1252,7 +1256,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     } else {
                         bytesToSkip[0] -= bytesWritten;
                     }
-                    if (status == 1) { decompressEnded[0] = true; break; }
+                    if (status == AlphaVideoGpuNative.STREAM_DONE) { decompressEnded[0] = true; break; }
                 }
                 if (decompressEnded[0] && frameAccumulatorBuffer.position() < finalBytesPerLayer) continue;
                 
@@ -1262,9 +1266,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 while (accumulatorSize < finalBytesPerLayer && !decompressEnded[0]) {
                     decompressBuffer.clear();
                     long result = AlphaVideoGpuNative.nativeStreamingDecompressContinueToBuffer(streamId[0], decompressBuffer, bufferSize);
-                    if (result == -1) { decompressEnded[0] = true; break; }
+                    if (result == -1) { streamError[0] = streamFailure(local, streamId[0]); return; }
                     int status = (int)(result >> 32);
                     int bytesWritten = (int)(result & 0xFFFFFFFFL);
+                    if (status == AlphaVideoGpuNative.STREAM_PENDING) { inputPending[0] = true; return; }
                     if (bytesWritten > 0) {
                         decompressBuffer.limit(bytesWritten);
                         decompressBuffer.position(0);
@@ -1272,7 +1277,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                         frameAccumulatorBuffer.put(decompressBuffer);
                         accumulatorSize += bytesWritten;
                     }
-                    if (status == 1) { decompressEnded[0] = true; break; }
+                    if (status == AlphaVideoGpuNative.STREAM_DONE) { decompressEnded[0] = true; break; }
                 }
                 
                 if (accumulatorSize >= finalBytesPerLayer) {
@@ -1441,6 +1446,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 
                 int virtualPlaybackPos = (playbackLoopIteration * totalFrames + currentFrame) % vPosModulus;
                 decodeFrames.accept(virtualPlaybackPos);
+                if (streamError[0] != null) {
+                    final String error = streamError[0];
+                    mainHandler.post(() -> notifyError(error));
+                    break;
+                }
                 evictOldFrames.accept(virtualPlaybackPos);
                 
                 int currentGpuSlot = currentFrame % finalGpuCacheSize;
@@ -1448,8 +1458,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 boolean frameInCpuCache = frameCache.containsKey(virtualPlaybackPos);
                 if (!frameInGpu && !frameInCpuCache) {
                     // Still catching up to a seek: decodeFrames goes on with it
-                    if (bytesToSkip[0] > 0 && !decompressEnded[0]) continue;
-                    Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
+                    if (bytesToSkip[0] > 0 && !decompressEnded[0] && !inputPending[0]) continue;
+                    // Bytes on their way are expected; anything else is a stall worth a warning
+                    if (!inputPending[0]) {
+                        Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
+                    }
                     Thread.sleep(8);
                     continue;
                 }
@@ -2016,13 +2029,54 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         }
     }
     
-    /** Turns a source URI into a local file, downloading remote ones into the cache first. */
+    private static boolean isRemote(String uri) {
+        return uri.startsWith("https://") || uri.startsWith("http://");
+    }
+
+    /**
+     * What a source URI reads from: a local file in place, or for a URL or a data source a range
+     * reader, opened here. Blocks on the network.
+     */
     private AlphaVideoGpuSource resolveSource(String uri, String cacheKey) throws IOException {
-        if (AlphaVideoGpuDownloader.isRemote(uri)) {
-            File file = AlphaVideoGpuDownloader.fetch(getContext(), uri, cacheKey, shouldStop);
-            return AlphaVideoGpuSource.file(file.getPath());
+        final String dataSourceName = mPlayingDataSource;
+        final boolean appSource = dataSourceName != null;
+        if (!appSource && !isRemote(uri)) return AlphaVideoGpuSource.parse(uri);
+
+        final AlphaVideoGpuDataSource source;
+        if (appSource) {
+            AlphaVideoGpuDataSource.Factory factory = AlphaVideoGpuDataSources.get(dataSourceName);
+            if (factory == null) {
+                throw new IOException("No data source is registered as \"" + dataSourceName
+                    + "\" (AlphaVideoGpuDataSources.register)");
+            }
+            source = factory.create();
+        } else {
+            source = new AlphaVideoGpuHttpDataSource();
         }
-        return AlphaVideoGpuSource.parse(uri);
+        AlphaVideoGpuReader.Storage storage = storageFor(appSource);
+        String storeDir = storage == AlphaVideoGpuReader.Storage.DISK
+            ? new File(getContext().getCacheDir(), STORE_NAME).getPath() : STORE_NAME;
+        String key = cacheKey != null && !cacheKey.isEmpty() ? cacheKey : uri;
+        AlphaVideoGpuReader reader = AlphaVideoGpuReader.open(source, Uri.parse(uri), mPlayingHeaders, storage,
+            storeDir, key, mMaxStorageBytes);
+        logD("Opened " + uri + " (" + reader.size() + " bytes, storage " + storage + ")");
+        return AlphaVideoGpuSource.reader(reader, shouldStop);
+    }
+
+    private AlphaVideoGpuReader.Storage storageFor(boolean appSource) {
+        switch (mStorage) {
+            case STORAGE_DISK: return AlphaVideoGpuReader.Storage.DISK;
+            case STORAGE_MEMORY: return AlphaVideoGpuReader.Storage.MEMORY;
+            case STORAGE_NONE: return AlphaVideoGpuReader.Storage.NONE;
+            default: return appSource ? AlphaVideoGpuReader.Storage.NONE : AlphaVideoGpuReader.Storage.DISK;
+        }
+    }
+
+    /** What to report when a zstd stream fails: a read that failed after its retries, or corrupt data. */
+    private static String streamFailure(AlphaVideoGpuSource local, long streamId) {
+        String why = AlphaVideoGpuNative.nativeStreamingError(streamId);
+        if (why == null) why = "unknown error";
+        return local.reader() != null ? "Reading " + local + " failed: " + why : "Cannot decode " + local + ": " + why;
     }
 
     /**
@@ -2043,8 +2097,15 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         return AlphaVideoGpuNative.nativeStreamingRestartAt(streamId[0], compressedOffset);
     }
 
-    /** Starts a zstd stream over the level0 data of an internally compressed KTX2, memory-mapped in place. */
+    /**
+     * Starts a zstd stream over the level0 data of an internally compressed KTX2: memory-mapped in
+     * place, or read from the source's range reader.
+     */
     private long openInternalZstdStream(AlphaVideoGpuSource local, long level0Offset, long level0Length) throws IOException {
+        AlphaVideoGpuReader reader = local.reader();
+        if (reader != null) {
+            return AlphaVideoGpuNative.nativeReaderZstdStreamingInit(reader.handle(), level0Offset, level0Length);
+        }
         try (AssetFileDescriptor afd = local.openFd(getContext())) {
             return AlphaVideoGpuNative.nativeInternalZstdStreamingInit(
                 afd.getParcelFileDescriptor().getFd(), afd.getStartOffset() + level0Offset, level0Length);

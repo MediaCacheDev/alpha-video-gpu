@@ -12,20 +12,24 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
+import androidx.annotation.Nullable;
+
 /**
- * A local file the player can read in place: a file, an APK asset, a raw resource, or a
- * content:// URI.
+ * What the player reads: a local file it can read in place (a file, an APK asset, a raw resource,
+ * or a content:// URI), or a range reader over a URL or an app's data source.
  *
- * Preloaded playback reads the whole file through {@link #openStream}, which works for every kind.
- * Streaming playback memory-maps a descriptor range from {@link #openFd}, which for assets and raw
- * resources requires them to be stored uncompressed in the APK. Remote URLs are not sources; they
- * are downloaded by {@link AlphaVideoGpuDownloader} and played as files.
+ * Headers, ranges and whole files are read through {@link #openStream}, which works for every
+ * kind. Streaming playback of a local file memory-maps a descriptor range from {@link #openFd},
+ * which for assets and raw resources requires them to be stored uncompressed in the APK; a reader
+ * is streamed from {@link #reader} instead.
  */
 final class AlphaVideoGpuSource {
 
-    private enum Kind { FILE, ASSET, RAW, CONTENT }
+    private enum Kind { FILE, ASSET, RAW, CONTENT, READER }
 
     private static final String ASSET_SCHEME = "asset://";
     // What Image.resolveAssetSource(require(...)) gives in a release build: a res/raw name
@@ -33,14 +37,35 @@ final class AlphaVideoGpuSource {
 
     private final Kind kind;
     private final String location;
+    @Nullable private final AlphaVideoGpuReader reader;
+    // Stops the reader's waits once the playback stops
+    @Nullable private final AtomicBoolean cancelled;
 
     private AlphaVideoGpuSource(Kind kind, String location) {
+        this(kind, location, null, null);
+    }
+
+    private AlphaVideoGpuSource(Kind kind, String location, @Nullable AlphaVideoGpuReader reader,
+                                @Nullable AtomicBoolean cancelled) {
         this.kind = kind;
         this.location = location;
+        this.reader = reader;
+        this.cancelled = cancelled;
     }
 
     static AlphaVideoGpuSource file(String path) {
         return new AlphaVideoGpuSource(Kind.FILE, path);
+    }
+
+    /** Reads through {@code reader}; its reads give up once {@code cancelled} is set. */
+    static AlphaVideoGpuSource reader(AlphaVideoGpuReader reader, AtomicBoolean cancelled) {
+        return new AlphaVideoGpuSource(Kind.READER, reader.toString(), reader, cancelled);
+    }
+
+    /** The range reader of a URL or data source; null for a local file. */
+    @Nullable
+    AlphaVideoGpuReader reader() {
+        return reader;
     }
 
     /**
@@ -77,6 +102,8 @@ final class AlphaVideoGpuSource {
     /** The caller closes the descriptor; native code duplicates it if it needs to keep reading. */
     AssetFileDescriptor openFd(Context context) throws IOException {
         switch (kind) {
+            case READER:
+                throw new IOException(location + " is read by range, not from a descriptor");
             case ASSET:
                 try {
                     return context.getAssets().openFd(location);
@@ -108,6 +135,8 @@ final class AlphaVideoGpuSource {
 
     InputStream openStream(Context context) throws IOException {
         switch (kind) {
+            case READER:
+                return new ReaderInputStream(reader, cancelled);
             case ASSET:
                 return context.getAssets().open(location);
             case RAW:
@@ -166,6 +195,64 @@ final class AlphaVideoGpuSource {
                 total += n;
             }
             return total == count ? range : java.util.Arrays.copyOf(range, total);
+        }
+    }
+
+    /** The whole file in a direct buffer, for uploads straight from it. */
+    ByteBuffer readAllDirect(Context context) throws IOException {
+        long size = reader != null ? reader.size() : -1;
+        if (size < 0 || size > Integer.MAX_VALUE) {
+            byte[] all = readAll(context);
+            ByteBuffer out = ByteBuffer.allocateDirect(all.length);
+            out.put(all);
+            out.rewind();
+            return out;
+        }
+        ByteBuffer out = ByteBuffer.allocateDirect((int) size);
+        byte[] chunk = new byte[256 * 1024];
+        for (long pos = 0; pos < size; ) {
+            int n = reader.readFully(pos, chunk, 0, (int) Math.min(chunk.length, size - pos), cancelled);
+            if (n == 0) throw new IOException(location + " ended at " + pos + " of " + size + " bytes");
+            out.put(chunk, 0, n);
+            pos += n;
+        }
+        out.rewind();
+        return out;
+    }
+
+    /** A reader's bytes in order from 0, as a stream; skipping moves the position without reading. */
+    private static final class ReaderInputStream extends InputStream {
+        private final AlphaVideoGpuReader reader;
+        private final AtomicBoolean cancelled;
+        private long position = 0;
+
+        ReaderInputStream(AlphaVideoGpuReader reader, AtomicBoolean cancelled) {
+            this.reader = reader;
+            this.cancelled = cancelled;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            return read(one, 0, 1) == 1 ? one[0] & 0xFF : -1;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            if (length == 0) return 0;
+            int n = reader.readFully(position, buffer, offset, length, cancelled);
+            if (n == 0) return -1;
+            position += n;
+            return n;
+        }
+
+        @Override
+        public long skip(long n) {
+            if (n <= 0) return 0;
+            long size = reader.size();
+            long skipped = size >= 0 ? Math.max(0, Math.min(n, size - position)) : n;
+            position += skipped;
+            return skipped;
         }
     }
 

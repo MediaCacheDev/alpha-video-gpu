@@ -13,6 +13,7 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 
 public class ZstdSeekTableTest {
     private static final Path FIXTURES = Paths.get("..", "tests", "fixtures");
@@ -93,6 +94,18 @@ public class ZstdSeekTableTest {
         for (long offset : table.compressedOffsets) {
             assertEquals(name + " frame at " + offset, ZSTD_FRAME_MAGIC, header.getInt((int) (levelOffset + offset)));
         }
+
+        // As the player reads it: the footer, then just the bytes the table takes
+        long levelEnd = levelOffset + header.getLong(88);
+        byte[] footer = Arrays.copyOfRange(file, (int) levelEnd - 9, (int) levelEnd);
+        long needed = ZstdSeekTable.tailBytesNeeded(footer);
+        assertEquals(name, 8 + expectedSeekPoints * 8 + 9, needed);
+        byte[] tail = Arrays.copyOfRange(file, (int) (levelEnd - needed), (int) levelEnd);
+        ZstdSeekTable fromTail = ZstdSeekTable.parseTail(tail, header.getLong(88), header.getLong(96));
+        assertNotNull(name, fromTail);
+        assertArrayEquals(name, table.compressedOffsets, fromTail.compressedOffsets);
+        assertArrayEquals(name, table.decompressedOffsets, fromTail.decompressedOffsets);
+        assertNull(name, ZstdSeekTable.parseTail(Arrays.copyOfRange(tail, 1, tail.length), header.getLong(88), header.getLong(96)));
     }
 
     @Test

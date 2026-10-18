@@ -1,4 +1,6 @@
-// Maven publication for dev.mediacache:alpha-video-gpu. Run it through scripts/publish-android.sh.
+// Maven publication for dev.mediacache:alpha-video-gpu, and for alpha-video-gpu-media3
+// (media3/build.gradle sets publishArtifactId, publishDescription and publishBundlesNatives before
+// applying this). Run it through scripts/publish-android.sh.
 //
 // Signing reads ORG_GRADLE_PROJECT_signingInMemoryKey (armored secret key), …KeyPassword and
 // optionally …KeyId. Without a key the artifacts are left unsigned, which is enough for
@@ -8,17 +10,19 @@ apply plugin: 'maven-publish'
 apply plugin: 'signing'
 
 def repoUrl = 'https://github.com/MediaCacheDev/alpha-video-gpu'
+def artifact = project.ext.has('publishArtifactId') ? project.ext.publishArtifactId : 'alpha-video-gpu'
+def bundlesNatives = project.ext.has('publishBundlesNatives') ? project.ext.publishBundlesNatives : true
 
 afterEvaluate {
     publishing {
         publications {
             release(MavenPublication) {
                 from components.release
-                artifactId = 'alpha-video-gpu'
+                artifactId = artifact
 
                 pom {
-                    name = 'alpha-video-gpu'
-                    description = 'Transparent animations for Android from ASTC texture arrays in KTX2 files, drawn into a TextureView with OpenGL ES 3.0.'
+                    name = artifact
+                    description = project.ext.has('publishDescription') ? project.ext.publishDescription : 'Transparent animations for Android from ASTC texture arrays in KTX2 files, drawn into a TextureView with OpenGL ES 3.0.'
                     url = repoUrl
                     inceptionYear = '2026'
                     licenses {
@@ -27,12 +31,12 @@ afterEvaluate {
                             url = 'https://opensource.org/licenses/MIT'
                             distribution = 'repo'
                         }
-                        license {
+                        if (bundlesNatives) license {
                             name = 'Apache-2.0 (ASTC decoder)'
                             url = 'https://www.apache.org/licenses/LICENSE-2.0'
                             distribution = 'repo'
                         }
-                        license {
+                        if (bundlesNatives) license {
                             name = 'BSD-3-Clause (zstd)'
                             url = 'https://opensource.org/licenses/BSD-3-Clause'
                             distribution = 'repo'
@@ -57,7 +61,8 @@ afterEvaluate {
         repositories {
             maven {
                 name = 'staging'
-                url = layout.buildDirectory.dir('staging-repo')
+                // Both artifacts, so that one bundle uploads them together
+                url = rootProject.layout.buildDirectory.dir('staging-repo')
             }
         }
     }

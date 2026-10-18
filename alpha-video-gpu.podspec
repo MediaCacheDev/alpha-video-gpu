@@ -16,14 +16,16 @@ Pod::Spec.new do |s|
   s.platform      = :ios, '13.0'
   s.source        = { :git => 'https://github.com/MediaCacheDev/alpha-video-gpu.git', :tag => "v#{s.version}" }
 
-  # AlphaVideoGpuView.mm compiles the ASTC decoder and zstd by #include
-  s.source_files        = 'ios/Sources/AlphaVideoGPU/**/*.{h,mm}'
+  # AlphaVideoGpuView.mm compiles the ASTC decoder and zstd by #include, and alpha_video_source.cpp
+  # alpha-video-source's range reader
+  s.source_files        = 'ios/Sources/AlphaVideoGPU/**/*.{h,mm}', 'ios/Sources/AlphaVideoGPU/alpha_video_source.cpp'
   s.public_header_files = 'ios/Sources/AlphaVideoGPU/include/AlphaVideoGPU.h'
-  s.preserve_paths      = 'ios/Sources/AlphaVideoGPU/astc_decomp.cpp', 'third_party/zstd/**/*'
+  s.preserve_paths      = 'ios/Sources/AlphaVideoGPU/astc_decomp.cpp', 'third_party/zstd/**/*',
+                          'third_party/alpha-video-source/**/*'
   s.frameworks          = 'Metal', 'MetalKit'
   s.libraries           = 'c++'
   s.pod_target_xcconfig = {
-    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++14',
+    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/third_party"'
   }
 end

@@ -3,12 +3,14 @@ package dev.mediacache.alphavideo.gpu.reactnative;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.uimanager.ThemedReactContext;
 import com.facebook.react.uimanager.annotations.ReactProp;
 
 import dev.mediacache.alphavideo.gpu.AlphaVideoGpuView;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /** React Native view manager for {@link AlphaVideoGpuView}. */
@@ -39,16 +41,26 @@ public class AlphaVideoGpuViewManager extends AlphaVideoGpuViewManagerSpec<Alpha
         }
 
         // Adopt a cacheKey carried inside the source map before touching the source:
-        // setSource() starts the download that reads the key, and React gives no
+        // setSource() starts the read that uses the key, and React gives no
         // ordering guarantee between this setter and the standalone `cacheKey` one, so
-        // relying on that prop alone can download under a URL-derived name instead.
+        // relying on that prop alone can store under the URL instead.
         if (source != null && source.hasKey("cacheKey") && !source.isNull("cacheKey")) {
             String sourceCacheKey = source.getString("cacheKey");
             if (sourceCacheKey != null && !sourceCacheKey.isEmpty()) {
                 view.setCacheKey(sourceCacheKey);
             }
         }
-        
+
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (source != null && source.hasKey("headers") && !source.isNull("headers")) {
+            ReadableArray flat = source.getArray("headers");
+            for (int i = 0; flat != null && i + 1 < flat.size(); i += 2) {
+                headers.put(flat.getString(i), flat.getString(i + 1));
+            }
+        }
+        view.setHeaders(headers);
+        view.setDataSource(source != null && source.hasKey("dataSource") && !source.isNull("dataSource")
+            ? source.getString("dataSource") : null);
         view.setSource(sourceUri == null || sourceUri.isEmpty() ? null : sourceUri);
     }
 
@@ -77,6 +89,20 @@ public class AlphaVideoGpuViewManager extends AlphaVideoGpuViewManagerSpec<Alpha
         view.setCacheKey(cacheKey);
     }
     
+    /** "auto" (default), "disk", "memory" or "none"; see AlphaVideoGpuView.setStorage. */
+    @ReactProp(name = "storage")
+    @Override
+    public void setStorage(AlphaVideoGpuView view, @Nullable String storage) {
+        view.setStorage(storage);
+    }
+
+    /** 0 for the default, 512 MB. */
+    @ReactProp(name = "maxStorageBytes", defaultDouble = 0)
+    @Override
+    public void setMaxStorageBytes(AlphaVideoGpuView view, double maxStorageBytes) {
+        view.setMaxStorageBytes((long) maxStorageBytes);
+    }
+
     @ReactProp(name = "enableFrameEvents", defaultBoolean = false)
     @Override
     public void setEnableFrameEvents(AlphaVideoGpuView view, boolean enable) {

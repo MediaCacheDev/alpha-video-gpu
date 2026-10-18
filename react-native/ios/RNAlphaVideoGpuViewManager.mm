@@ -15,7 +15,7 @@
 /** AlphaVideoGpuView with the React Native props and events. */
 @interface RNAlphaVideoGpuView : AlphaVideoGpuView
 
-// `source` prop: { uri, cacheKey }
+// `source` prop: { uri, cacheKey, headers?: [name, value, ...], dataSource? }
 @property (nonatomic, copy) NSDictionary *reactSource;
 
 @property (nonatomic, copy) RCTDirectEventBlock reactOnLoad;
@@ -46,11 +46,20 @@ static NSString *RNAVGString(id value)
 {
   _reactSource = [reactSource copy];
   // Adopt a cacheKey inside `source` before loading: React gives no ordering guarantee against
-  // the separate `cacheKey` prop, and the load reads the key to name the download.
+  // the separate `cacheKey` prop, and the load reads the key to name what it stores.
   NSString *cacheKey = RNAVGString(reactSource[@"cacheKey"]);
   if (cacheKey) {
     self.cacheKey = cacheKey;
   }
+  NSArray *flat = [reactSource[@"headers"] isKindOfClass:[NSArray class]] ? reactSource[@"headers"] : @[];
+  NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionary];
+  for (NSUInteger i = 0; i + 1 < flat.count; i += 2) {
+    if ([flat[i] isKindOfClass:[NSString class]] && [flat[i + 1] isKindOfClass:[NSString class]]) {
+      headers[flat[i]] = flat[i + 1];
+    }
+  }
+  self.headers = headers;
+  self.dataSource = RNAVGString(reactSource[@"dataSource"]);
   self.source = RNAVGString(reactSource[@"uri"]);
 }
 
@@ -110,6 +119,8 @@ RCT_EXPORT_MODULE(AlphaVideoGpuView)
 RCT_REMAP_VIEW_PROPERTY(source, reactSource, NSDictionary)
 RCT_REMAP_VIEW_PROPERTY(paused, playbackPaused, BOOL)
 RCT_EXPORT_VIEW_PROPERTY(cacheKey, NSString)
+RCT_EXPORT_VIEW_PROPERTY(storage, NSString)
+RCT_EXPORT_VIEW_PROPERTY(maxStorageBytes, int64_t)
 RCT_EXPORT_VIEW_PROPERTY(autoPlay, BOOL)
 RCT_EXPORT_VIEW_PROPERTY(loop, BOOL)
 RCT_EXPORT_VIEW_PROPERTY(playbackSpeed, CGFloat)
