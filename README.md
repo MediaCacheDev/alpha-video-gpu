@@ -877,17 +877,47 @@ cd android && ./gradlew assembleRelease               # Android: the AAR (needs 
 xcodebuild -scheme AlphaVideoGPU -destination 'generic/platform=iOS Simulator' build   # iOS, from the repo root
 ```
 
-Tests that run on the host, on the fixtures in `tests/fixtures/` (test-card encodes, described in `expected.json`):
+A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
+
+## Tests
+
+The fixtures in `tests/fixtures/` are test cards from the tester app, encoded to KTX2 with 4×4, 6×6 and 8×8 ASTC blocks, as one zstd stream and with a seek table, and described in `expected.json`. Every frame carries its index as a row of cells in the colour and in the alpha, beside colour swatches and an alpha ramp, so a test can tell which frame it got and how far off its colours are. They're copies of a few of the tester app's cards (`npm run testcards` in [alpha-video-test](https://github.com/MediaCacheDev/alpha-video-test)); regenerate them there.
+
+| Where | Command | What it checks |
+|---|---|---|
+| Web, under Node | `cd web && npm test` | The KTX2 parser, the seek table, streaming reads and seeks in zstd and uncompressed files, and every frame of the fixtures through the software ASTC decoder, read back by its frame code |
+| Android, on the host | `cd android && ./gradlew testReleaseUnitTest` | The seek table parser (JUnit) |
+| iOS, on the host | `clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test` | The seek table, reads and seeks (`zstd_seek.h`), from the repository root |
+| Web, in a browser | `web/test/browser/index.html`, see below | Every streaming and memory mode on every fixture in a real browser: frame codes after seeks and in playback, from the canvas |
+| Android and iOS devices | the tester app's `test:pixels` and `test:streaming` | Every mode and memory strategy on every card, pixel by pixel, and streaming; see below |
+
+The browser page isn't automated. Build `web/dist/` (`cd web && npm run build`), serve this repository over HTTP, and open `web/test/browser/index.html`; results show on the page and in `window.results`. alpha-video-source's server supports range requests, which the streaming modes use:
 
 ```bash
-cd web && npm test                                    # web: parsers, seek table, streaming zstd and uncompressed reads and seeks
-cd android && ./gradlew testReleaseUnitTest           # Android: the seek table parser (JUnit)
-clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test   # iOS: seek table, reads and seeks
+cd ../alpha-video-source/web && npm run serve -- <path to this repo> --port 8766
+# then open http://localhost:8766/web/test/browser/index.html
 ```
 
-`web/test/browser/` plays the cards in a browser (see the web README); the demo app's pixel tests play them on Android and iOS, and its streaming tests (`npm run test:streaming`) play files from a local server, checking the range requests, storage, headers and data sources.
+`?astc=off` hides `WEBGL_compressed_texture_astc` to test the software decoder, `?only=<regex>` picks cases, `?cards=<path>` plays other cards (the tester app's include more sizes and layouts), and `?storage=`, `?replay` and `?input=` exercise storage and sources (see the [web README](web/README.md#testing)). Add `--no-range` to the server for one without range support.
 
-A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
+On Android and iOS the tester app plays the cards through the React Native component. In [alpha-video-test](https://github.com/MediaCacheDev/alpha-video-test#tests), with this repo's tarball installed and a Release build on an emulator, phone or simulator:
+
+```bash
+npm run test:pixels -- --platform android --player gpu     # default (VRAM streaming), stream ram and preload, on every card
+npm run test:pixels -- --platform ios --player gpu
+npm run test:pixels -- --platform ios --player gpu --only 'astc4x4_seek' --frames 0,37   # one fixture, two frames
+npm run test:pixels -- --platform android --player gpu --playback      # playback and looping
+npm run test:streaming -- --platform android --player gpu  # range requests, seek table, storage, headers, Media3 data source
+```
+
+`npm pack` here (and in `web/`) makes the tarballs the tester app installs; rebuild its app after installing them. Everything, in order:
+
+```bash
+(cd web && npm test)
+(cd android && ./gradlew testReleaseUnitTest)
+clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test
+# the browser page, with ?astc=off too; then, in alpha-video-test: test:pixels and test:streaming with --player gpu on each platform
+```
 
 ## Requirements
 
