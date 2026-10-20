@@ -7,6 +7,6 @@ export default defineConfig({
   clean: true,
   target: 'es2019',
   external: ['react'],
-  // Bundled until alpha-video-source is published, so the tarball installs on its own
+  // alpha-video-source isn't on npm: it's bundled, so the tarball installs on its own
   noExternal: ['alpha-video-source'],
 });
