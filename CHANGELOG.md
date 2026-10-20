@@ -8,7 +8,7 @@ First public release.
 
 - Plays transparent animations stored as ASTC texture arrays in KTX2 files. Metal on iOS, OpenGL ES on Android, WebGL 2 on the web.
 - Streaming (`stream`, on by default) and preloaded playback, with frames in VRAM (`memoryStrategy="vram"`, the default) or RAM. Streaming takes KTX2-internal zstd and uncompressed (memory-mapped) files, with a bounded ring and frame cache.
-- Metadata from the encoder's `BasisPlayerMetadata` key. Files in the earlier experimental formats (Basis Universal UASTC, atlas packing, GLB containers, multi-part files, whole-file `.zst`) are rejected; they play on the `archive/basis-atlas-parts` branch.
+- Frame size, count and ASTC format come from the KTX2 header, and the frame rate from the standard `KTXanimData` key (30 fps without it). Frame rates are fractional on every platform, so 29.97 fps (1001/30000 s per frame) plays exactly. Files in the earlier experimental formats (Basis Universal UASTC, atlas packing, GLB containers, multi-part files, whole-file `.zst`) are rejected; they play on the `archive/basis-atlas-parts` branch.
 - Sources: `https://`, `file://`, absolute paths, `asset://` (Android assets, the iOS bundle, the web root), and on Android `content://` and `res/raw` names.
 - Android and iOS read http(s) files by range requests as they play, through the C++ reader of [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source), instead of downloading them whole first. `source.headers` go with every request.
   - A streamed zstd file starts after its header and seek table, and is then read 256 KB at a time as it decodes. A seek reads from its seek point. Uncompressed files, and every file with `stream` off, are read whole first. Servers without range support work too.

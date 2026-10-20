@@ -576,9 +576,10 @@ export class KTX2PlayerCore {
     gl: WebGLRenderingContext, header: Uint8Array, reader: SourceReader, loadId: number
   ): Promise<void> {
     const metadata = extractKTX2Metadata(header);
-    if (!metadata) throw new Error('No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.');
-    if (metadata.mode !== 'astc' || metadata.packingMode !== 'array') {
-      throw new Error(`Only ASTC texture arrays play (this file is mode '${metadata.mode ?? ''}', packing '${metadata.packingMode ?? ''}'); encode it with texenc`);
+    if (!metadata) throw new Error('Not a KTX2 file');
+    const vkFormat = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(12, true);
+    if (!(vkFormat in ASTC_FORMAT_MAP) || metadata.frameCount < 1) {
+      throw new Error(`Only ASTC texture arrays play (this file has vkFormat ${vkFormat} and ${metadata.frameCount} layers); encode it with texenc`);
     }
     if (!(gl instanceof WebGL2RenderingContext) || !this._arrayProgram) {
       throw new AlphaVideoGpuError('WEBGL_UNSUPPORTED', 'Texture arrays need WebGL2');

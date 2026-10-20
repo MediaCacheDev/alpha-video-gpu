@@ -97,7 +97,6 @@ export interface NativeProps extends ViewProps {
    * Enable streaming mode for texture array playback.
    * When true (default): Use streaming decompression with ring buffer (constant memory usage).
    * When false: Load all frames at once.
-   * Only applies to packingMode='array' files.
    */
   stream?: WithDefault<boolean, true>;
 

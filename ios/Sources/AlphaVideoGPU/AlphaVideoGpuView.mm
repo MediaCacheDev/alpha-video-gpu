@@ -103,6 +103,48 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
 
 @end
 
+/** Frame rate from KTXanimData (per-frame duration / timescale) in a key/value data block, or 0. */
+static double AVGAnimFrameRate(const uint8_t *kvd, NSUInteger length) {
+  NSUInteger pos = 0;
+  while (pos + 4 <= length) {
+    uint32_t entryLength = avg_read_u32le(kvd + pos);
+    NSUInteger entryStart = pos + 4;
+    if (entryLength == 0 || entryStart + entryLength > length) break;
+    NSUInteger keyEnd = entryStart;
+    while (keyEnd < entryStart + entryLength && kvd[keyEnd] != 0) keyEnd++;
+    static const char kAnimKey[] = "KTXanimData";
+    if (keyEnd - entryStart == sizeof(kAnimKey) - 1 && memcmp(kvd + entryStart, kAnimKey, keyEnd - entryStart) == 0 &&
+        entryStart + entryLength >= keyEnd + 1 + 12) {
+      uint32_t duration = avg_read_u32le(kvd + keyEnd + 1);
+      uint32_t timescale = avg_read_u32le(kvd + keyEnd + 5);
+      return duration > 0 && timescale > 0 ? (double)timescale / duration : 0;
+    }
+    pos = entryStart + entryLength + (4 - entryLength % 4) % 4;
+  }
+  return 0;
+}
+
+/**
+ * Frame size, frame count and vkFormat from the KTX2 header, and the frame rate from KTXanimData
+ * (30 without it). Both are standard KTX 2.0; texenc writes no other metadata.
+ */
+static NSDictionary *AVGKTX2Metadata(const uint8_t *header, const uint8_t *kvd, NSUInteger kvdLength) {
+  double frameRate = kvd ? AVGAnimFrameRate(kvd, kvdLength) : 0;
+  return @{
+    @"vkFormat": @(avg_read_u32le(header + 12)),
+    @"frameWidth": @(avg_read_u32le(header + 20)),
+    @"frameHeight": @(avg_read_u32le(header + 24)),
+    @"frameCount": @(avg_read_u32le(header + 32)),
+    @"frameRate": @(frameRate > 0 ? frameRate : 30.0),
+  };
+}
+
+/** ASTC (VkFormat 157-184, either colour space) in an array texture: the only files that play. */
+static BOOL AVGIsASTCArray(NSDictionary *metadata) {
+  uint32_t vkFormat = [metadata[@"vkFormat"] unsignedIntValue];
+  return vkFormat >= 157 && vkFormat <= 184 && [metadata[@"frameCount"] unsignedIntValue] >= 1;
+}
+
 @implementation AlphaVideoGpuView {
   MTLPixelFormat _metalPixelFormat;
   BOOL _useCompressedFormat;
@@ -641,74 +683,17 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
   _samplerState = [self.device newSamplerStateWithDescriptor:samplerDescriptor];
 }
 
-/**
- * Extract BasisPlayerMetadata from KTX2 key-value data section.
- * Returns nil if not found.
- */
+/** Reads the frame metadata from data holding the file through its key/value data; nil if it isn't KTX2. */
 - (NSDictionary *)extractKTX2Metadata:(NSData *)ktx2Data
 {
   if (ktx2Data.length < 80) return nil;
-  
-  const uint8_t *bytes = (const uint8_t *)[ktx2Data bytes];
-  
-  // Check KTX2 magic: «KTX 20»
-  if (bytes[0] != 0xAB || bytes[1] != 0x4B || bytes[2] != 0x54 || bytes[3] != 0x58) {
-    return nil;
-  }
-  
-  // Read KVD offset and length from header (bytes 56-63, little-endian)
-  uint32_t kvdByteOffset = *(uint32_t *)(bytes + 56);
-  uint32_t kvdByteLength = *(uint32_t *)(bytes + 60);
-  
-  if (kvdByteLength == 0 || kvdByteOffset + kvdByteLength > ktx2Data.length) {
-    return nil;
-  }
-  
-  // Parse key-value entries
-  uint32_t pos = kvdByteOffset;
-  uint32_t kvdEnd = kvdByteOffset + kvdByteLength;
-  
-  while (pos < kvdEnd) {
-    if (pos + 4 > ktx2Data.length) break;
-    
-    uint32_t entryLength = *(uint32_t *)(bytes + pos);
-    pos += 4;
-    
-    if (entryLength == 0 || pos + entryLength > ktx2Data.length) break;
-    
-    // Find key (NUL-terminated string)
-    uint32_t keyEnd = pos;
-    while (keyEnd < pos + entryLength && bytes[keyEnd] != 0) {
-      keyEnd++;
-    }
-    
-    NSString *key = [[NSString alloc] initWithBytes:(bytes + pos) length:(keyEnd - pos) encoding:NSUTF8StringEncoding];
-    
-    if ([key isEqualToString:@"BasisPlayerMetadata"]) {
-      // Value starts after key's NUL terminator
-      uint32_t valueStart = keyEnd + 1;
-      uint32_t valueEnd = pos + entryLength;
-      
-      // Find actual value end (may have NUL terminator)
-      while (valueEnd > valueStart && bytes[valueEnd - 1] == 0) {
-        valueEnd--;
-      }
-      
-      NSData *valueData = [NSData dataWithBytes:(bytes + valueStart) length:(valueEnd - valueStart)];
-      NSError *jsonError;
-      NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:valueData options:0 error:&jsonError];
-      if (!jsonError) {
-        AVG_VLOG(@"Extracted embedded metadata from KTX2");
-        return metadata;
-      }
-    }
-    
-    // Move to next entry (with padding to 4-byte alignment)
-    pos += entryLength;
-    pos += (4 - (entryLength % 4)) % 4;
-  }
-  
-  return nil;
+  const uint8_t *bytes = (const uint8_t *)ktx2Data.bytes;
+  if (bytes[0] != 0xAB || bytes[1] != 0x4B || bytes[2] != 0x54 || bytes[3] != 0x58) return nil;
+
+  uint32_t kvdOffset = avg_read_u32le(bytes + 56);
+  uint32_t kvdLength = avg_read_u32le(bytes + 60);
+  BOOL kvdInRange = kvdLength > 0 && (uint64_t)kvdOffset + kvdLength <= ktx2Data.length;
+  return AVGKTX2Metadata(bytes, kvdInRange ? bytes + kvdOffset : NULL, kvdInRange ? kvdLength : 0);
 }
 
 - (void)loadKTX2FromFile:(NSString *)path
@@ -732,7 +717,7 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
     NSDictionary *metadata = [self extractKTX2Metadata:fileData];
     if (!metadata) {
       dispatch_async(dispatch_get_main_queue(), ^{
-        [self notifyError:@"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."];
+        [self notifyError:@"Not a KTX2 file"];
       });
       return;
     }
@@ -755,7 +740,7 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
     NSData *fileData = [self readHeaderFrom:reader error:&error];
     NSDictionary *metadata = fileData ? [self extractKTX2Metadata:fileData] : nil;
     if (fileData && !metadata) {
-      error = @"No metadata found in KTX2 file. Ensure the file was encoded with metadata injection.";
+      error = @"Not a KTX2 file";
     }
     uint32_t supercompression = metadata ? avg_read_u32le((const uint8_t *)fileData.bytes + 44) : 0;
     if (metadata && self.stream && supercompression == 0) {
@@ -1281,39 +1266,17 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
     return NO;  // Not uncompressed
   }
   
-  // Read KVD offset and length (bytes 56-63)
+  // Read the key/value data for KTXanimData
   uint32_t kvdOffset = *(uint32_t *)(headerBytes + 56);
   uint32_t kvdLength = *(uint32_t *)(headerBytes + 60);
-  
-  AVG_VLOG(@"checkAndPlayUncompressedStreaming: kvdOffset=%u, kvdLength=%u", kvdOffset, kvdLength);
-  
-  if (kvdLength == 0 || kvdOffset == 0) {
-    close(fd);
-    return NO;
+  NSMutableData *kvdBytes = [NSMutableData dataWithLength:MIN(kvdLength, 4096u)];
+  if (kvdBytes.length > 0) {
+    ssize_t kvdRead = pread(fd, kvdBytes.mutableBytes, kvdBytes.length, kvdOffset);
+    kvdBytes.length = kvdRead > 0 ? (NSUInteger)kvdRead : 0;
   }
-  
-  // Read metadata section
-  lseek(fd, kvdOffset, SEEK_SET);
-  NSMutableData *metadataBytes = [NSMutableData dataWithLength:MIN(kvdLength, 4096u)];
-  read(fd, metadataBytes.mutableBytes, metadataBytes.length);
-  
-  // Extract metadata JSON from KVD
-  NSString *metadataJson = [self extractMetadataJsonFromKvdBytes:metadataBytes];
-  if (!metadataJson) {
-    close(fd);
-    return NO;
-  }
-  
-  // Parse metadata
-  NSError *jsonError = nil;
-  NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:[metadataJson dataUsingEncoding:NSUTF8StringEncoding]
-                                                           options:0 error:&jsonError];
-  if (jsonError || ![metadata isKindOfClass:[NSDictionary class]]) {
-    close(fd);
-    return NO;
-  }
-  // Only texture arrays stream
-  if (![metadata[@"packingMode"] isEqual:@"array"]) {
+  NSDictionary *metadata = AVGKTX2Metadata(headerBytes, (const uint8_t *)kvdBytes.bytes, kvdBytes.length);
+  // Only ASTC texture arrays stream
+  if (!AVGIsASTCArray(metadata)) {
     close(fd);
     return NO;
   }
@@ -1340,7 +1303,7 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
 {
   if (!self.stream || fileData.length < 104) return NO;
   if (avg_read_u32le((const uint8_t *)fileData.bytes + 44) != 0) return NO;
-  if (![metadata[@"packingMode"] isEqual:@"array"]) return NO;
+  if (!AVGIsASTCArray(metadata)) return NO;
   _heldFileData = fileData;
   _mmapData = (void *)fileData.bytes;
   _mmapSize = fileData.length;
@@ -1380,7 +1343,7 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
     self.totalFrames = layerCount;
     self.frameWidth = width;
     self.frameHeight = height;
-    self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+    self.frameRate = [metadata[@"frameRate"] doubleValue];
     self.frameInterval = 1.0 / self.frameRate;
     
     self->_textureArrayLayerCount = layerCount;
@@ -1518,54 +1481,6 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
   });
   
   return YES;
-}
-
-- (NSString *)extractMetadataJsonFromKvdBytes:(NSData *)kvdBytes
-{
-  if (!kvdBytes || kvdBytes.length < 4) return nil;
-  
-  const uint8_t *bytes = (const uint8_t *)kvdBytes.bytes;
-  NSUInteger pos = 0;
-  NSUInteger kvdEnd = kvdBytes.length;
-  
-  while (pos < kvdEnd) {
-    if (pos + 4 > kvdBytes.length) break;
-    
-    uint32_t entryLength = *(uint32_t *)(bytes + pos);
-    pos += 4;
-    
-    if (entryLength == 0 || pos + entryLength > kvdBytes.length) break;
-    
-    // Find key (NUL-terminated string)
-    NSUInteger keyEnd = pos;
-    while (keyEnd < pos + entryLength && bytes[keyEnd] != 0) {
-      keyEnd++;
-    }
-    
-    NSString *key = [[NSString alloc] initWithBytes:(bytes + pos) length:(keyEnd - pos) encoding:NSUTF8StringEncoding];
-    
-    if ([key isEqualToString:@"BasisPlayerMetadata"]) {
-      NSUInteger valueStart = keyEnd + 1;
-      NSUInteger valueEnd = pos + entryLength;
-      
-      // Find actual value end (may have NUL terminator)
-      while (valueEnd > valueStart && bytes[valueEnd - 1] == 0) {
-        valueEnd--;
-      }
-      
-      NSString *metadataJson = [[NSString alloc] initWithBytes:(bytes + valueStart) 
-                                                        length:(valueEnd - valueStart) 
-                                                      encoding:NSUTF8StringEncoding];
-      AVG_VLOG(@"extractMetadataJsonFromKvdBytes: found BasisPlayerMetadata");
-      return metadataJson;
-    }
-    
-    // Move to next entry (with padding to 4-byte alignment)
-    pos += entryLength;
-    pos += (4 - (entryLength % 4)) % 4;
-  }
-  
-  return nil;
 }
 
 - (void)uploadUncompressedFrame:(NSInteger)frameIndex toSlot:(NSInteger)slot
@@ -1752,22 +1667,20 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
                             fileData:(NSData *)fileData
                               reader:(AVGSourceReader *)reader
 {
-  NSString *mode = metadata[@"mode"];
-  NSString *packingMode = metadata[@"packingMode"];
-  if (![mode isEqual:@"astc"] || ![packingMode isEqual:@"array"]) {
-    [self notifyError:[NSString stringWithFormat:@"Only ASTC texture arrays play (this file is mode '%@', packing '%@'); encode it with texenc",
-                       mode ?: @"", packingMode ?: @""]];
+  if (!AVGIsASTCArray(metadata)) {
+    [self notifyError:[NSString stringWithFormat:@"Only ASTC texture arrays play (this file has vkFormat %@ and %@ layers); encode it with texenc",
+                       metadata[@"vkFormat"], metadata[@"frameCount"]]];
     return;
   }
   
   self.totalFrames = [metadata[@"frameCount"] integerValue];
   self.frameWidth = [metadata[@"frameWidth"] integerValue];
   self.frameHeight = [metadata[@"frameHeight"] integerValue];
-  self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+  self.frameRate = [metadata[@"frameRate"] doubleValue];
   self.frameInterval = 1.0 / self.frameRate;
-  _textureArrayLayerCount = [metadata[@"layerCount"] integerValue] ?: self.totalFrames;
+  _textureArrayLayerCount = self.totalFrames;
   
-  AVG_VLOG(@"Metadata: %ld frames, %ldx%ld, %.1f fps",
+  AVG_VLOG(@"Metadata: %ld frames, %ldx%ld, %.3f fps",
         (long)self.totalFrames, (long)self.frameWidth, (long)self.frameHeight, self.frameRate);
   
   [self loadTextureArray:metadata sourcePath:sourcePath fileData:fileData reader:reader];
@@ -2282,7 +2195,7 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
     self.totalFrames = layerCount;
     self.frameWidth = width;
     self.frameHeight = height;
-    self.frameRate = [metadata[@"frameRate"] floatValue] ?: 30.0;
+    self.frameRate = [metadata[@"frameRate"] doubleValue];
     self.frameInterval = 1.0 / self.frameRate;
     
     self->_textureArrayLayerCount = layerCount;
@@ -2410,7 +2323,7 @@ static int64_t AVGReadLevel(void *context, uint64_t offset, uint8_t *buffer, siz
   BOOL needed = self.isPlaying || _frameOwed;
   if (needed && !self.displayLink) {
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
-    self.displayLink.preferredFramesPerSecond = (NSInteger)self.frameRate;
+    self.displayLink.preferredFramesPerSecond = (NSInteger)ceil(self.frameRate);
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
   } else if (!needed && self.displayLink) {
     [self.displayLink invalidate];

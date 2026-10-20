@@ -92,6 +92,58 @@ describe.each(Object.entries(expected))('%s', (name, e) => {
   }
 });
 
+/** A 400x400, 181-layer ASTC 4x4 header followed by the given key/value entries (no level data). */
+function ktx2WithKeys(entries: [string, Uint8Array][]): Uint8Array {
+  const encoded = entries.map(([key, value]) => {
+    const keyBytes = new TextEncoder().encode(`${key}\0`);
+    const length = keyBytes.length + value.length;
+    const entry = new Uint8Array(4 + length + ((4 - (length % 4)) % 4));
+    new DataView(entry.buffer).setUint32(0, length, true);
+    entry.set(keyBytes, 4);
+    entry.set(value, 4 + keyBytes.length);
+    return entry;
+  });
+  const kvdLength = encoded.reduce((sum, e) => sum + e.length, 0);
+  const data = new Uint8Array(80 + kvdLength);
+  data.set([0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const view = new DataView(data.buffer);
+  view.setUint32(12, 157, true);
+  view.setUint32(20, 400, true);
+  view.setUint32(24, 400, true);
+  view.setUint32(32, 181, true);
+  view.setUint32(56, 80, true);
+  view.setUint32(60, kvdLength, true);
+  let pos = 80;
+  for (const entry of encoded) {
+    data.set(entry, pos);
+    pos += entry.length;
+  }
+  return data;
+}
+
+function animData(duration: number, timescale: number): Uint8Array {
+  const value = new Uint8Array(12);
+  new DataView(value.buffer).setUint32(0, duration, true);
+  new DataView(value.buffer).setUint32(4, timescale, true);
+  return value;
+}
+
+describe('frame rate from KTXanimData', () => {
+  it('keeps fractional rates exact', () => {
+    const data = ktx2WithKeys([['KTXanimData', animData(1001, 30000)], ['KTXwriter', new TextEncoder().encode('test\0')]]);
+    expect(extractKTX2Metadata(data)).toEqual({ frameWidth: 400, frameHeight: 400, frameCount: 181, frameRate: 30000 / 1001 });
+  });
+
+  it('plays files without it at 30 fps', () => {
+    expect(extractKTX2Metadata(ktx2WithKeys([['KTXwriter', new TextEncoder().encode('test\0')]]))?.frameRate).toBe(30);
+    expect(extractKTX2Metadata(ktx2WithKeys([]))?.frameRate).toBe(30);
+  });
+
+  it('ignores a zero duration or timescale', () => {
+    expect(extractKTX2Metadata(ktx2WithKeys([['KTXanimData', animData(0, 30)]]))?.frameRate).toBe(30);
+  });
+});
+
 describe('rejects what is not a KTX2', () => {
   const junk = new Uint8Array(256).fill(7);
   it('extractKTX2Metadata', () => expect(extractKTX2Metadata(junk)).toBeNull());

@@ -13,17 +13,17 @@ See it next to the other formats in the [demo app](#demo-and-related-packages).
 
 ## alpha-video-gpu or alpha-video?
 
-alpha-video-gpu doesn't depend on a video codec. There's nothing to decode, so it uses almost no CPU, needs no hardware video decoder, and runs wherever the GPU supports ASTC textures, which covers more devices than VP9 or AV1 hardware decoding. [alpha-video](https://github.com/MediaCacheDev/alpha-video) plays WebM VP9 and AV1 instead, for when file size matters more.
+alpha-video-gpu doesn't depend on a video codec. The GPU samples the frames as they are stored, so playback takes little CPU, needs no hardware video decoder, and runs wherever the GPU supports ASTC textures, which covers more devices than VP9 or AV1 hardware decoding. [alpha-video](https://github.com/MediaCacheDev/alpha-video) plays WebM VP9 and AV1 instead, for when file size matters more.
 
 | | [alpha-video](https://github.com/MediaCacheDev/alpha-video) | alpha-video-gpu (this package) |
 |---|---|---|
 | **Format** | WebM: VP9 with alpha, or dual-stream VP9/AV1 | KTX2: an ASTC texture array, one layer per frame |
 | **Made with** | ffmpeg, or any tool that exports alpha WebM | [alpha-video-gpu-encoder](https://github.com/MediaCacheDev/alpha-video-gpu-encoder) (`texenc`) |
 | **Decoding** | Every frame: libvpx or dav1d on the CPU, or MediaCodec on Android | None |
-| **CPU and battery** | A decode per frame, or one pass up front with `mode="preload"` | Near zero |
+| **CPU and battery** | A decode per frame, or one pass up front with `mode="preload"` | Low: zstd at most, and the GPU does the rest |
 | **What the device needs** | Nothing for software decoding. Hardware decoding needs a VP9 or AV1 decoder (Android only), and each player takes 2 of its few instances | ASTC texture support: every iPhone and iPad since the A8 (2014), nearly every Android GPU, Apple silicon Macs and mobile browsers |
-| **Many players at once** | Limited by the CPU, or by the hardware decoder's instances | Dozens: each one is just a texture |
-| **File size** | Smallest | Several times larger |
+| **Many players at once** | Limited by the CPU, or by the hardware decoder's instances: 20 small loops saturated a budget phone | Dozens: 50 small uncompressed loops used under half of the same phone's CPU |
+| **File size** | Smallest | About 4 to 6 times larger at similar quality |
 | **Seeking** | Decodes from the previous keyframe | Any frame directly |
 | **Web** | `<video>` in Chrome and Firefox | WebGL where the browser has ASTC |
 | **Best for** | Long or large clips, downloads where size matters, files from standard video tools | UI effects, stickers and glows, many simultaneous loops, short to medium videos |
@@ -38,7 +38,7 @@ This library renders videos from KTX2 files that hold an ASTC texture array, one
 - No per-frame decoding: frames are uploaded as compressed ASTC blocks
 - Hardware texture compression on iOS, Android and the mobile web
 - Software ASTC decoding on emulators and devices without ASTC
-- Metadata embedded in the KTX2 file by the encoder
+- Frame size, count and rate from standard KTX2 fields (see [Metadata](#metadata))
 - **Streaming playback** for long videos with minimal memory footprint
 - **Uncompressed ASTC streaming** for many concurrent players
 
@@ -46,97 +46,65 @@ This library renders videos from KTX2 files that hold an ASTC texture array, one
 
 ## Video Codecs vs GPU Texture Streaming
 
-This section explains why GPU texture streaming exists and when to use it instead of traditional video codecs.
-
-### The Traditional Video Pipeline
-
-Video codecs (H.264, VP9, AV1) are designed for maximum compression:
+ASTC makes a different trade-off from video codecs. VP9 and AV1 spend CPU on every frame to make files as small as possible. ASTC is a format the GPU samples directly, so playback takes as little CPU and memory traffic as possible and leaves the CPU to the rest of the app, even with many animations on screen. The cost is file size.
 
 ```
-Encoded File → CPU Decode → YUV/YUVA → Convert to RGBA → Upload to GPU → Render
-     │              │            │              │              │
-   Small        Heavy CPU     Planar        Per-frame      Bandwidth
-   files        per frame     format        conversion     limited
+VP9 / AV1:  file → decode on the CPU → YUV → convert to RGBA → upload → draw
+ASTC:       file → zstd (or nothing) → upload as is → draw (the GPU decodes while sampling)
 ```
 
-**Per-frame work:**
-1. **Decode** - CPU decompresses each frame using complex algorithms (motion compensation, DCT, entropy coding)
-2. **Color convert** - YUV→RGBA conversion (or YUVA for alpha)
-3. **GPU upload** - Transfer decoded pixels to GPU memory every frame
+The measurements below use two clips: a glow (400×400, 181 frames, 30 fps, mostly transparent) and a manta ray (1920×1080, 424 frames, 29.97 fps, mostly opaque footage). Each was encoded from the same frames into every format.
 
-**Characteristics:**
-- Excellent compression (10-50x smaller than raw)
-- High CPU usage during playback
-- Battery drain on mobile
-- Latency from decode pipeline
-- Alpha support varies (VP9/AV1 support YUVA, H.264 does not)
+### File size
 
-### The GPU Texture Pipeline
+| Clip | VP9 (CRF 18) | AV1 (CRF 28) | ASTC 4x4 | ASTC 6x6 | ASTC 8x8 |
+|------|-----:|-----:|-----:|-----:|-----:|
+| Glow | 1.0 MB | 0.60 MB | 5.5 MB | 2.5 MB | 1.4 MB |
+| Manta | 7.0 MB | 6.4 MB | 95 MB | 63 MB | 38 MB |
 
-GPU texture streaming pre-compresses frames into GPU-native formats:
+At similar quality (PSNR), ASTC came out about 4 times the size of VP9 for the glow and 5.5 times for the manta. The encoder's README has the full tables, with quality at each block size and video at two quality settings.
 
-```
-KTX2 File → Zstd Decompress → ASTC Data → Direct GPU Upload → Render
-    │             │               │               │
-  Larger      ~1GB/s CPU      Already GPU      Zero CPU
-  files       (trivial)        format         per frame
-```
+### On a budget Android phone
 
-**Per-frame work:**
-1. **Decompress** - Zstd runs at ~1GB/s, trivial CPU load
-2. **Upload** - ASTC data goes directly to GPU (no conversion)
-3. **Render** - GPU decompresses ASTC in hardware during sampling
+Measured on a Samsung Galaxy A52s (Snapdragon 778G, 6 GB, Android 14), an inexpensive phone from 2021, in Release builds of the [demo app](#demo-and-related-packages). CPU is the whole phone's, as cores kept busy, so it includes Android's media processes and compositing; the phone has 8 cores. The phone has a VP9 hardware decoder but no AV1 one.
 
-**Characteristics:**
-- Moderate compression (3-10x smaller than raw, larger than video codecs)
-- Near-zero CPU usage during playback
-- Minimal battery drain
-- No decode latency
-- Native alpha support (ASTC includes alpha channel)
+**One player** (each clip looping on its own, CPU above an empty screen):
 
-### Side-by-Side Comparison
+| Clip | ASTC 4x4 | ASTC 8x8 | VP9, libvpx | VP9, MediaCodec | AV1, dav1d |
+|------|-----:|-----:|-----:|-----:|-----:|
+| Glow | 0.7 cores | 0.5 cores | 0.7 cores | 1.3 cores | 0.7 cores |
+| Manta | 0.8 cores | 0.7 cores | 3.7 cores | 3.9 cores | 3.1 cores |
 
-| Aspect | Video Codec (VP9/AV1) | GPU Texture (ASTC) |
-|--------|----------------------|-------------------|
-| **File size** | Smallest (10-50x compression) | Larger (3-10x compression) |
-| **CPU per frame** | High (decode + convert) | Near-zero (GPU does decompression) |
-| **Battery impact** | Significant | Minimal |
-| **Memory bandwidth** | RGBA upload every frame | Compressed upload, GPU expands |
-| **Alpha support** | VP9/AV1 only (YUVA) | Native (ASTC 4-channel) |
-| **Startup latency** | Codec init + first decode | Immediate |
-| **Concurrent players** | CPU-limited (2-4 typical) | GPU-limited (10-50+ typical) |
-| **Hardware decode** | Requires video decoder chip | Uses texture sampling hardware |
+One small clip costs about the same in any format: most of that is Android redrawing the view each frame. At 1080p, video kept 3 to 4 cores busy and ASTC under one. MediaCodec decodes VP9's colour in hardware, but the alpha plane is still decoded and combined on the CPU.
 
-### When to Use Each
+**Many players** (glow loops in the demo's main screen, each in its own view):
 
-**Use video codecs (alpha-video) when:**
-- File size is critical (bandwidth-constrained)
-- Playing 1-2 videos at a time
-- Content is long-form (minutes+)
-- Device has hardware video decoder
+| Players | Format | CPU | App memory | Demo UI |
+|---------|--------|----:|-----------:|--------:|
+| none | | 0.8 cores | 136 MB | 113 fps |
+| 8 | ASTC, zstd | 2.1 cores | 452 MB | 60 fps |
+| 8 | VP9, libvpx | 3.4 cores | 298 MB | 54 fps |
+| 20 | ASTC, uncompressed | 2.4 cores | 371 MB | 52 fps |
+| 20 | ASTC, zstd | 3.1 cores | 908 MB | 52 fps |
+| 20 | VP9, libvpx | 8 cores (all) | 462 MB | 15 fps |
+| 20 | VP9, decoder `auto` | 8 cores (all) | 428 MB | 3 fps |
+| 50 | ASTC, uncompressed | 3.7 cores | 699 MB | 41 fps |
+| 50 | ASTC, zstd | 8 cores (all) | 2.1 GB | 3 fps |
 
-**Use GPU textures (alpha-video-gpu) when:**
-- Many simultaneous videos (UI effects, particles, stickers)
-- Battery/CPU usage is critical
-- Low latency is required
-- Content is short-to-medium (seconds to ~1 minute)
-- Consistent cross-platform behavior needed
+"Demo UI" is the frame rate of the demo's own interface on the phone's 120 Hz screen, which shows how much the players leave for the rest of an app. The VP9 here is the demo's glow file (5.7 MB, high quality), so it takes more decoding than the CRF 18 file above. With 20 or more players, use uncompressed files (`--zstd 0`): each zstd player decompresses on its own, and took about 40 MB of memory here, against about 12 MB uncompressed.
 
-### The Math
+### When to use each
 
-For a 30fps, 400×400 video with alpha:
+**Use video codecs ([alpha-video](https://github.com/MediaCacheDev/alpha-video)) when:**
+- Download or app size comes first
+- The content is long or high-resolution footage, especially opaque
+- Only one or two videos play at a time
 
-**Video codec (VP9 YUVA):**
-- File: ~50KB/sec of video
-- CPU: Decode + YUV→RGBA = ~5-15ms per frame
-- Memory: 400×400×4 = 640KB RGBA uploaded per frame
-- 10 concurrent = 50-150ms CPU per frame (drops frames)
-
-**GPU texture (ASTC 6×6):**
-- File: ~200KB/sec of video (4x larger)
-- CPU: Zstd decompress = ~0.2ms per frame
-- Memory: 400×400×0.44 = 71KB ASTC uploaded per frame (GPU expands)
-- 10 concurrent = 2ms CPU per frame (smooth 60fps)
+**Use ASTC (alpha-video-gpu) when:**
+- Many animations play at once (UI effects, stickers, glows)
+- The CPU should stay free for the app, or battery use matters
+- Seeking and scrubbing need to be frame-exact
+- Behaviour should be the same on every platform
 
 ### Streaming Modes
 
@@ -518,21 +486,18 @@ Without it, `stream` on an `asset://` or `res/raw` file fails with an error nami
 
 ## Metadata
 
-Video metadata is embedded by the encoder in the KTX2 file's key-value data, under the key `BasisPlayerMetadata` (the name is kept so older files still read). The player reads it automatically:
+The player reads everything from standard KTX 2.0 fields, so it needs no custom metadata:
 
-```json
-{
-  "frameCount": 120,
-  "frameWidth": 400,
-  "frameHeight": 400,
-  "frameRate": 30,
-  "mode": "astc",
-  "packingMode": "array",
-  "layerCount": 120
-}
-```
+| What | Where in the file |
+|------|-------------------|
+| Frame width and height | Header: `pixelWidth`, `pixelHeight` |
+| Frame count | Header: `layerCount` (one layer per frame) |
+| ASTC block size | Header: `vkFormat` |
+| Frame rate | Key/value data: [`KTXanimData`](https://registry.khronos.org/KTX/specs/2.0/ktxspec.v2.html#_ktxanimdata), the time per frame as a fraction, so 29.97 fps (1001/30000 s) is exact. Without it, 30 fps |
 
-Files from older encoders in other modes (UASTC, atlas packing, GLB containers, multi-part files) are rejected with an error; encode them again with `texenc`.
+`onLoad` reports `frameRate` as a decimal (29.97…), and `seekToTime` uses it.
+
+Only ASTC texture arrays play. Files in other formats (UASTC and other Basis Universal files, atlas packing, GLB containers, multi-part files) are rejected with an error; encode them again with `texenc`. Files from earlier encoders, which also carried a JSON `BasisPlayerMetadata` entry, still play, at 30 fps.
 
 
 ---
@@ -734,23 +699,25 @@ A zstd decoder can only start at the beginning of a zstd frame. By default the e
 
 ## Uncompressed ASTC Streaming
 
-For maximum playback performance and massive concurrency, uncompressed ASTC streaming eliminates all runtime Zstd decompression overhead. The KTX2 file contains raw ASTC texture data that can be uploaded directly to the GPU.
+For the most players at once and the least CPU, uncompressed files skip zstd entirely. The KTX2 file holds the ASTC blocks as they are, and the player uploads them straight from the memory-mapped file.
 
 ### When to Use
 
-- **50-100+ simultaneous players** on a single device
-- **Battery-critical applications** (kiosks, digital signage)
-- **Guaranteed smooth playback** regardless of device CPU
+- **Dozens of simultaneous players** on one screen
+- **Always-on displays** (kiosks, digital signage), where CPU and battery add up
+- **Smooth playback while the CPU is busy** with the rest of the app
 - **Storage is not a constraint** (local assets, fast network)
 
 ### Performance Characteristics
 
+The glow clip (400×400, 181 frames) on the budget phone from [the measurements above](#on-a-budget-android-phone):
+
 | Metric | Zstd compressed | Uncompressed (`--zstd 0`) |
 |--------|-----------------|---------------|
-| File size | ~5 MB | ~29 MB (6x larger) |
+| File size | 4.9 MB | 29 MB (6x larger) |
 | CPU during playback | Zstd decode + upload | Upload only |
-| Concurrent players | 10-20 typical | 50-100+ tested |
-| Battery impact | Moderate | Minimal |
+| 20 players | 3.1 cores, 908 MB, demo UI at 52 fps | 2.4 cores, 371 MB, demo UI at 52 fps |
+| 50 players | All 8 cores, 2.1 GB, demo UI at 3 fps | 3.7 cores, 699 MB, demo UI at 41 fps |
 | Memory bandwidth | Lower | Higher |
 
 ### Encoding Uncompressed ASTC
@@ -777,14 +744,14 @@ texenc --input ./frames --output video_uncompressed.ktx2 --fps 30 --zstd 0
 1. **Memory-mapped file access** - The KTX2 file is mmap'd, allowing the OS to page frames in/out efficiently
 2. **Direct GPU upload** - ASTC blocks are copied directly to GPU texture memory (no Zstd decompression needed)
 3. **Ring buffer playback** - Only `streamingCacheSize` frames (`streamingRingSize` with `memoryStrategy="ram"`) are in GPU memory at once
-4. **Zero CPU decode** - On real devices with ASTC hardware, CPU usage approaches zero during playback
+4. **No decoding on the CPU** - On devices with ASTC hardware, each frame is a copy from the mapped file to the GPU
 
 ### Trade-offs
 
 | Pros | Cons |
 |------|------|
-| Near-zero CPU usage | 5-6x larger file size |
-| Scales to 50-100+ concurrent players | Higher storage/bandwidth requirements |
+| The lowest CPU use: no decompression | 6x larger file size than zstd |
+| Scales to dozens of players (50 on a budget phone) | Higher storage/bandwidth requirements |
 | Consistent frame timing | Not suitable for slow networks |
 | Lower battery consumption | Larger app bundle if bundled |
 | No decode latency on startup | — |
@@ -797,27 +764,26 @@ On iOS/Android simulators (no hardware ASTC), uncompressed streaming still requi
 
 ## Performance Characteristics
 
-- **CPU:** Near-zero during playback (frame uploads only, or none when every frame is in VRAM)
+- **CPU:** Low: zstd decompression for compressed files while streaming, frame uploads, and the platform redrawing the view for each new frame. On Android each player is a `TextureView`, and that redraw is most of what one small player costs. See [the measurements](#on-a-budget-android-phone).
 - **Memory:** GPU texture memory = the ASTC size (ASTC decompresses on GPU)
-- **Battery:** Significantly lower than video playback
 - **Load time:** Direct upload of the ASTC blocks
 
 ### Playback Mode Comparison
 
 | Mode | Load Time | Memory | CPU (Playback) | Best For |
 |------|-----------|--------|----------------|----------|
-| Non-streaming VRAM | Slow (all frames) | High VRAM, minimal RAM | Near-zero | Short videos, best performance |
+| Non-streaming VRAM | Slow (all frames) | High VRAM, minimal RAM | Lowest | Short videos, best performance |
 | Non-streaming RAM | Slow (all frames) | High RAM, minimal VRAM | Low (uploads) | VRAM-constrained devices |
-| Streaming VRAM (Zstd) | Fast (prefetch) | Low VRAM ring buffer | Medium (decode) | Long videos, fixed memory |
-| Streaming RAM (Zstd) | Fast (prefetch) | Medium RAM cache, minimal VRAM | Medium (decode) | Long videos, VRAM-constrained |
-| Streaming Uncompressed | Fast (mmap) | Low VRAM ring buffer | Near-zero | Massive concurrency, battery-critical |
+| Streaming VRAM (Zstd) | Fast (prefetch) | Low VRAM ring buffer | Low (zstd) | Long videos, fixed memory |
+| Streaming RAM (Zstd) | Fast (prefetch) | Medium RAM cache, minimal VRAM | Low (zstd) | Long videos, VRAM-constrained |
+| Streaming Uncompressed | Fast (mmap) | Low VRAM ring buffer | Lowest | Many players at once, always-on displays |
 
 Best suited for:
 - Looping UI effects (glows, shimmers, highlights)
 - Transparent overlays
 - Kiosk/always-on displays
 - Any video where consistent frame timing matters
-- **High-concurrency scenarios** (50-100+ simultaneous videos)
+- **Many simultaneous players** (dozens, with uncompressed files)
 
 Not ideal for:
 - Long-form video content

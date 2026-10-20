@@ -18,7 +18,6 @@ import android.view.TextureView;
 
 import androidx.annotation.Nullable;
 
-import org.json.JSONObject;
 
 import java.io.File;
 import java.util.Arrays;
@@ -119,8 +118,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     private final AtomicInteger seekRequest = new AtomicInteger(-1);
     // A clip that doesn't loop has reached its last frame; playing again starts it over
     private volatile boolean ended = false;
-    private float frameRate = 30.0f;
-    private long frameIntervalNanos;
+    private double frameRate = Ktx2Metadata.DEFAULT_FRAME_RATE;
     
     private int frameWidth = 0;
     private int frameHeight = 0;
@@ -267,8 +265,6 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             .asFloatBuffer()
             .put(TEXCOORD_DATA);
         texCoordBuffer.position(0);
-        
-        frameIntervalNanos = (long) (1_000_000_000L / frameRate);
     }
     
     private synchronized ExecutorService getOrCreateExecutor() {
@@ -619,16 +615,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             return;
         }
         
-        String metadataJson = extractKTX2Metadata(header);
-        if (metadataJson == null) {
-            mainHandler.post(() -> notifyError("No metadata found in KTX2 file. Ensure the file was encoded with metadata injection."));
-            return;
-        }
-        
-        try {
-            parseMetadata(metadataJson);
-        } catch (Exception e) {
-            mainHandler.post(() -> notifyError("Failed to parse metadata: " + e.getMessage()));
+        String metadataError = applyMetadata(Ktx2Metadata.read(header));
+        if (metadataError != null) {
+            mainHandler.post(() -> notifyError(metadataError));
             return;
         }
         
@@ -1637,99 +1626,20 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         return shader;
     }
     
-    /**
-     * Extract BasisPlayerMetadata from KTX2 key-value data section.
-     * Returns null if not found.
-     */
-    private String extractKTX2Metadata(byte[] ktx2Data) {
-        try {
-            if (ktx2Data == null || ktx2Data.length < 80) return null;
-            
-            // Check KTX2 magic: «KTX 20»
-            if (ktx2Data[0] != (byte)0xAB || ktx2Data[1] != 0x4B || ktx2Data[2] != 0x54 || ktx2Data[3] != 0x58) {
-                return null;
-            }
-            
-            // Read KVD offset and length from header (bytes 56-63, little-endian)
-            ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
-            int kvdByteOffset = header.getInt(56);
-            int kvdByteLength = header.getInt(60);
-            
-            if (kvdByteLength == 0 || kvdByteOffset + kvdByteLength > ktx2Data.length) {
-                return null;
-            }
-            
-            // Parse key-value entries
-            int pos = kvdByteOffset;
-            int kvdEnd = kvdByteOffset + kvdByteLength;
-            
-            while (pos < kvdEnd) {
-                if (pos + 4 > ktx2Data.length) break;
-                
-                ByteBuffer entryBuf = ByteBuffer.wrap(ktx2Data, pos, 4).order(ByteOrder.LITTLE_ENDIAN);
-                int entryLength = entryBuf.getInt();
-                pos += 4;
-                
-                if (entryLength == 0 || pos + entryLength > ktx2Data.length) break;
-                
-                // Find key (NUL-terminated string)
-                int keyEnd = pos;
-                while (keyEnd < pos + entryLength && ktx2Data[keyEnd] != 0) {
-                    keyEnd++;
-                }
-                
-                String key = new String(ktx2Data, pos, keyEnd - pos, "UTF-8");
-                
-                if ("BasisPlayerMetadata".equals(key)) {
-                    // Value starts after key's NUL terminator
-                    int valueStart = keyEnd + 1;
-                    int valueEnd = pos + entryLength;
-                    
-                    // Find actual value end (may have NUL terminator)
-                    while (valueEnd > valueStart && ktx2Data[valueEnd - 1] == 0) {
-                        valueEnd--;
-                    }
-                    
-                    String metadataJson = new String(ktx2Data, valueStart, valueEnd - valueStart, "UTF-8");
-                    logD("Extracted embedded metadata from KTX2: " + metadataJson.substring(0, Math.min(200, metadataJson.length())) + "...");
-                    return metadataJson;
-                }
-                
-                // Move to next entry (with padding to 4-byte alignment)
-                pos += entryLength;
-                pos += (4 - (entryLength % 4)) % 4;
-            }
-            
-            return null;
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to extract KTX2 metadata: " + e.getMessage());
-            return null;
+    /** Takes the frame size, count and rate from the file; returns an error unless it plays. */
+    private String applyMetadata(Ktx2Metadata metadata) {
+        if (metadata == null) return "Not a KTX2 file";
+        if (!metadata.isAstcArray()) {
+            return "Only ASTC texture arrays play (this file has vkFormat " + metadata.vkFormat + " and "
+                    + metadata.frameCount + " layers); encode it with texenc";
         }
-    }
-    
-    private void parseMetadata(String json) throws Exception {
-        if (json == null || json.isEmpty()) {
-            throw new Exception("Metadata is null or empty");
-        }
-        
-        JSONObject metadata = new JSONObject(json);
-        
-        frameWidth = metadata.getInt("frameWidth");
-        frameHeight = metadata.getInt("frameHeight");
-        totalFrames = metadata.getInt("frameCount");
-        frameRate = (float) metadata.getDouble("frameRate");
-        frameIntervalNanos = (long) (1_000_000_000L / frameRate);
-        
-        String mode = metadata.optString("mode", "");
-        String packingMode = metadata.optString("packingMode", "");
-        if (!"astc".equals(mode) || !"array".equals(packingMode)) {
-            throw new Exception("Only ASTC texture arrays play (this file is mode '" + mode
-                    + "', packing '" + packingMode + "'); encode it with texenc");
-        }
-        textureArrayLayerCount = metadata.optInt("layerCount", totalFrames);
-        
-        logI("Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight +
-                ", " + frameRate + " fps");
+        frameWidth = metadata.width;
+        frameHeight = metadata.height;
+        totalFrames = metadata.frameCount;
+        textureArrayLayerCount = metadata.frameCount;
+        frameRate = metadata.frameRate;
+        logI("Metadata: " + totalFrames + " frames, " + frameWidth + "x" + frameHeight + ", " + frameRate + " fps");
+        return null;
     }
     
     /**

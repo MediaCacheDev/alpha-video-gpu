@@ -1,75 +1,60 @@
 /**
  * KTX2 Parsing Utilities
  *
- * Functions for extracting KTX2 metadata and mapping ASTC formats.
+ * Functions for reading a KTX2 file's frame metadata and mapping ASTC formats.
  */
 
 import type { Metadata } from './types';
 
+/** Frame rate for files without KTXanimData. */
+export const DEFAULT_FRAME_RATE = 30;
+
 /**
- * Extract BasisPlayerMetadata from KTX2 key-value data section.
- * Returns null if not found.
+ * Reads the frame size and count from the KTX2 header and the frame rate from KTXanimData, the
+ * KTX 2.0 key for array textures whose layers are animation frames (per-frame duration /
+ * timescale seconds, so 29.97 fps is exact). Returns null if the data isn't a KTX2 file.
  */
 export function extractKTX2Metadata(ktx2Data: Uint8Array): Metadata | null {
-  try {
-    const view = new DataView(
-      ktx2Data.buffer,
-      ktx2Data.byteOffset,
-      ktx2Data.byteLength
-    );
-
-    // Check KTX2 magic: 0xAB 0x4B 0x54 0x58
-    if (
-      ktx2Data[0] !== 0xab ||
-      ktx2Data[1] !== 0x4b ||
-      ktx2Data[2] !== 0x54 ||
-      ktx2Data[3] !== 0x58
-    ) {
-      return null;
-    }
-
-    const kvdByteOffset = view.getUint32(56, true);
-    const kvdByteLength = view.getUint32(60, true);
-    if (kvdByteLength === 0) return null;
-
-    let pos = kvdByteOffset;
-    const kvdEnd = kvdByteOffset + kvdByteLength;
-
-    while (pos < kvdEnd) {
-      const entryLength = view.getUint32(pos, true);
-      pos += 4;
-      if (entryLength === 0) break;
-
-      // Read key (null-terminated)
-      let keyEnd = pos;
-      while (keyEnd < pos + entryLength && ktx2Data[keyEnd] !== 0) keyEnd++;
-      const key = new TextDecoder().decode(ktx2Data.slice(pos, keyEnd));
-
-      // Read value (strip trailing nulls)
-      const valueStart = keyEnd + 1;
-      const valueEnd = pos + entryLength;
-      let actualValueEnd = valueEnd;
-      while (actualValueEnd > valueStart && ktx2Data[actualValueEnd - 1] === 0) {
-        actualValueEnd--;
-      }
-
-      if (key === 'BasisPlayerMetadata') {
-        const valueStr = new TextDecoder().decode(
-          ktx2Data.slice(valueStart, actualValueEnd)
-        );
-        return JSON.parse(valueStr);
-      }
-
-      pos += entryLength;
-      // Align to 4 bytes
-      pos += (4 - (entryLength % 4)) % 4;
-    }
-
-    return null;
-  } catch (error) {
-    console.warn('[AlphaVideoGpu] Failed to extract KTX2 metadata:', error);
+  if (
+    ktx2Data.byteLength < 80 ||
+    ktx2Data[0] !== 0xab ||
+    ktx2Data[1] !== 0x4b ||
+    ktx2Data[2] !== 0x54 ||
+    ktx2Data[3] !== 0x58
+  ) {
     return null;
   }
+
+  const view = new DataView(ktx2Data.buffer, ktx2Data.byteOffset, ktx2Data.byteLength);
+  return {
+    frameWidth: view.getUint32(20, true),
+    frameHeight: view.getUint32(24, true),
+    frameCount: view.getUint32(32, true),
+    frameRate: readAnimFrameRate(ktx2Data, view) ?? DEFAULT_FRAME_RATE,
+  };
+}
+
+function readAnimFrameRate(ktx2Data: Uint8Array, view: DataView): number | null {
+  const kvdEnd = Math.min(view.getUint32(56, true) + view.getUint32(60, true), ktx2Data.byteLength);
+  let pos = view.getUint32(56, true);
+
+  while (pos + 4 <= kvdEnd) {
+    const entryLength = view.getUint32(pos, true);
+    const entryStart = pos + 4;
+    if (entryLength === 0 || entryStart + entryLength > kvdEnd) break;
+
+    let keyEnd = entryStart;
+    while (keyEnd < entryStart + entryLength && ktx2Data[keyEnd] !== 0) keyEnd++;
+    const key = new TextDecoder().decode(ktx2Data.subarray(entryStart, keyEnd));
+    if (key === 'KTXanimData' && entryStart + entryLength - (keyEnd + 1) >= 12) {
+      const duration = view.getUint32(keyEnd + 1, true);
+      const timescale = view.getUint32(keyEnd + 5, true);
+      return duration > 0 && timescale > 0 ? timescale / duration : null;
+    }
+
+    pos = entryStart + entryLength + ((4 - (entryLength % 4)) % 4);
+  }
+  return null;
 }
 
 /**

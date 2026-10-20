@@ -29,14 +29,12 @@ export interface KTX2SourceOptions {
  */
 export type KTX2Storage = StorageKind | ByteStore;
 
+/** From the KTX2 header (size, frame count) and its KTXanimData key (frame rate, may be fractional). */
 export interface Metadata {
   frameCount: number;
   frameWidth: number;
   frameHeight: number;
   frameRate: number;
-  mode?: string; // 'astc'
-  packingMode?: string; // 'array'
-  layerCount?: number;
 }
 
 export interface KTX2LoadEvent {
