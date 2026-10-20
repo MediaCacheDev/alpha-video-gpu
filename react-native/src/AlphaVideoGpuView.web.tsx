@@ -55,6 +55,7 @@ export interface AlphaVideoGpuViewProps {
   /** The store's cap in bytes (default 512 MB). Read on mount */
   maxStorageBytes?: number;
   style?: any;
+  testID?: string;
   // Events have the native shape, so the same handlers work on every platform
   /** Called when file metadata is loaded, provides dimensions and frame info */
   onLoad?: (event: { nativeEvent: AlphaVideoGpuLoadEvent }) => void;
@@ -103,6 +104,7 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   storage,
   maxStorageBytes,
   style,
+  testID,
   onLoad,
   onStateChange,
   onFrameUpdate,
@@ -243,7 +245,7 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   }, [style]);
 
   return (
-    <View style={[styles.container, style]}>
+    <View testID={testID} style={[styles.container, style]}>
       <canvas
         ref={canvasRef}
         width={canvasStyle.width}

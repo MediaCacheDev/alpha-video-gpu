@@ -42,6 +42,8 @@ export interface AlphaVideoGpuViewProps {
   paused?: boolean;
   /** View style */
   style?: ViewStyle;
+  /** Locates the view in end-to-end tests */
+  testID?: string;
   // Every event has this shape on Android, iOS and web
   /** Callback when player state changes */
   onStateChange?: (event: { nativeEvent: { state: string } }) => void;

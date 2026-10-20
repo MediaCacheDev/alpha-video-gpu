@@ -23,6 +23,7 @@ First public release.
   - With `'none'`, clips up to 16 MB stay in memory, so loops don't fetch again. And with any storage, a streamed clip whose frames all fit the streaming buffer loops without reading or decoding again.
   - Replaces the IndexedDB whole-file cache, and its `getCachedFile` and `setCachedFile` exports.
 - Playback control: `play`, `pause`, `stop`, `seekToFrame` and `seekToTime` on every platform, plus `paused`, `autoPlay`, `loop` and `playbackSpeed`.
+- `testID` reaches the view on every platform, including React Native Web.
 - Events: `onLoad`, `onFrameUpdate` (with `enableFrameEvents`), `onStateChange`, `onFinished` and `onError`. On the web, `onError` reports `ASTC_UNSUPPORTED` or `WEBGL_UNSUPPORTED` in `code`.
 - A software ASTC decoder for emulators, devices and browsers without ASTC. On the web it's the same decoder compiled to WebAssembly, loaded only by browsers without `WEBGL_compressed_texture_astc`; they report `ASTC_UNSUPPORTED` only if WebAssembly is blocked as well.
 - Streaming seeks start at seek points. When a zstd level ends with a seek table (zstd's seekable format, written by alpha-video-gpu-encoder's `--seek-interval`), a seek starts decoding at the zstd frame before its target, or carries on from the decoder if that is closer. Files without a table play as before, and seek from the start of the file.
