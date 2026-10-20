@@ -9,7 +9,13 @@ Pod::Spec.new do |s|
   s.name          = 'alpha-video-gpu'
   s.module_name   = 'AlphaVideoGPU'
   s.version       = '1.0.0'
-  s.summary       = 'Transparent animations for iOS from ASTC KTX2 texture arrays, drawn with Metal.'
+  s.summary       = 'Transparent (alpha) animations for iOS from ASTC texture arrays in KTX2 files, drawn with Metal.'
+  s.description   = <<~DESC
+    Plays transparent animations stored as ASTC texture arrays in KTX2 files (made with
+    alpha-video-gpu-encoder). The GPU samples the frames as stored, with no video decoding, so
+    dozens of players run at once with little CPU. Streams files by range requests, with
+    frame-exact seeking and offline storage.
+  DESC
   s.homepage      = 'https://github.com/MediaCacheDev/alpha-video-gpu'
   s.license       = { :type => 'MIT', :file => 'LICENSE' }
   s.author        = { 'Daniel Kasprowicz' => '9932671+danielkpl2@users.noreply.github.com' }

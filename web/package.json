@@ -1,7 +1,7 @@
 {
   "name": "alpha-video-gpu-web",
   "version": "1.0.0",
-  "description": "Transparent (alpha) animations from ASTC KTX2 texture arrays in a <canvas> with WebGL2, for plain JS/TS and React. The zstd decoder is bundled inline.",
+  "description": "Transparent (alpha) animations in a <canvas> from ASTC texture arrays in KTX2 files, drawn with WebGL 2, for plain JS/TS and React. Streams by range requests, with seeking and offline storage; the zstd decoder is bundled inline.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -38,13 +38,21 @@
   "keywords": [
     "ktx2",
     "astc",
+    "texture-compression",
     "webgl",
+    "webgl2",
+    "canvas",
     "alpha",
-    "transparent",
+    "alpha-video",
+    "transparent-video",
+    "transparent-animation",
+    "transparency",
     "animation",
+    "video-player",
+    "zstd",
     "react"
   ],
-  "author": "danielkpl2",
+  "author": "Daniel Kasprowicz",
   "license": "MIT",
   "repository": {
     "type": "git",

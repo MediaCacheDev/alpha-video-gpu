@@ -1,7 +1,7 @@
 {
   "name": "react-native-alpha-video-gpu",
   "version": "1.0.0",
-  "description": "Transparent (alpha) animations for React Native as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web.",
+  "description": "Transparent (alpha) animations for React Native on Android, iOS and web, from ASTC texture arrays in KTX2 files. The GPU draws the frames as stored, with Metal, OpenGL ES or WebGL, so dozens play at once with little CPU.",
   "main": "react-native/src/index.js",
   "types": "react-native/src/index.d.ts",
   "files": [
@@ -47,17 +47,25 @@
   "keywords": [
     "react-native",
     "react-native-web",
+    "react-native-component",
+    "fabric",
     "alpha",
+    "alpha-video",
     "transparent-video",
+    "transparent-animation",
     "transparency",
     "animation",
+    "video-player",
     "ktx2",
     "astc",
+    "texture-compression",
+    "gpu",
     "metal",
-    "opengl",
+    "opengl-es",
     "webgl",
     "ios",
-    "android"
+    "android",
+    "web"
   ],
   "author": "Daniel Kasprowicz",
   "license": "MIT",

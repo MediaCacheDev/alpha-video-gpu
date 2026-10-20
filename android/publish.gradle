@@ -22,7 +22,7 @@ afterEvaluate {
 
                 pom {
                     name = artifact
-                    description = project.ext.has('publishDescription') ? project.ext.publishDescription : 'Transparent animations for Android from ASTC texture arrays in KTX2 files, drawn into a TextureView with OpenGL ES 3.0.'
+                    description = project.ext.has('publishDescription') ? project.ext.publishDescription : 'Transparent (alpha) animations for Android from ASTC texture arrays in KTX2 files, drawn into a TextureView with OpenGL ES 3.0. The GPU samples the frames as stored, so dozens play at once with little CPU. Streams files by range, with seeking and offline storage.'
                     url = repoUrl
                     inceptionYear = '2026'
                     licenses {
