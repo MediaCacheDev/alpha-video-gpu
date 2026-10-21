@@ -42,6 +42,12 @@ This library renders videos from KTX2 files that hold an ASTC texture array, one
 - **Streaming playback** for long videos with minimal memory footprint
 - **Uncompressed ASTC streaming** for many concurrent players
 
+### Drawing size
+
+Each frame is stored at one size, without mipmaps (the smaller, pre-filtered copies a GPU uses when it shrinks a texture), and the player samples it with bilinear filtering. At 100%, one texel per pixel on screen, or enlarged, frames look as clean as the source. Shrunk to less than half their size, each pixel on screen comes from the four texels nearest it and the rest are skipped, so edges turn jagged and fine detail sparkles as the clip moves, although the frames themselves are clean. The same clip played as video and scaled down the same way can look smoother.
+
+So draw ASTC at 100% where you can: encode each clip at the size it appears on screen, in physical pixels (a 150 pt view on a 3x screen is 450 px). Down to half size still looks fine.
+
 ---
 
 ## Video Codecs vs GPU Texture Streaming
