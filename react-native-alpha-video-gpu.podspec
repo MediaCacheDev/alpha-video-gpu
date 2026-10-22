@@ -15,12 +15,11 @@ Pod::Spec.new do |s|
 
   # The iOS library (ios/Sources/AlphaVideoGPU, also the Swift package and the alpha-video-gpu
   # pod) and the React Native view. AlphaVideoGpuView.mm compiles the ASTC decoder and zstd by
-  # #include, and alpha_video_gpu_range_source.cpp range-source's reader.
-  s.source_files        = 'ios/Sources/AlphaVideoGPU/**/*.{h,mm}', 'ios/Sources/AlphaVideoGPU/alpha_video_gpu_range_source.cpp',
+  # #include. The range-source add-on is react-native-range-source, which the player finds at runtime.
+  s.source_files        = 'ios/Sources/AlphaVideoGPU/**/*.{h,mm}', 'third_party/range-source/include/*.h',
                           'react-native/ios/**/*.{h,mm}'
   s.public_header_files = 'ios/Sources/AlphaVideoGPU/include/AlphaVideoGPU.h'
-  s.preserve_paths      = 'ios/Sources/AlphaVideoGPU/astc_decomp.cpp', 'third_party/zstd/**/*',
-                          'third_party/range-source/**/*'
+  s.preserve_paths      = 'ios/Sources/AlphaVideoGPU/astc_decomp.cpp', 'third_party/zstd/**/*'
   s.frameworks          = 'Metal', 'MetalKit'
   s.libraries           = 'c++'
   s.pod_target_xcconfig = {

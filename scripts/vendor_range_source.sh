@@ -1,6 +1,7 @@
 #!/bin/bash
-# Copies range-source's native headers (and, until the add-on is its own package, its reader and
-# stores) from a range-source checkout into third_party/range-source, and records its commit there.
+# Copies range-source's native headers (its C interface, and the basic input) from a range-source
+# checkout into third_party/range-source, and records its commit there. The add-on itself is a
+# dependency (dev.mediacache:range-source, the RangeSource SwiftPM product, the range-source pod).
 #
 #   scripts/vendor_range_source.sh [path to range-source]
 #
@@ -24,27 +25,25 @@ SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
 DEST="$PROJECT_DIR/third_party/range-source"
 
 COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
-if [ -n "$(git -C "$SOURCE_DIR" status --porcelain -- native/include native/src)" ]; then
+if [ -n "$(git -C "$SOURCE_DIR" status --porcelain -- native/include)" ]; then
     COMMIT="$COMMIT, with uncommitted changes"
 fi
 
 rm -rf "$DEST/include" "$DEST/src"
-mkdir -p "$DEST/include" "$DEST/src"
+mkdir -p "$DEST/include"
 cp "$SOURCE_DIR"/native/include/*.h "$DEST/include/"
-cp "$SOURCE_DIR"/native/src/*.h "$SOURCE_DIR"/native/src/*.cpp "$DEST/src/"
 cp "$SOURCE_DIR/LICENSE" "$DEST/LICENSE"
 
 cat > "$DEST/README.md" <<EOF
 # range-source (native)
 
-\`include/\` and \`src/\` are \`native/include\` and \`native/src\` from [range-source](https://github.com/MediaCacheDev/range-source), unmodified, at commit \`$COMMIT\`. MIT, by the same author as this repository.
+\`include/\` is \`native/include\` from [range-source](https://github.com/MediaCacheDev/range-source), unmodified, at commit \`$COMMIT\`. MIT, by the same author as this repository.
 
-- \`include/range_source.h\` is the add-on's C interface, a table of functions, with a C++ wrapper over it. The player reads URLs and data sources through it.
+- \`include/range_source.h\` is the add-on's C interface, a table of functions, with a C++ wrapper over it. The player finds the add-on at runtime and reads URLs and data sources through it.
 - \`include/range_source_download.h\` is the basic input, for when the add-on isn't there: a URL downloaded whole into a temporary file, read as it arrives.
-- \`src/\` is the add-on's reader and stores, compiled in until the add-on is its own package.
 
-On Android they compile with the player's native code. On iOS \`ios/Sources/AlphaVideoGPU/alpha_video_gpu_range_source.{h,cpp}\` include them by their path under \`third_party\` and rename their namespace and C symbols, so a copy from another package in the same app can't clash.
+Each player puts the C++ wrappers in a namespace of its own (\`RANGE_SOURCE_CLIENT_NAMESPACE\`), so another player's copy in the same app can't clash.
 
 To update, run \`scripts/vendor_range_source.sh\` against a newer checkout. Its tests live in that repository (\`native/test\`).
 EOF
-echo "Vendored range-source native sources at $COMMIT"
+echo "Vendored range-source's headers at $COMMIT"

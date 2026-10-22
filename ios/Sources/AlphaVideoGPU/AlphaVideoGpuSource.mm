@@ -1,13 +1,17 @@
 /**
  * AlphaVideoGpuSource.mm
- * Range reading for URLs and data sources: the built-in URLSession fetcher, the adapter for an
- * app's AlphaVideoGpuDataSource, and the reader they feed: range-source's, through its C table, or
- * without it the basic input, a download into a temporary file.
+ * Reading URLs and data sources: the built-in URLSession fetcher, and the reader it feeds, the
+ * range-source add-on's through its C table, or without the add-on the basic input, a download
+ * into a temporary file. A data source is read by the add-on, which the player finds at runtime.
  */
 
 #import "AlphaVideoGpuSource.h"
 
-#include "alpha_video_gpu_range_source.h"
+// range-source's C interface and the basic input (third_party/range-source/include), with their
+// C++ wrappers in a namespace of this library's own, as each player that includes them does
+#define RANGE_SOURCE_CLIENT_NAMESPACE avg_rs
+#include "range_source.h"
+#include "range_source_download.h"
 
 #include <condition_variable>
 #include <cstddef>
@@ -368,182 +372,35 @@ private:
     bool cancelled_ = false;
 };
 
-/**
- * Reads through an app's AlphaVideoGpuDataSource in windows of kWindowBytes, asking for the next
- * window when one ends, so that a source never has more than one window to hold.
- */
-class DataSourceUpstream : public avg_rs::Upstream {
-public:
-    static constexpr int64_t kWindowBytes = 4 * 1024 * 1024;
-
-    DataSourceUpstream(id<AlphaVideoGpuDataSource> source, NSURL* url, NSDictionary<NSString*, NSString*>* headers)
-        : source_(source), url_(url), headers_([headers copy]) {}
-
-    ~DataSourceUpstream() override { close(); }
-
-    bool open(int64_t position, avg_rs::SourceInfo& info, std::string& error) override {
-        close();
-        position_ = position;
-        size_ = -1;
-        return startWindow(&info, error);
-    }
-
-    int64_t read(uint8_t* out, int64_t size, std::string& error) override {
-        for (;;) {
-            std::shared_ptr<Pipe> pipe = currentPipe();
-            if (!pipe) {
-                error = "Not open";
-                return -1;
-            }
-            int64_t n = pipe->read(out, size, error);
-            if (n > 0) position_ += n;
-            if (n != 0) return n;
-            // A window shorter than asked for ends at the end of the file
-            if (position_ < windowEnd_ || (size_ >= 0 && position_ >= size_)) return 0;
-            if (!startWindow(nullptr, error)) return -1;
-        }
-    }
-
-    void close() override {
-        id<AlphaVideoGpuCancellable> token;
-        std::shared_ptr<Pipe> pipe;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            token = token_;
-            pipe = std::move(pipe_);
-            token_ = nil;
-        }
-        if (pipe) pipe->cancel();
-        [token cancel];
-    }
-
-    void cancel() override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cancelled_ = true;
-        }
-        close();
-    }
-
-private:
-    bool startWindow(avg_rs::SourceInfo* info, std::string& error) {
-        auto pipe = std::make_shared<Pipe>();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (cancelled_) {
-                error = "Cancelled";
-                return false;
-            }
-            pipe_ = pipe;
-        }
-        windowEnd_ = position_ + kWindowBytes;
-        id<AlphaVideoGpuCancellable> token = [source_ readURL:url_
-                                                       offset:position_
-                                                       length:kWindowBytes
-                                                      headers:headers_ ?: @{}
-                                                     response:^(AlphaVideoGpuDataInfo* dataInfo) {
-            avg_rs::SourceInfo sourceInfo;
-            sourceInfo.size = dataInfo.size >= 0 ? dataInfo.size : -1;
-            sourceInfo.etag = stdString(dataInfo.etag);
-            sourceInfo.lastModified = stdString(dataInfo.lastModified);
-            pipe->respond(sourceInfo);
-        }
-                                                         data:^(NSData* data) {
-            [data enumerateByteRangesUsingBlock:^(const void* bytes, NSRange range, BOOL* stop) {
-                pipe->push(static_cast<const uint8_t*>(bytes), range.length);
-            }];
-        }
-                                                   completion:^(NSError* _Nullable readError) {
-            pipe->finish(readError ? describe(readError) : "");
-        }];
-        bool cancelNow;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            token_ = token;
-            cancelNow = cancelled_;
-        }
-        if (cancelNow) [token cancel];
-
-        avg_rs::SourceInfo got;
-        if (!pipe->waitResponse(got, error)) return false;
-        if (got.size >= 0) size_ = got.size;
-        if (info) *info = got;
-        return true;
-    }
-
-    std::shared_ptr<Pipe> currentPipe() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return pipe_;
-    }
-
-    const id<AlphaVideoGpuDataSource> source_;
-    NSURL* const url_;
-    NSDictionary<NSString*, NSString*>* const headers_;
-    // The fetch thread's
-    int64_t position_ = 0;
-    int64_t windowEnd_ = 0;
-    int64_t size_ = -1;
-    // Also read by cancel(), from any thread
-    std::mutex mutex_;
-    std::shared_ptr<Pipe> pipe_;
-    id<AlphaVideoGpuCancellable> token_ = nil;
-    bool cancelled_ = false;
-};
-
 } // namespace
-
-#pragma mark - Public types
-
-@implementation AlphaVideoGpuDataInfo
-
-- (instancetype)initWithSize:(int64_t)size etag:(NSString *)etag lastModified:(NSString *)lastModified {
-    if ((self = [super init])) {
-        _size = size >= 0 ? size : -1;
-        _etag = [etag copy];
-        _lastModified = [lastModified copy];
-    }
-    return self;
-}
-
-@end
-
-@implementation AlphaVideoGpuDataSources
-
-static NSMutableDictionary<NSString *, id<AlphaVideoGpuDataSource>> *AVGRegisteredSources(void) {
-    static NSMutableDictionary<NSString *, id<AlphaVideoGpuDataSource>> *sources;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        sources = [NSMutableDictionary dictionary];
-    });
-    return sources;
-}
-
-+ (void)registerDataSource:(id<AlphaVideoGpuDataSource>)dataSource name:(NSString *)name {
-    @synchronized (self) {
-        AVGRegisteredSources()[name] = dataSource;
-    }
-}
-
-+ (void)unregisterName:(NSString *)name {
-    @synchronized (self) {
-        [AVGRegisteredSources() removeObjectForKey:name];
-    }
-}
-
-+ (id<AlphaVideoGpuDataSource>)dataSourceNamed:(NSString *)name {
-    @synchronized (self) {
-        return AVGRegisteredSources()[name];
-    }
-}
-
-@end
 
 #pragma mark - AVGSourceReader
 
+/**
+ * The add-on's class, as the player uses it (range-source's RangeSource.h). The player doesn't
+ * link the add-on, so it finds the class by name.
+ */
+@protocol AVGRangeSourceAddOn
+@property (class, nonatomic, readonly) const void *plugin;
++ (BOOL)getUpstream:(void *)upstream
+    forDataSourceNamed:(NSString *)name
+                   URL:(NSURL *)url
+               headers:(NSDictionary<NSString *, NSString *> *)headers;
+@end
+
+static Class<AVGRangeSourceAddOn> AVGRangeSourceClass(void) {
+    Class addOn = NSClassFromString(@"RangeSource");
+    return [addOn respondsToSelector:@selector(plugin)]
+            && [addOn respondsToSelector:@selector(getUpstream:forDataSourceNamed:URL:headers:)]
+        ? addOn : Nil;
+}
+
 static const RangeSourcePlugin *AVGRangeSourcePlugin(void) {
-    // The add-on's reader and stores, built into this library until the add-on is its own package
     static const RangeSourcePlugin *plugin = [] {
-        const RangeSourcePlugin *table = range_source_plugin();
+        Class<AVGRangeSourceAddOn> addOn = AVGRangeSourceClass();
+        if (!addOn) return static_cast<const RangeSourcePlugin *>(nullptr);
+        const RangeSourcePlugin *table = static_cast<const RangeSourcePlugin *>([addOn plugin]);
+        if (!table) return static_cast<const RangeSourcePlugin *>(nullptr);
         if (table->abi != RANGE_SOURCE_ABI) {
             NSLog(@"[AlphaVideoGPU] Not using range-source: its ABI is %d, and this player needs %d", table->abi,
                   RANGE_SOURCE_ABI);
@@ -565,42 +422,47 @@ BOOL AVGRangeSourceAvailable(void) {
 // Caches/alpha-video-gpu on disk, or the memory store's name
 static NSString *const AVGStoreName = @"alpha-video-gpu";
 
+static std::shared_ptr<avg_rs::Store> AVGStore(const RangeSourcePlugin *plugin, NSString *storage, int64_t maxStorageBytes) {
+    if ([storage isEqualToString:@"disk"]) {
+        NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        return avg_rs::Store::disk(plugin, stdString([caches stringByAppendingPathComponent:AVGStoreName]), maxStorageBytes);
+    }
+    if ([storage isEqualToString:@"memory"]) return avg_rs::Store::memory(plugin, stdString(AVGStoreName), maxStorageBytes);
+    return nullptr;
+}
+
 @implementation AVGSourceReader {
     std::shared_ptr<avg_rs::Reader> _reader;
 }
 
 + (instancetype)openURL:(NSURL *)url
-             dataSource:(id<AlphaVideoGpuDataSource>)dataSource
+             dataSource:(NSString *)dataSource
                 headers:(NSDictionary<NSString *, NSString *> *)headers
                 storage:(NSString *)storage
                     key:(NSString *)key
         maxStorageBytes:(int64_t)maxStorageBytes
                   error:(NSString **)error {
-    std::unique_ptr<avg_rs::Upstream> upstream;
+    const RangeSourcePlugin *plugin = AVGRangeSourcePlugin();
+    std::string openError;
+    std::shared_ptr<avg_rs::Reader> reader;
     if (dataSource) {
-        upstream = std::make_unique<DataSourceUpstream>(dataSource, url, headers);
+        RangeSourceUpstream upstream{};
+        if (!plugin || ![AVGRangeSourceClass() getUpstream:&upstream forDataSourceNamed:dataSource URL:url headers:headers]) {
+            if (error) *error = [NSString stringWithFormat:@"No data source is registered as \"%@\" (RangeDataSources)", dataSource];
+            return nil;
+        }
+        reader = avg_rs::RangeReader::open(plugin, upstream, AVGStore(plugin, storage, maxStorageBytes), stdString(key),
+                                           avg_rs::ReaderOptions(), openError);
     } else if ([url.scheme isEqualToString:@"https"] || [url.scheme isEqualToString:@"http"]) {
-        upstream = std::make_unique<URLSessionUpstream>(url, headers);
+        auto upstream = std::make_unique<URLSessionUpstream>(url, headers);
+        reader = plugin
+            ? std::shared_ptr<avg_rs::Reader>(avg_rs::RangeReader::open(plugin, std::move(upstream),
+                                                                        AVGStore(plugin, storage, maxStorageBytes),
+                                                                        stdString(key), avg_rs::ReaderOptions(), openError))
+            : avg_rs::DownloadReader::open(std::move(upstream), stdString(NSTemporaryDirectory()), openError);
     } else {
         if (error) *error = [NSString stringWithFormat:@"Not an http(s) URL: %@", url];
         return nil;
-    }
-
-    std::string openError;
-    std::shared_ptr<avg_rs::Reader> reader;
-    if (const RangeSourcePlugin *plugin = AVGRangeSourcePlugin()) {
-        std::shared_ptr<avg_rs::Store> store;
-        if ([storage isEqualToString:@"disk"]) {
-            NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-            store = avg_rs::Store::disk(plugin, stdString([caches stringByAppendingPathComponent:AVGStoreName]),
-                                        maxStorageBytes);
-        } else if ([storage isEqualToString:@"memory"]) {
-            store = avg_rs::Store::memory(plugin, stdString(AVGStoreName), maxStorageBytes);
-        }
-        reader = avg_rs::RangeReader::open(plugin, std::move(upstream), store, stdString(key),
-                                           avg_rs::ReaderOptions(), openError);
-    } else {
-        reader = avg_rs::DownloadReader::open(std::move(upstream), stdString(NSTemporaryDirectory()), openError);
     }
     if (!reader) {
         if (error) *error = nsString(openError);

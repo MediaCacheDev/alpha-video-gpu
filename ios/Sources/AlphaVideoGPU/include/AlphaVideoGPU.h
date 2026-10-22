@@ -10,74 +10,11 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/** What a data source knows about a file, given at the start of each read. */
-@interface AlphaVideoGpuDataInfo : NSObject
-
-/** The whole file's size in bytes (not what's left after the offset), or -1 if not known. */
-@property (nonatomic, readonly) int64_t size;
-/** An ETag, or any string that changes when the content does. */
-@property (nonatomic, copy, readonly, nullable) NSString *etag;
-/** Last-Modified, for sources without an ETag. */
-@property (nonatomic, copy, readonly, nullable) NSString *lastModified;
-
-- (instancetype)initWithSize:(int64_t)size
-                        etag:(nullable NSString *)etag
-                lastModified:(nullable NSString *)lastModified NS_DESIGNATED_INITIALIZER;
-- (instancetype)init NS_UNAVAILABLE;
-
-@end
-
-/** A read in progress. */
-@protocol AlphaVideoGpuCancellable <NSObject>
-/** Stops the read; the source may still call its handlers, which are then ignored. */
-- (void)cancel;
-@end
-
 /**
- * Where an animation's bytes come from, for an app that fetches, caches or decrypts them itself:
- * the role of AVAssetResourceLoaderDelegate, without the AVFoundation types. The player asks for
- * byte ranges as it plays, a window of a few megabytes at a time, and a new one at a seek.
- *
- * Shared by every player it's registered for, so a read must not depend on the one before.
- */
-@protocol AlphaVideoGpuDataSource <NSObject>
-
-/**
- * Reads `length` bytes of `url` from `offset`, fewer at the end of the file. Call `response`
- * once, then `data` with the bytes in order (any number of times), then `completion` once: nil
- * when done, an error otherwise. A read at or past the end calls `response`, then `completion`
- * with nil. The handlers may be called on any thread, and soon after this returns or much later.
- *
- * @param headers the source's `headers`, for sources that make HTTP requests; may be empty
- */
-- (id<AlphaVideoGpuCancellable>)readURL:(NSURL *)url
-                                 offset:(int64_t)offset
-                                 length:(int64_t)length
-                                headers:(NSDictionary<NSString *, NSString *> *)headers
-                               response:(void (^)(AlphaVideoGpuDataInfo *info))response
-                                   data:(void (^)(NSData *data))data
-                             completion:(void (^)(NSError *_Nullable error))completion
-    NS_SWIFT_NAME(read(url:offset:length:headers:response:data:completion:));
-
-@end
-
-/**
- * Data sources by name, for React Native: register one here, then pass
- * `source={{ uri, dataSource: 'name' }}` to AlphaVideoGpuView. Thread-safe.
- */
-@interface AlphaVideoGpuDataSources : NSObject
-
-/** Registers `dataSource` under `name`, replacing any registered before. */
-+ (void)registerDataSource:(id<AlphaVideoGpuDataSource>)dataSource name:(NSString *)name
-    NS_SWIFT_NAME(register(_:name:));
-+ (void)unregisterName:(NSString *)name NS_SWIFT_NAME(unregister(name:));
-+ (nullable id<AlphaVideoGpuDataSource>)dataSourceNamed:(NSString *)name NS_SWIFT_NAME(dataSource(named:));
-
-@end
-
-/**
- * onError's code for a data source without the range-source add-on, which reads them. Without it
- * a URL is downloaded whole for each play, and storage, maxStorageBytes and cacheKey are ignored.
+ * onError's code for a data source without the range-source add-on, which reads them (the
+ * RangeSource SwiftPM product, the alpha-video-gpu pod's Source subspec, or for React Native
+ * react-native-range-source). Without it a URL is downloaded whole for each play, and storage,
+ * maxStorageBytes and cacheKey are ignored.
  */
 extern NSString *const AlphaVideoGpuErrorNoSourceModule;
 
@@ -92,9 +29,9 @@ extern NSString *const AlphaVideoGpuErrorNoSourceModule;
 @interface AlphaVideoGpuView : MTKView
 
 /**
- * What to play, or nil: https:// or http:// (read by range as it plays, and kept as storage
- * says), file:// or an absolute path, asset://path inside the app bundle, or with dataSource any
- * URL that data source reads.
+ * What to play, or nil: https:// or http:// (with range-source read by range as it plays, and
+ * kept as storage says; without it downloaded whole), file:// or an absolute path, asset://path
+ * inside the app bundle, or with dataSource any URL that data source reads.
  */
 @property (nonatomic, copy, nullable) NSString *source;
 /**
@@ -104,7 +41,10 @@ extern NSString *const AlphaVideoGpuErrorNoSourceModule;
 @property (nonatomic, copy, nullable) NSString *cacheKey;
 /** Sent with every request for an http(s) source, and given to a data source. */
 @property (nonatomic, copy, nullable) NSDictionary<NSString *, NSString *> *headers;
-/** Reads the source through the data source registered under this name (AlphaVideoGpuDataSources). */
+/**
+ * Reads the source through the data source registered under this name with range-source's
+ * RangeDataSources. Needs the range-source add-on.
+ */
 @property (nonatomic, copy, nullable) NSString *dataSource;
 /**
  * Where a URL's or data source's bytes are kept between plays: "disk" (Caches/alpha-video-gpu),

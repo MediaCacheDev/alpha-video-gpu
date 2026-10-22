@@ -35,6 +35,16 @@ static_assert(AVGSourceReaderPending == AVG_ZSTD_READ_PENDING, "a pending read m
 
 #define AVG_VLOG(fmt, ...) do { if (self.verbose) NSLog(@"AlphaVideoGpuView: " fmt, ##__VA_ARGS__); } while (0)
 
+static void AVGWarnWithoutAddOn(void)
+{
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    NSLog(@"[AlphaVideoGPU] range-source isn't installed (the RangeSource SwiftPM product, the alpha-video-gpu pod's "
+          @"Source subspec, or for React Native npm i react-native-range-source): URLs are downloaded whole for each "
+          @"play, without range requests, storage, maxStorageBytes or cacheKey");
+  });
+}
+
 #pragma mark - Source resolution
 
 static BOOL AVGIsRemote(NSString *uri) {
@@ -502,25 +512,18 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   BOOL readsRanges = dataSourceName != nil || AVGIsRemote(uri);
   if (readsRanges && !AVGRangeSourceAvailable()) {
     if (dataSourceName) {
-      [self notifyError:[NSString stringWithFormat:@"The data source \"%@\" needs the range-source add-on, which the "
-                                                   @"app's build leaves out", dataSourceName]
+      [self notifyError:[NSString stringWithFormat:@"The data source \"%@\" needs the range-source add-on (the "
+                                                   @"RangeSource SwiftPM product, the alpha-video-gpu pod's Source "
+                                                   @"subspec, or for React Native react-native-range-source), which "
+                                                   @"the app doesn't include", dataSourceName]
                    code:AlphaVideoGpuErrorNoSourceModule];
       return;
     }
-    [self warnIfStorageWithoutAddOn];
-  }
-  id<AlphaVideoGpuDataSource> dataSource = nil;
-  if (dataSourceName) {
-    dataSource = [AlphaVideoGpuDataSources dataSourceNamed:dataSourceName];
-    if (!dataSource) {
-      [self notifyError:[NSString stringWithFormat:@"No data source is registered as \"%@\" (AlphaVideoGpuDataSources)",
-                                                   dataSourceName]];
-      return;
-    }
+    AVGWarnWithoutAddOn();
   }
   NSDictionary<NSString *, NSString *> *headers = _playingHeaders;
   // auto: the disk for URLs; a data source's caching is its own
-  NSString *storage = ![self.storage isEqualToString:@"auto"] ? self.storage : dataSource ? @"none" : @"disk";
+  NSString *storage = ![self.storage isEqualToString:@"auto"] ? self.storage : dataSourceName ? @"none" : @"disk";
   NSString *key = self.cacheKey.length > 0 ? self.cacheKey : uri;
   int64_t maxStorageBytes = self.maxStorageBytes > 0 ? self.maxStorageBytes : kAVGDefaultMaxStorageBytes;
   AVG_VLOG(@"Resolving source %@", uri);
@@ -532,7 +535,7 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
     if (readsRanges) {
       NSURL *url = [NSURL URLWithString:uri];
       reader = url ? [AVGSourceReader openURL:url
-                                   dataSource:dataSource
+                                   dataSource:dataSourceName
                                       headers:headers
                                       storage:storage
                                           key:key
@@ -600,18 +603,6 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   _isSourceLoading = NO;
   NSLog(@"AlphaVideoGpuView: Error: %@", error);
   if (self.onError) self.onError(error ?: @"Unknown error", code);
-}
-
-- (void)warnIfStorageWithoutAddOn
-{
-  BOOL set = ![self.storage isEqualToString:@"auto"] || self.maxStorageBytes > 0 || self.cacheKey.length > 0;
-  static dispatch_once_t once;
-  if (set) {
-    dispatch_once(&once, ^{
-      NSLog(@"[AlphaVideoGPU] storage, maxStorageBytes and cacheKey need the range-source add-on, which the app's "
-            @"build leaves out; URLs are downloaded whole for each play instead");
-    });
-  }
 }
 
 - (void)setupMetal

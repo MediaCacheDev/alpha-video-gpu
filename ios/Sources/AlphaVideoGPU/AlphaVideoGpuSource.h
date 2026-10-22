@@ -27,12 +27,13 @@ static const int64_t AVGSourceReaderPending = -2;
  * Opens the source at 0 to learn its size and version, unless the store holds it whole. Blocks
  * on the network, so not on the main queue.
  *
- * @param dataSource nil for the built-in URLSession fetcher (http and https only)
- * @param storage "disk" (Caches/alpha-video-gpu), "memory" or "none"
- * @param key what the store keeps the file under
+ * @param dataSource the name of a data source registered with the add-on's RangeDataSources; nil
+ * for the built-in URLSession fetcher (http and https only)
+ * @param storage "disk" (Caches/alpha-video-gpu), "memory" or "none"; with the add-on
+ * @param key what the store keeps the file under; with the add-on
  */
 + (nullable instancetype)openURL:(NSURL *)url
-                      dataSource:(nullable id<AlphaVideoGpuDataSource>)dataSource
+                      dataSource:(nullable NSString *)dataSource
                          headers:(NSDictionary<NSString *, NSString *> *)headers
                          storage:(NSString *)storage
                              key:(NSString *)key

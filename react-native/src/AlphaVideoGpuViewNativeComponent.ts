@@ -12,7 +12,8 @@ import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNati
 
 /**
  * Where to load from:
- * - `https://…` / `http://…`: read by range as it plays, and kept as `storage` says
+ * - `https://…` / `http://…`: with react-native-range-source read by range as it plays, and kept
+ *   as `storage` says; without it downloaded whole
  * - `file:///abs/path` or `/abs/path`: read in place
  * - `asset://relative/path`: Android APK `assets/`, the iOS app bundle, or the site root on web
  * - Android only: `content://…`, or a res/raw name (what `require()` resolves to in a release build)
@@ -24,7 +25,7 @@ export interface SourceType {
   cacheKey?: string;
   /** Sent with every request for the URL, e.g. Authorization; given to a `dataSource` too */
   headers?: Record<string, string>;
-  /** A data source registered in native code under this name (AlphaVideoGpuDataSources) */
+  /** A data source registered in native code under this name (react-native-range-source's RangeDataSources) */
   dataSource?: string;
 }
 

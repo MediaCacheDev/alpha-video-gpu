@@ -303,7 +303,13 @@ public:
     static std::shared_ptr<RangeReader> open(const RangeSourcePlugin* plugin, std::unique_ptr<Upstream> upstream,
                                              const std::shared_ptr<Store>& store, const std::string& key,
                                              const ReaderOptions& options, std::string& error) {
-        const RangeSourceUpstream c = Upstream::toC(std::move(upstream));
+        return open(plugin, Upstream::toC(std::move(upstream)), store, key, options, error);
+    }
+
+    /** Over an upstream already in C, such as the add-on's for an app's data source; owns it from here on. */
+    static std::shared_ptr<RangeReader> open(const RangeSourcePlugin* plugin, const RangeSourceUpstream& c,
+                                             const std::shared_ptr<Store>& store, const std::string& key,
+                                             const ReaderOptions& options, std::string& error) {
         RangeSourceReaderOptions o{};
         o.structSize = sizeof(o);
         o.blockSize = options.blockSize;
