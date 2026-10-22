@@ -163,12 +163,14 @@ On devices and browsers without hardware ASTC support (iOS Simulator, Android Em
 
 ### React Native
 
-**npm**, package `react-native-alpha-video-gpu`:
+**npm**, package `react-native-alpha-video-gpu`, with [range-source](#streaming-and-storage) for URLs:
 
 ```bash
-npm install react-native-alpha-video-gpu
+npm install react-native-alpha-video-gpu react-native-range-source
 cd ios && pod install
 ```
+
+`react-native-range-source` reads URLs by range, keeps them on disk or in memory, and reads [data sources](#data-sources). React Native only links an app's own dependencies, so it's in the install line rather than a dependency of the player. Without it, a URL is downloaded whole for each play ([Without range-source](#without-range-source)). One install serves `react-native-alpha-video` too.
 
 ```tsx
 import { AlphaVideoGpuView } from 'react-native-alpha-video-gpu';
@@ -211,7 +213,15 @@ dependencies {
 }
 ```
 
-To read videos through a Media3 `DataSource.Factory`, add `dev.mediacache:alpha-video-gpu-media3` too ([Data sources](#data-sources)).
+It brings [range-source](https://github.com/MediaCacheDev/range-source) (`dev.mediacache:range-source`, about 320 KB per architecture), which reads URLs by range and keeps them between plays. To leave it out ([Without range-source](#without-range-source)):
+
+```gradle
+implementation('dev.mediacache:alpha-video-gpu:1.0.0') {
+    exclude group: 'dev.mediacache', module: 'range-source'
+}
+```
+
+To read videos through a Media3 `DataSource.Factory`, add `dev.mediacache:range-source-media3` ([Data sources](#data-sources)).
 
 `AlphaVideoGpuView` is a `TextureView` in `dev.mediacache.alphavideo.gpu`. It takes the same sources and options as the React Native component, through setters:
 
@@ -236,7 +246,7 @@ view.setPlayerCallback(object : AlphaVideoGpuView.PlayerCallback {
     override fun onStateChange(state: String) {}
     override fun onFrameUpdate(frame: Int, totalFrames: Int) {}
     override fun onFinished() {}
-    override fun onError(error: String) {}
+    override fun onError(error: String, code: String?) {}  // code: AlphaVideoGpuView.ERROR_NO_SOURCE_MODULE, or null
 })
 view.setSource("https://example.com/video.ktx2")
 container.addView(view)
@@ -262,6 +272,8 @@ pod 'alpha-video-gpu', '1.0.0'
 
 The module is `AlphaVideoGPU` either way.
 
+Both bring [range-source](https://github.com/MediaCacheDev/range-source), which reads URLs by range and keeps them between plays: the pod's `Source` subspec, and the package's default trait, `Source` (Swift 6.1, Xcode 16.3 or later). To leave it out ([Without range-source](#without-range-source)), take the pod's core alone, `pod 'alpha-video-gpu', '1.0.0', :subspecs => ['Core']`. From a package, depend on the player with `traits: []`. An Xcode app project can't choose a package's traits, so an app that adds the package in Xcode always has range-source.
+
 `AlphaVideoGpuView` is an Objective-C `MTKView`, so it works from Swift and Objective-C:
 
 ```swift
@@ -286,7 +298,7 @@ view.onLoad = { width, height, frameCount, frameRate in }
 view.onStateChange = { state in }
 view.onFrameUpdate = { frame, totalFrames in }
 view.onFinished = { }
-view.onError = { error in }
+view.onError = { error, code in }      // code: AlphaVideoGpuErrorNoSourceModule, or nil
 view.source = "https://example.com/video.ktx2"  // loads on the next main-queue turn
 container.addSubview(view)
 ```
@@ -353,7 +365,7 @@ Sizes outside their range are clamped to it. Where the frames live, and which si
 
 | Form | iOS | Android | Web | Notes |
 |------|-----|---------|-----|-------|
-| `https://…`, `http://…` | ✓ | ✓ | ✓ | Read by range requests as it plays, and kept between plays; see [Streaming and storage](#streaming-and-storage). `source.headers` go with every request. |
+| `https://…`, `http://…` | ✓ | ✓ | ✓ | Read by range requests as it plays, and kept between plays; see [Streaming and storage](#streaming-and-storage). Without range-source on Android and iOS, downloaded whole. `source.headers` go with every request. |
 | anything, with `source.dataSource` | ✓ | ✓ | — | Read by a data source the app registered under that name; see [Data sources](#data-sources). On the web, pass a byte source instead (below). |
 | `file:///abs/path`, `/abs/path` | ✓ | ✓ | — | Read in place. |
 | `asset://path/in/bundle` | ✓ | ✓ | ✓ | Android: APK `assets/`. iOS: the app bundle's resource folder. Web: the site root (`/path/in/bundle`). |
@@ -366,7 +378,7 @@ On the web, `source` can also be a `Blob` or `File`, or a byte source, `{ size, 
 
 #### Streaming and storage
 
-An http(s) source is read by HTTP range requests as it plays, through the same reader on every platform ([range-source](https://github.com/MediaCacheDev/range-source)). On Android and iOS:
+An http(s) source is read by HTTP range requests as it plays, through the same reader on every platform ([range-source](https://github.com/MediaCacheDev/range-source)). It's included on Android and iOS, and in React Native it's `react-native-range-source` ([Installation](#installation)). On Android and iOS:
 
 - With `stream` on and a zstd file (the encoder's default), playback starts after a few small reads: the header, and the seek table at the end of the level. The level is then read from its start, 256 KB at a time as the decoder needs it, and a seek reads from the seek point before its target. A file written as one zstd stream has no seek table, so a far seek reads on from where the decoder is.
 - An uncompressed file, and any file with `stream` off, is read whole before it plays, in one request.
@@ -388,6 +400,16 @@ Storage is partial: it keeps the ranges played so far, and a clip held whole pla
 
 Local files, bundled files, `content://` URIs and `res/raw` resources are read in place and never stored. On react-native-web, `'disk'` is the browser's storage, as `'auto'` (OPFS, else IndexedDB); the web package also takes `'opfs'`, `'indexeddb'`, `'cache'` and stores of an app's own ([Web Support](#web-support)).
 
+#### Without range-source
+
+An app that leaves range-source out (to have no network or disk code of ours, or with its own caching) still plays local files, bundled files, `content://` URIs and `res/raw` resources as before. A URL is downloaded whole, with one request from the start, into a temporary file, and plays as it arrives:
+- a seek past what has arrived waits for it;
+- loops and seeks back read the file;
+- nothing is kept between plays, so a replay downloads it again;
+- `headers` are sent.
+
+`storage`, `maxStorageBytes` and `cacheKey` have no effect, and the player logs once that range-source isn't installed. A data source reports `onError` with the code `NO_SOURCE_MODULE` (`AlphaVideoGpuView.ERROR_NO_SOURCE_MODULE` on Android, `AlphaVideoGpuErrorNoSourceModule` on iOS), with a message naming the add-on.
+
 #### Cache keys
 
 Stored clips are named by `cacheKey` if you give one, otherwise by the URL. Set `cacheKey` when the URL changes while the file doesn't (presigned URLs), so a new URL still finds the stored copy, and doesn't reload a view that is already playing it:
@@ -408,42 +430,44 @@ An app that fetches, caches or decrypts the bytes itself registers a data source
 
 A data source's bytes aren't stored by default, since it usually caches them itself; `storage="disk"` or `"memory"` stores them too. On the native views, call `setDataSource("name")` (Android) or set `dataSource = "name"` (iOS) before the source, with `setHeaders` or `headers`.
 
-The interfaces have the same shape as the WebM player's ([alpha-video](https://github.com/MediaCacheDev/alpha-video)), so one class can serve both players through a small adapter. They are separate types, so that the two packages version independently. Register a source with each player that should use it.
+Data sources are range-source's, so they need it ([Without range-source](#without-range-source)), and one registered once serves this player and the WebM player ([alpha-video](https://github.com/MediaCacheDev/alpha-video)):
 
-**Android:** implement `dev.mediacache.alphavideo.gpu.AlphaVideoGpuDataSource`. `open(uri, position, headers)` starts a read at `position` and returns the file's size and version (`new Info(size, etag, lastModified)`). `read` and `close` follow, and `cancel` (optional) stops a read blocked on the network from another thread. Register a factory, which makes one per player:
+**Android:** implement `dev.mediacache.rangesource.RangeDataSource`. `open(uri, position, headers)` starts a read at `position` and returns the file's size and version (`new Info(size, etag, lastModified)`). `read` and `close` follow, and `cancel` (optional) stops a read blocked on the network from another thread. Register a factory, which makes one per player:
 
 ```kotlin
-AlphaVideoGpuDataSources.register("mine") { MyDataSource() }
+RangeDataSources.register("mine") { MyDataSource() }
 ```
 
-To read through a Media3 `DataSource.Factory` (OkHttp, Cronet, a `CacheDataSource`), add the adapter, which uses the app's own `androidx.media3:media3-datasource` (compiled against 1.8.0):
+To read through a Media3 `DataSource.Factory` (OkHttp, Cronet, a `CacheDataSource`), add range-source's adapter, which uses the app's own `androidx.media3:media3-datasource` (compiled against 1.8.0):
 
 ```gradle
-implementation 'dev.mediacache:alpha-video-gpu-media3:1.0.0'
+implementation 'dev.mediacache:range-source-media3:1.0.0'
 ```
 
 ```kotlin
-AlphaVideoGpuDataSources.register("media3", Media3AlphaVideoGpuDataSource.factory(dataSourceFactory))
+RangeDataSources.register("media3", Media3RangeDataSource.factory(dataSourceFactory))
 ```
 
-The built-in fetcher is public too, to register with other timeouts or a user agent: `AlphaVideoGpuHttpDataSource.Factory().setConnectTimeoutMs(…).setReadTimeoutMs(…).setUserAgent(…)`.
+The built-in fetcher is public too, to register with other timeouts or a user agent: `RangeHttpDataSource.Factory().setConnectTimeoutMs(…).setReadTimeoutMs(…).setUserAgent(…)`.
 
-**iOS:** conform to `AlphaVideoGpuDataSource`. Each call reads a window of a few megabytes: call `response` once with the file's size and version, then `data` with the bytes in order, then `completion`. One instance serves every player, so a read mustn't depend on the one before:
+**iOS:** conform to `RangeDataSource`. Each call reads a window of a few megabytes: call `response` once with the file's size and version, then `data` with the bytes in order, then `completion`. One instance serves every player, so a read mustn't depend on the one before:
 
 ```swift
-final class MyDataSource: NSObject, AlphaVideoGpuDataSource {
+import RangeSource
+
+final class MyDataSource: NSObject, RangeDataSource {
     func read(url: URL, offset: Int64, length: Int64, headers: [String: String],
-              response: @escaping (AlphaVideoGpuDataInfo) -> Void,
+              response: @escaping (RangeDataInfo) -> Void,
               data: @escaping (Data) -> Void,
-              completion: @escaping (Error?) -> Void) -> AlphaVideoGpuCancellable {
-        // response(AlphaVideoGpuDataInfo(size: total, etag: etag, lastModified: nil)), data(…), completion(nil)
+              completion: @escaping (Error?) -> Void) -> RangeCancellable {
+        // response(RangeDataInfo(size: total, etag: etag, lastModified: nil)), data(…), completion(nil)
     }
 }
 
-AlphaVideoGpuDataSources.register(MyDataSource(), name: "mine")
+RangeDataSources.register(MyDataSource(), name: "mine")
 ```
 
-The WebM player's protocol has the same method, so one Swift class can't conform to both. Use two small classes that share the fetching code.
+**React Native:** register in native code, as above, in `MainApplication` (Android) and `AppDelegate` (iOS, `import RangeSource`).
 
 #### Bundled with `require()`
 
@@ -822,7 +846,7 @@ Not ideal for:
 | `onStateChange` | `({ nativeEvent: { state } }) => void` | — | `state` is `"loading"`, `"ready"`, `"playing"`, `"paused"` or `"stopped"` |
 | `onFrameUpdate` | `({ nativeEvent: { frame, totalFrames } }) => void` | — | After a seek, and for every frame with `enableFrameEvents` |
 | `onFinished` | `() => void` | — | A non-looping video reached its last frame |
-| `onError` | `({ nativeEvent: { error, code? } }) => void` | — | Loading or playback failed. `code` is set on web only: `'ASTC_UNSUPPORTED'` or `'WEBGL_UNSUPPORTED'` |
+| `onError` | `({ nativeEvent: { error, code? } }) => void` | — | Loading or playback failed. `code` is set for errors an app may handle: `'NO_SOURCE_MODULE'` on Android and iOS ([Without range-source](#without-range-source)), `'ASTC_UNSUPPORTED'` or `'WEBGL_UNSUPPORTED'` on the web |
 
 The events have the same shape on Android, iOS and web. Playback is controlled with props (`paused`, `autoPlay`, a new `source`) and with the ref (see [Usage](#usage)).
 
@@ -832,14 +856,13 @@ The events have the same shape on Android, iOS and web. Playback is controlled w
 
 | Path | What | Package |
 |---|---|---|
-| `android/` | The Android library: `AlphaVideoGpuView`, source loading and data sources, and the JNI code for zstd, the range reader, the software ASTC decoder and texture uploads (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
-| `android/media3/` | The adapter from a Media3 `DataSource.Factory` to a data source | `dev.mediacache:alpha-video-gpu-media3` |
-| `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++) and data sources, with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
+| `android/` | The Android library: `AlphaVideoGpuView`, source loading, and the JNI code for zstd, reading through range-source or the basic download, the software ASTC decoder and texture uploads (`src/main/cpp`). Builds on its own (`./gradlew` in that folder) | `dev.mediacache:alpha-video-gpu` |
+| `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++) and source loading, with its public header in `include/`. `ios/Tests` has its tests with and without range-source | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
 | `third_party/zstd/` | zstd 1.4.9 (single-file library), compiled into both native libraries | |
-| `third_party/range-source/` | The C interface and basic input of [range-source](https://github.com/MediaCacheDev/range-source), and its C++ reader and stores, compiled into both native libraries. `scripts/vendor_range_source.sh` updates it | |
+| `third_party/range-source/` | The headers of [range-source](https://github.com/MediaCacheDev/range-source): its C interface, which the players find the add-on through at runtime, and the basic input. `scripts/vendor_range_source.sh` updates it | |
 | `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `react-native-alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
 | `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there builds `dist/` | npm `alpha-video-gpu-web` |
-| `scripts/publish-android.sh` | `local` publishes the Android library and the Media3 adapter to `~/.m2`; `central` signs them and uploads them to the Maven Central Portal (see the script for the variables) | |
+| `scripts/publish-android.sh` | `local` publishes the Android library to `~/.m2`; `central` signs it and uploads it to the Maven Central Portal (see the script for the variables) | |
 
 A clone builds with no setup step, since the decoders are in the repo (`third_party/` for the native libraries, `web/src/` for the web package):
 
@@ -849,7 +872,7 @@ cd android && ./gradlew assembleRelease               # Android: the AAR (needs 
 xcodebuild -scheme AlphaVideoGPU -destination 'generic/platform=iOS Simulator' build   # iOS, from the repo root
 ```
 
-A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
+A release is the tag `v<version>`: Swift Package Manager resolves it, and `alpha-video-gpu.podspec` fetches its sources from it. After pushing the tag, `pod trunk push alpha-video-gpu.podspec` (only while trunk accepts new versions). [range-source](https://github.com/MediaCacheDev/range-source) is released first on every channel, since the players depend on it. Publish `alpha-video-gpu-web` to npm before `react-native-alpha-video-gpu`, which depends on it.
 
 ## Tests
 
@@ -860,6 +883,7 @@ The fixtures in `tests/fixtures/` are test cards from the tester app, encoded to
 | Web, under Node | `cd web && npm test` | The KTX2 parser, the seek table, streaming reads and seeks in zstd and uncompressed files, and every frame of the fixtures through the software ASTC decoder, read back by its frame code |
 | Android, on the host | `cd android && ./gradlew testReleaseUnitTest` | The seek table parser (JUnit) |
 | iOS, on the host | `clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test` | The seek table, reads and seeks (`zstd_seek.h`), from the repository root |
+| iOS simulator | `xcodebuild test -scheme AlphaVideoGPU -destination 'platform=iOS Simulator,name=iPhone 16 Pro'`, and the same with `-scheme WithoutRangeSource-Package` in `ios/Tests/WithoutRangeSource` | With range-source (`SourceTests`), a data source registered with it. Without it (a package depending on this one with `traits: []`), a file plays and a data source reports `NO_SOURCE_MODULE`. `RANGE_SOURCE_PATH` points them at a range-source checkout instead of its release |
 | Web, in a browser | `web/test/browser/index.html`, see below | Every streaming and memory mode on every fixture in a real browser: frame codes after seeks and in playback, from the canvas |
 | Android and iOS devices | the tester app's `test:pixels` and `test:streaming` | Every mode and memory strategy on every card, pixel by pixel, and streaming; see below |
 
@@ -882,12 +906,16 @@ npm run test:pixels -- --platform android --player gpu --playback      # playbac
 npm run test:streaming -- --platform android --player gpu  # range requests, seek table, storage, headers, Media3 data source
 ```
 
+The tester app installs `react-native-range-source`. Without it (`npm uninstall react-native-range-source`, then rebuild), `test:streaming` checks the basic input instead: one download per play, and `NO_SOURCE_MODULE` for a data source.
+
 `npm pack` here (and in `web/`) makes the tarballs the tester app installs; rebuild its app after installing them. Everything, in order:
 
 ```bash
 (cd web && npm test)
 (cd android && ./gradlew testReleaseUnitTest)
 clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test
+xcodebuild test -scheme AlphaVideoGPU -destination 'platform=iOS Simulator,name=iPhone 16 Pro'
+(cd ios/Tests/WithoutRangeSource && xcodebuild test -scheme WithoutRangeSource-Package -destination 'platform=iOS Simulator,name=iPhone 16 Pro')
 # the browser page, with ?astc=off too; then, in alpha-video-test: test:pixels and test:streaming with --player gpu on each platform
 ```
 

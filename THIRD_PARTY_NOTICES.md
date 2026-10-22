@@ -9,6 +9,6 @@ The code in this repository is MIT-licensed (see `LICENSE`), apart from the comp
 
 Licence texts: `third_party/zstd/LICENSE` (Zstandard's BSD licence) and `third_party/licenses/Apache-2.0.txt`.
 
-The native libraries also compile in the C++ reader of [range-source](https://github.com/MediaCacheDev/range-source) (`third_party/range-source`), MIT-licensed by the same author, which reads files by range and keeps them between plays. The Media3 adapter, `dev.mediacache:alpha-video-gpu-media3`, contains only this repository's code and uses the app's own Media3.
+The native libraries carry the headers of [range-source](https://github.com/MediaCacheDev/range-source) (`third_party/range-source/include`): its C interface, and the basic input that downloads a URL when the add-on isn't installed. MIT-licensed, by the same author. The add-on itself is a separate package with its own `LICENSE`.
 
 The web package, [`alpha-video-gpu-web`](web), bundles [zstddec](https://github.com/donmccurdy/zstddec); see [`web/THIRD_PARTY_NOTICES.md`](web/THIRD_PARTY_NOTICES.md).
