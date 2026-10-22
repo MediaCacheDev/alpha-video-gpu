@@ -74,10 +74,6 @@ android {
 repositories {
     google()
     mavenCentral()
-    // range-source from scripts/publish-android.sh local in its repository, before it's on Maven Central
-    mavenLocal {
-        content { includeModule 'dev.mediacache', 'range-source' }
-    }
 }
 
 dependencies {

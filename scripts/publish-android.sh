@@ -3,9 +3,8 @@
 # publish-android.sh [local|central]
 #
 # Builds the standalone Android library in android/ and publishes it as
-# dev.mediacache:alpha-video-gpu:<version>, the version in android/build.gradle. Needs
-# dev.mediacache:range-source, which the player depends on, published first (or in ~/.m2, from
-# range-source's scripts/publish-android.sh local).
+# dev.mediacache:alpha-video-gpu:<version>, the version in android/build.gradle.
+# dev.mediacache:range-source, which the player depends on, comes from Maven Central.
 #
 #   local    publishToMavenLocal (~/.m2), unsigned unless a key is set. The default.
 #   central  signs, bundles and uploads to the Maven Central Portal. Needs:
