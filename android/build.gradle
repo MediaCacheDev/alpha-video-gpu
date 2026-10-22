@@ -30,6 +30,7 @@ android {
 
     defaultConfig {
         minSdk safeExtGet('minSdkVersion', 24)
+        consumerProguardFiles 'consumer-rules.pro'
 
         externalNativeBuild {
             cmake {
@@ -65,9 +66,16 @@ android {
 repositories {
     google()
     mavenCentral()
+    // range-source from scripts/publish-android.sh local in its repository, before it's on Maven Central
+    mavenLocal {
+        content { includeModule 'dev.mediacache', 'range-source' }
+    }
 }
 
 dependencies {
+    // Included by default and removable: an app can exclude it, and the player then falls back
+    // to the basic input (RangeSourceLink)
+    api 'dev.mediacache:range-source:1.0.0'
     implementation 'androidx.annotation:annotation:1.9.1'
     // JVM tests of the pure-Java parts (./gradlew test), on the fixtures in ../tests/fixtures
     testImplementation 'junit:junit:4.13.2'

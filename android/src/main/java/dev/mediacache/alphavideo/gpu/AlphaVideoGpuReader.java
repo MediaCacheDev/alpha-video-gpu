@@ -10,7 +10,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A native reader over an {@link AlphaVideoGpuDataSource}: with the range-source add-on, blocks in
+ * A native reader over a {@link Fetcher}: with the range-source add-on, blocks in
  * memory and in an optional store, fetched on the reader's own thread; without it, the file
  * downloaded whole into a temporary file, read as it arrives. One playback owns it, opens it on its
  * worker thread and closes it there; a zstd stream over it keeps its own native reference.
@@ -47,7 +47,7 @@ final class AlphaVideoGpuReader {
      * @param key what the store calls this file
      * @param downloadDir where the file is downloaded without the add-on
      */
-    static AlphaVideoGpuReader open(AlphaVideoGpuDataSource source, Uri uri, Map<String, String> headers,
+    static AlphaVideoGpuReader open(Fetcher source, Uri uri, Map<String, String> headers,
                                     Storage storage, String storeDir, String key, long maxStorageBytes,
                                     String downloadDir) throws IOException {
         String[] error = new String[1];
@@ -120,7 +120,7 @@ final class AlphaVideoGpuReader {
     }
 
     /**
-     * The data source as the native reader calls it, on the reader's fetch thread, with failures
+     * The fetcher as the native reader calls it, on the reader's fetch thread, with failures
      * as return values.
      */
     static final class Upstream {
@@ -132,7 +132,7 @@ final class AlphaVideoGpuReader {
             return t;
         });
 
-        private final AlphaVideoGpuDataSource source;
+        private final Fetcher source;
         private final Uri uri;
         private final Map<String, String> headers;
         // Read by native code after open() and failures
@@ -140,7 +140,7 @@ final class AlphaVideoGpuReader {
         String lastModified;
         String error;
 
-        Upstream(AlphaVideoGpuDataSource source, Uri uri, Map<String, String> headers) {
+        Upstream(Fetcher source, Uri uri, Map<String, String> headers) {
             this.source = source;
             this.uri = uri;
             this.headers = headers;
@@ -149,7 +149,7 @@ final class AlphaVideoGpuReader {
         /** The file's size, -1 if not known, or -2 with {@link #error} set. */
         long open(long position) {
             try {
-                AlphaVideoGpuDataSource.Info info = source.open(uri, position, headers);
+                Fetcher.Info info = source.open(uri, position, headers);
                 etag = info.etag;
                 lastModified = info.lastModified;
                 return info.size;

@@ -1,5 +1,5 @@
 // Readers over a Java AlphaVideoGpuDataSource (AlphaVideoGpuReader and its Upstream), and the
-// range-source add-on's table (RangeSourceLink)
+// check of the range-source add-on's table (RangeSourceLink)
 
 #include "source_jni.h"
 
@@ -167,8 +167,9 @@ std::shared_ptr<avg_rs::Reader> readerFromReference(jlong reference) {
 extern "C" {
 
 JNIEXPORT jlong JNICALL
-Java_dev_mediacache_alphavideo_gpu_RangeSourceLink_nativeBuiltInPlugin(JNIEnv*, jclass) {
-    const RangeSourcePlugin* plugin = range_source_plugin();
+Java_dev_mediacache_alphavideo_gpu_RangeSourceLink_nativeUsablePlugin(JNIEnv*, jclass, jlong address) {
+    const auto* plugin = reinterpret_cast<const RangeSourcePlugin*>(address);
+    if (!plugin) return 0;
     if (plugin->abi != RANGE_SOURCE_ABI) {
         LOGE("Not using range-source: its ABI is %d, and this player needs %d", plugin->abi, RANGE_SOURCE_ABI);
         return 0;

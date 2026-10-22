@@ -1,6 +1,4 @@
-// Maven publication for dev.mediacache:alpha-video-gpu, and for alpha-video-gpu-media3
-// (media3/build.gradle sets publishArtifactId, publishDescription and publishBundlesNatives before
-// applying this). Run it through scripts/publish-android.sh.
+// Maven publication for dev.mediacache:alpha-video-gpu. Run it through scripts/publish-android.sh.
 //
 // Signing reads ORG_GRADLE_PROJECT_signingInMemoryKey (armored secret key), …KeyPassword and
 // optionally …KeyId. Without a key the artifacts are left unsigned, which is enough for
@@ -61,7 +59,6 @@ afterEvaluate {
         repositories {
             maven {
                 name = 'staging'
-                // Both artifacts, so that one bundle uploads them together
                 url = rootProject.layout.buildDirectory.dir('staging-repo')
             }
         }

@@ -68,8 +68,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
      * ({@link #setDataSource}) without the range-source add-on, which reads them.
      */
     public static final String ERROR_NO_SOURCE_MODULE = "NO_SOURCE_MODULE";
-    // Storage set without the add-on is warned of once per process
-    private static final AtomicBoolean warnedStorageWithoutAddOn = new AtomicBoolean(false);
+    // A URL played without the add-on is warned of once per process
+    private static final AtomicBoolean warnedWithoutAddOn = new AtomicBoolean(false);
     
     // GL constants - ASTC formats for all 14 block sizes
     private static final int GL_COMPRESSED_RGBA_ASTC_4x4_KHR   = 0x93B0;
@@ -385,8 +385,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     }
 
     /**
-     * Reads the source through the data source registered under this name
-     * ({@link AlphaVideoGpuDataSources#register}), whatever its scheme; null for the built-in ones.
+     * Reads the source through the data source registered under this name with the range-source
+     * add-on ({@code dev.mediacache.rangesource.RangeDataSources.register}), whatever its scheme;
+     * null for the built-in ones.
      */
     public void setDataSource(@Nullable String name) {
         mDataSource = name == null || name.isEmpty() ? null : name;
@@ -1964,21 +1965,21 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         if (!RangeSourceLink.available()) {
             if (appSource) {
                 throw new NoSourceModuleException("The data source \"" + dataSourceName + "\" needs the "
-                    + "range-source add-on (dev.mediacache:range-source), which the app's build leaves out");
+                    + "range-source add-on (dev.mediacache:range-source; for React Native, react-native-range-source), "
+                    + "which the app doesn't include");
             }
-            warnIfStorageWithoutAddOn(cacheKey);
+            warnWithoutAddOn();
         }
 
-        final AlphaVideoGpuDataSource source;
+        final Fetcher source;
         if (appSource) {
-            AlphaVideoGpuDataSource.Factory factory = AlphaVideoGpuDataSources.get(dataSourceName);
-            if (factory == null) {
+            source = AppDataSource.create(dataSourceName);
+            if (source == null) {
                 throw new IOException("No data source is registered as \"" + dataSourceName
-                    + "\" (AlphaVideoGpuDataSources.register)");
+                    + "\" (RangeDataSources.register)");
             }
-            source = factory.create();
         } else {
-            source = new AlphaVideoGpuHttpDataSource();
+            source = new HttpFetcher();
         }
         AlphaVideoGpuReader.Storage storage = storageFor(appSource);
         String storeDir = storage == AlphaVideoGpuReader.Storage.DISK
@@ -1997,13 +1998,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         }
     }
 
-    private void warnIfStorageWithoutAddOn(String cacheKey) {
-        boolean set = !STORAGE_AUTO.equals(mStorage) || mMaxStorageBytes != DEFAULT_MAX_STORAGE_BYTES
-            || (cacheKey != null && !cacheKey.isEmpty());
-        if (set && warnedStorageWithoutAddOn.compareAndSet(false, true)) {
-            Log.w(TAG, "storage, maxStorageBytes and cacheKey need the range-source add-on "
-                + "(dev.mediacache:range-source), which the app's build leaves out; URLs are downloaded whole "
-                + "for each play instead");
+    private void warnWithoutAddOn() {
+        if (warnedWithoutAddOn.compareAndSet(false, true)) {
+            Log.w(TAG, "range-source isn't installed (dev.mediacache:range-source; for React Native, "
+                + "npm i react-native-range-source): URLs are downloaded whole for each play, without range "
+                + "requests, storage, maxStorageBytes or cacheKey");
         }
     }
 

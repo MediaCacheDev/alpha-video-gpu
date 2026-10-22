@@ -1,1 +1,0 @@
-var typeSearchIndex = [{"p":"dev.mediacache.alphavideo.gpu.media3","l":"Media3AlphaVideoGpuDataSource","url":"dev/mediacache/alphavideo/gpu/media3/Media3AlphaVideoGpuDataSource.html"}, {"l":"All classes","url":"allclasses.html"}]

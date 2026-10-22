@@ -3,8 +3,9 @@
 # publish-android.sh [local|central]
 #
 # Builds the standalone Android library in android/ and publishes it as
-# dev.mediacache:alpha-video-gpu:<version>, the version in android/build.gradle, with its Media3
-# adapter dev.mediacache:alpha-video-gpu-media3 (android/media3).
+# dev.mediacache:alpha-video-gpu:<version>, the version in android/build.gradle. Needs
+# dev.mediacache:range-source, which the player depends on, published first (or in ~/.m2, from
+# range-source's scripts/publish-android.sh local).
 #
 #   local    publishToMavenLocal (~/.m2), unsigned unless a key is set. The default.
 #   central  signs, bundles and uploads to the Maven Central Portal. Needs:
@@ -33,7 +34,7 @@ fi
 case "$MODE" in
     local)
         "${GRADLE[@]}" publishToMavenLocal
-        echo "✅ dev.mediacache:$ARTIFACT:$VERSION and $ARTIFACT-media3:$VERSION in ~/.m2/repository"
+        echo "✅ dev.mediacache:$ARTIFACT:$VERSION in ~/.m2/repository"
         ;;
     central)
         for var in ORG_GRADLE_PROJECT_mavenCentralUsername ORG_GRADLE_PROJECT_mavenCentralPassword \
@@ -48,7 +49,7 @@ case "$MODE" in
         rm -rf "$STAGING"
         "${GRADLE[@]}" publishReleasePublicationToStagingRepository
 
-        VERSION_DIRS=("dev/mediacache/$ARTIFACT/$VERSION" "dev/mediacache/$ARTIFACT-media3/$VERSION")
+        VERSION_DIRS=("dev/mediacache/$ARTIFACT/$VERSION")
         for dir in "${VERSION_DIRS[@]}"; do
             if ! ls "$STAGING/$dir"/*.aar.asc > /dev/null 2>&1; then
                 echo "❌ $dir was not signed"

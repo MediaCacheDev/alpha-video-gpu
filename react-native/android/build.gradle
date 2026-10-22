@@ -38,6 +38,7 @@ android {
 
     defaultConfig {
         minSdk safeExtGet('minSdkVersion', 24)
+        consumerProguardFiles "${coreDir}/consumer-rules.pro"
 
         externalNativeBuild {
             cmake {
@@ -75,11 +76,27 @@ android {
     }
 }
 
+// range-source, the add-on the player reads URLs and data sources through, is the app's own
+// dependency, react-native-range-source, which autolinking adds; the player finds it at run time
+// (RangeSourceLink) and plays URLs without it. Its classes are only needed to compile: from that
+// package when it's installed, else from its Maven artifact.
+def rangeSourceProject = rootProject.findProject(':react-native-range-source')
+logger.lifecycle("react-native-alpha-video-gpu: range-source ${rangeSourceProject ? 'from react-native-range-source' : 'not installed (URLs are downloaded whole; npm i react-native-range-source for range streaming and storage)'}")
+
 repositories {
     google()
     mavenCentral()
+    // range-source from scripts/publish-android.sh local in its repository, before it's on Maven Central
+    mavenLocal {
+        content { includeModule 'dev.mediacache', 'range-source' }
+    }
 }
 
 dependencies {
     implementation 'com.facebook.react:react-android'
+    if (rangeSourceProject) {
+        compileOnly rangeSourceProject
+    } else {
+        compileOnly 'dev.mediacache:range-source:1.0.0'
+    }
 }

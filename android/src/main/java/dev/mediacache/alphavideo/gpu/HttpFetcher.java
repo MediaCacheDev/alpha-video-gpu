@@ -11,67 +11,27 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * The built-in source for {@code http(s)://} URLs: {@code HttpURLConnection} with
- * {@code Range: bytes=N-} requests. A server that ignores ranges answers 200 with the whole file,
- * which is read from the position on; that works, but each seek then reads from the start.
- * Redirects are followed, between http and https too, keeping the headers.
+ * The player's fetcher for {@code http(s)://} URLs, with or without the range-source add-on:
+ * {@code HttpURLConnection} with {@code Range: bytes=N-} requests. A server that ignores ranges
+ * answers 200 with the whole file, which is read from the position on; that works, but each seek
+ * then reads from the start. Redirects are followed, between http and https too, keeping the
+ * headers.
  */
-public final class AlphaVideoGpuHttpDataSource implements AlphaVideoGpuDataSource {
+final class HttpFetcher implements Fetcher {
 
-    public static final int DEFAULT_CONNECT_TIMEOUT_MS = 15000;
-    public static final int DEFAULT_READ_TIMEOUT_MS = 30000;
-    public static final String DEFAULT_USER_AGENT = "AlphaVideoGpu/1.0";
+    private static final int CONNECT_TIMEOUT_MS = 15000;
+    private static final int READ_TIMEOUT_MS = 30000;
+    private static final String USER_AGENT = "AlphaVideoGpu/1.0";
 
     private static final int MAX_REDIRECTS = 5;
     private static final Pattern CONTENT_RANGE = Pattern.compile("bytes\\s+(\\d+)-\\d+/(\\d+|\\*)");
     private static final Pattern UNSATISFIED_RANGE = Pattern.compile("bytes\\s+\\*/(\\d+)");
-
-    public static final class Factory implements AlphaVideoGpuDataSource.Factory {
-        private int connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
-        private int readTimeoutMs = DEFAULT_READ_TIMEOUT_MS;
-        private String userAgent = DEFAULT_USER_AGENT;
-
-        public Factory setConnectTimeoutMs(int connectTimeoutMs) {
-            this.connectTimeoutMs = connectTimeoutMs;
-            return this;
-        }
-
-        public Factory setReadTimeoutMs(int readTimeoutMs) {
-            this.readTimeoutMs = readTimeoutMs;
-            return this;
-        }
-
-        /** Sent unless the headers have a User-Agent. */
-        public Factory setUserAgent(String userAgent) {
-            this.userAgent = userAgent;
-            return this;
-        }
-
-        @Override
-        public AlphaVideoGpuDataSource create() {
-            return new AlphaVideoGpuHttpDataSource(connectTimeoutMs, readTimeoutMs, userAgent);
-        }
-    }
-
-    private final int connectTimeoutMs;
-    private final int readTimeoutMs;
-    private final String userAgent;
 
     // Set on the reading thread, disconnected by cancel() from any
     private volatile HttpURLConnection connection;
     private volatile boolean cancelled = false;
     // Null once the read has ended
     private InputStream in;
-
-    public AlphaVideoGpuHttpDataSource() {
-        this(DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS, DEFAULT_USER_AGENT);
-    }
-
-    private AlphaVideoGpuHttpDataSource(int connectTimeoutMs, int readTimeoutMs, String userAgent) {
-        this.connectTimeoutMs = connectTimeoutMs;
-        this.readTimeoutMs = readTimeoutMs;
-        this.userAgent = userAgent;
-    }
 
     @Override
     public Info open(Uri uri, long position, Map<String, String> headers) throws IOException {
@@ -166,10 +126,10 @@ public final class AlphaVideoGpuHttpDataSource implements AlphaVideoGpuDataSourc
             close();
             throw new IOException("Cancelled");
         }
-        c.setConnectTimeout(connectTimeoutMs);
-        c.setReadTimeout(readTimeoutMs);
+        c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        c.setReadTimeout(READ_TIMEOUT_MS);
         c.setInstanceFollowRedirects(false);
-        c.setRequestProperty("User-Agent", userAgent);
+        c.setRequestProperty("User-Agent", USER_AGENT);
         for (Map.Entry<String, String> header : headers.entrySet()) {
             c.setRequestProperty(header.getKey(), header.getValue());
         }
