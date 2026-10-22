@@ -51,8 +51,12 @@ export interface AlphaVideoGpuViewProps {
   onFrameUpdate?: (event: { nativeEvent: { frame: number; totalFrames: number } }) => void;
   /** Callback when playback finishes */
   onFinished?: (event: { nativeEvent: {} }) => void;
-  /** Callback on error. `code` is set on web only: 'ASTC_UNSUPPORTED' or 'WEBGL_UNSUPPORTED' */
-  onError?: (event: { nativeEvent: { error: string; code?: 'ASTC_UNSUPPORTED' | 'WEBGL_UNSUPPORTED' } }) => void;
+  /**
+   * Callback on error. `code` tells apart the errors an app may handle: on the web
+   * 'ASTC_UNSUPPORTED' or 'WEBGL_UNSUPPORTED', on iOS and Android 'NO_SOURCE_MODULE' (a data
+   * source without the range-source add-on)
+   */
+  onError?: (event: { nativeEvent: { error: string; code?: 'ASTC_UNSUPPORTED' | 'WEBGL_UNSUPPORTED' | 'NO_SOURCE_MODULE' | '' } }) => void;
   /** Callback when loaded */
   onLoad?: (event: { nativeEvent: { width: number; height: number; frameCount: number; frameRate: number; duration: number } }) => void;
   

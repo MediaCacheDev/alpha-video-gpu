@@ -1,14 +1,16 @@
 /**
  * AlphaVideoGpuSource.mm
  * Range reading for URLs and data sources: the built-in URLSession fetcher, the adapter for an
- * app's AlphaVideoGpuDataSource, and the reader they feed (alpha-video-source's RangeReader).
+ * app's AlphaVideoGpuDataSource, and the reader they feed: range-source's, through its C table, or
+ * without it the basic input, a download into a temporary file.
  */
 
 #import "AlphaVideoGpuSource.h"
 
-#include "alpha_video_source.h"
+#include "alpha_video_gpu_range_source.h"
 
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -32,7 +34,7 @@ public:
     }
 
     /** `skip`: bytes of the data to drop first, for a server that answered from 0. */
-    void respond(const avsource::SourceInfo& info, int64_t skip = 0) {
+    void respond(const avg_rs::SourceInfo& info, int64_t skip = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (responded_ || done_) return;
         responded_ = true;
@@ -70,7 +72,7 @@ public:
 
     void cancel() { finish("Cancelled"); }
 
-    bool waitResponse(avsource::SourceInfo& info, std::string& error) {
+    bool waitResponse(avg_rs::SourceInfo& info, std::string& error) {
         std::unique_lock<std::mutex> lock(mutex_);
         changed_.wait(lock, [&] { return responded_ || done_; });
         if (!responded_) {
@@ -119,7 +121,7 @@ private:
     bool paused_ = false;
     bool responded_ = false;
     bool done_ = false;
-    avsource::SourceInfo info_;
+    avg_rs::SourceInfo info_;
     int64_t skip_ = 0;
     std::string buffer_;
     size_t offset_ = 0;
@@ -206,7 +208,7 @@ didReceiveResponse:(NSURLResponse *)response
         return;
     }
     NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-    avsource::SourceInfo info;
+    avg_rs::SourceInfo info;
     info.etag = stdString([http valueForHTTPHeaderField:@"ETag"]);
     info.lastModified = stdString([http valueForHTTPHeaderField:@"Last-Modified"]);
     NSString *encoding = [http valueForHTTPHeaderField:@"Content-Encoding"];
@@ -269,7 +271,7 @@ namespace {
  * Reads a URL with URLSession: a `Range: bytes=N-` request per open, kept open as the reader
  * reads on, and suspended while the reader has a megabyte waiting.
  */
-class URLSessionUpstream : public avsource::Upstream {
+class URLSessionUpstream : public avg_rs::Upstream {
 public:
     URLSessionUpstream(NSURL* url, NSDictionary<NSString*, NSString*>* headers)
         : url_(url), headers_([headers copy]), delegate_([AVGSessionDelegate new]) {
@@ -287,7 +289,7 @@ public:
         [session_ invalidateAndCancel];
     }
 
-    bool open(int64_t position, avsource::SourceInfo& info, std::string& error) override {
+    bool open(int64_t position, avg_rs::SourceInfo& info, std::string& error) override {
         close();
         NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url_];
         [headers_ enumerateKeysAndObjectsUsingBlock:^(NSString* name, NSString* value, BOOL* stop) {
@@ -370,7 +372,7 @@ private:
  * Reads through an app's AlphaVideoGpuDataSource in windows of kWindowBytes, asking for the next
  * window when one ends, so that a source never has more than one window to hold.
  */
-class DataSourceUpstream : public avsource::Upstream {
+class DataSourceUpstream : public avg_rs::Upstream {
 public:
     static constexpr int64_t kWindowBytes = 4 * 1024 * 1024;
 
@@ -379,7 +381,7 @@ public:
 
     ~DataSourceUpstream() override { close(); }
 
-    bool open(int64_t position, avsource::SourceInfo& info, std::string& error) override {
+    bool open(int64_t position, avg_rs::SourceInfo& info, std::string& error) override {
         close();
         position_ = position;
         size_ = -1;
@@ -424,7 +426,7 @@ public:
     }
 
 private:
-    bool startWindow(avsource::SourceInfo* info, std::string& error) {
+    bool startWindow(avg_rs::SourceInfo* info, std::string& error) {
         auto pipe = std::make_shared<Pipe>();
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -440,7 +442,7 @@ private:
                                                        length:kWindowBytes
                                                       headers:headers_ ?: @{}
                                                      response:^(AlphaVideoGpuDataInfo* dataInfo) {
-            avsource::SourceInfo sourceInfo;
+            avg_rs::SourceInfo sourceInfo;
             sourceInfo.size = dataInfo.size >= 0 ? dataInfo.size : -1;
             sourceInfo.etag = stdString(dataInfo.etag);
             sourceInfo.lastModified = stdString(dataInfo.lastModified);
@@ -462,7 +464,7 @@ private:
         }
         if (cancelNow) [token cancel];
 
-        avsource::SourceInfo got;
+        avg_rs::SourceInfo got;
         if (!pipe->waitResponse(got, error)) return false;
         if (got.size >= 0) size_ = got.size;
         if (info) *info = got;
@@ -538,11 +540,33 @@ static NSMutableDictionary<NSString *, id<AlphaVideoGpuDataSource>> *AVGRegister
 
 #pragma mark - AVGSourceReader
 
+static const RangeSourcePlugin *AVGRangeSourcePlugin(void) {
+    // The add-on's reader and stores, built into this library until the add-on is its own package
+    static const RangeSourcePlugin *plugin = [] {
+        const RangeSourcePlugin *table = range_source_plugin();
+        if (table->abi != RANGE_SOURCE_ABI) {
+            NSLog(@"[AlphaVideoGPU] Not using range-source: its ABI is %d, and this player needs %d", table->abi,
+                  RANGE_SOURCE_ABI);
+            return static_cast<const RangeSourcePlugin *>(nullptr);
+        }
+        if (table->structSize < offsetof(RangeSourcePlugin, releaseReader) + sizeof(table->releaseReader)) {
+            NSLog(@"[AlphaVideoGPU] Not using range-source: it is older than this player");
+            return static_cast<const RangeSourcePlugin *>(nullptr);
+        }
+        return table;
+    }();
+    return plugin;
+}
+
+BOOL AVGRangeSourceAvailable(void) {
+    return AVGRangeSourcePlugin() != nullptr;
+}
+
 // Caches/alpha-video-gpu on disk, or the memory store's name
 static NSString *const AVGStoreName = @"alpha-video-gpu";
 
 @implementation AVGSourceReader {
-    std::shared_ptr<avsource::RangeReader> _reader;
+    std::shared_ptr<avg_rs::Reader> _reader;
 }
 
 + (instancetype)openURL:(NSURL *)url
@@ -552,7 +576,7 @@ static NSString *const AVGStoreName = @"alpha-video-gpu";
                     key:(NSString *)key
         maxStorageBytes:(int64_t)maxStorageBytes
                   error:(NSString **)error {
-    std::unique_ptr<avsource::Upstream> upstream;
+    std::unique_ptr<avg_rs::Upstream> upstream;
     if (dataSource) {
         upstream = std::make_unique<DataSourceUpstream>(dataSource, url, headers);
     } else if ([url.scheme isEqualToString:@"https"] || [url.scheme isEqualToString:@"http"]) {
@@ -562,17 +586,22 @@ static NSString *const AVGStoreName = @"alpha-video-gpu";
         return nil;
     }
 
-    std::shared_ptr<avsource::Store> store;
-    if ([storage isEqualToString:@"disk"]) {
-        NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-        store = avsource::Store::disk(stdString([caches stringByAppendingPathComponent:AVGStoreName]), maxStorageBytes);
-    } else if ([storage isEqualToString:@"memory"]) {
-        store = avsource::Store::memory(stdString(AVGStoreName), maxStorageBytes);
-    }
-
     std::string openError;
-    auto reader = avsource::RangeReader::open(std::move(upstream), std::move(store), stdString(key),
-                                              avsource::ReaderOptions(), openError);
+    std::shared_ptr<avg_rs::Reader> reader;
+    if (const RangeSourcePlugin *plugin = AVGRangeSourcePlugin()) {
+        std::shared_ptr<avg_rs::Store> store;
+        if ([storage isEqualToString:@"disk"]) {
+            NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+            store = avg_rs::Store::disk(plugin, stdString([caches stringByAppendingPathComponent:AVGStoreName]),
+                                        maxStorageBytes);
+        } else if ([storage isEqualToString:@"memory"]) {
+            store = avg_rs::Store::memory(plugin, stdString(AVGStoreName), maxStorageBytes);
+        }
+        reader = avg_rs::RangeReader::open(plugin, std::move(upstream), store, stdString(key),
+                                           avg_rs::ReaderOptions(), openError);
+    } else {
+        reader = avg_rs::DownloadReader::open(std::move(upstream), stdString(NSTemporaryDirectory()), openError);
+    }
     if (!reader) {
         if (error) *error = nsString(openError);
         return nil;
@@ -621,7 +650,7 @@ static NSString *const AVGStoreName = @"alpha-video-gpu";
 
 - (int64_t)tryReadAt:(int64_t)position into:(uint8_t *)buffer length:(size_t)length {
     int64_t n = _reader->tryRead(position, buffer, static_cast<int64_t>(length));
-    return n == avsource::RangeReader::kPending ? AVGSourceReaderPending : n;
+    return n == avg_rs::Reader::kPending ? AVGSourceReaderPending : n;
 }
 
 - (void)close {

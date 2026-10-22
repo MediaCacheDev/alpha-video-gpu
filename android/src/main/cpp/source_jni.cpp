@@ -1,4 +1,5 @@
-// Range readers over a Java AlphaVideoGpuDataSource (AlphaVideoGpuReader and its Upstream)
+// Readers over a Java AlphaVideoGpuDataSource (AlphaVideoGpuReader and its Upstream), and the
+// range-source add-on's table (RangeSourceLink)
 
 #include "source_jni.h"
 
@@ -6,6 +7,7 @@
 #include <pthread.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -48,7 +50,7 @@ std::string stringFromJava(JNIEnv* env, jstring value) {
     return result;
 }
 
-class JavaUpstream : public avsource::Upstream {
+class JavaUpstream : public avg_rs::Upstream {
 public:
     static std::unique_ptr<JavaUpstream> create(JNIEnv* env, jobject upstream) {
         auto result = std::unique_ptr<JavaUpstream>(new JavaUpstream());
@@ -80,7 +82,7 @@ public:
         if (buffer_) env->DeleteGlobalRef(buffer_);
     }
 
-    bool open(int64_t position, avsource::SourceInfo& info, std::string& error) override {
+    bool open(int64_t position, avg_rs::SourceInfo& info, std::string& error) override {
         JNIEnv* env = threadEnv(vm_);
         if (!env) {
             error = "Cannot attach the reader's thread to Java";
@@ -150,7 +152,7 @@ private:
 };
 
 // An AlphaVideoGpuReader reference: a shared_ptr of its own, so each holder frees only its own.
-using ReaderRef = std::shared_ptr<avsource::RangeReader>;
+using ReaderRef = std::shared_ptr<avg_rs::Reader>;
 
 const ReaderRef& readerOf(jlong reference) {
     return *reinterpret_cast<ReaderRef*>(reference);
@@ -158,32 +160,49 @@ const ReaderRef& readerOf(jlong reference) {
 
 } // namespace
 
-std::shared_ptr<avsource::RangeReader> readerFromReference(jlong reference) {
+std::shared_ptr<avg_rs::Reader> readerFromReference(jlong reference) {
     return reference != 0 ? readerOf(reference) : nullptr;
 }
 
 extern "C" {
 
 JNIEXPORT jlong JNICALL
+Java_dev_mediacache_alphavideo_gpu_RangeSourceLink_nativeBuiltInPlugin(JNIEnv*, jclass) {
+    const RangeSourcePlugin* plugin = range_source_plugin();
+    if (plugin->abi != RANGE_SOURCE_ABI) {
+        LOGE("Not using range-source: its ABI is %d, and this player needs %d", plugin->abi, RANGE_SOURCE_ABI);
+        return 0;
+    }
+    if (plugin->structSize < offsetof(RangeSourcePlugin, releaseReader) + sizeof(plugin->releaseReader)) {
+        LOGE("Not using range-source: it is older than this player");
+        return 0;
+    }
+    return reinterpret_cast<jlong>(plugin);
+}
+
+JNIEXPORT jlong JNICALL
 Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuReader_nativeOpen(
-    JNIEnv* env, jclass, jobject upstream, jint storage, jstring storeDir, jstring key, jlong maxStorageBytes,
-    jobjectArray errorOut) {
+    JNIEnv* env, jclass, jlong plugin, jobject upstream, jint storage, jstring storeDir, jstring key,
+    jlong maxStorageBytes, jstring downloadDir, jobjectArray errorOut) {
     // AlphaVideoGpuReader.Storage ordinals
     enum { kDisk = 0, kMemory = 1 };
     std::string error;
-    std::shared_ptr<avsource::RangeReader> reader;
+    std::shared_ptr<avg_rs::Reader> reader;
     std::unique_ptr<JavaUpstream> javaUpstream = JavaUpstream::create(env, upstream);
-    if (javaUpstream) {
-        std::shared_ptr<avsource::Store> store;
-        if (storage == kDisk) {
-            store = avsource::Store::disk(stringFromJava(env, storeDir), maxStorageBytes);
-        } else if (storage == kMemory) {
-            store = avsource::Store::memory(stringFromJava(env, storeDir), maxStorageBytes);
-        }
-        reader = avsource::RangeReader::open(std::move(javaUpstream), std::move(store), stringFromJava(env, key),
-                                             avsource::ReaderOptions(), error);
-    } else {
+    const auto* table = reinterpret_cast<const RangeSourcePlugin*>(plugin);
+    if (!javaUpstream) {
         error = "Cannot call the data source";
+    } else if (table) {
+        std::shared_ptr<avg_rs::Store> store;
+        if (storage == kDisk) {
+            store = avg_rs::Store::disk(table, stringFromJava(env, storeDir), maxStorageBytes);
+        } else if (storage == kMemory) {
+            store = avg_rs::Store::memory(table, stringFromJava(env, storeDir), maxStorageBytes);
+        }
+        reader = avg_rs::RangeReader::open(table, std::move(javaUpstream), store, stringFromJava(env, key),
+                                           avg_rs::ReaderOptions(), error);
+    } else {
+        reader = avg_rs::DownloadReader::open(std::move(javaUpstream), stringFromJava(env, downloadDir), error);
     }
     if (!reader) {
         jstring message = env->NewStringUTF(error.c_str());

@@ -7,12 +7,19 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/**
+ * Whether the range-source add-on is there. Without it a URL is downloaded whole into a temporary
+ * file, and data sources, storage and cache keys aren't available.
+ */
+BOOL AVGRangeSourceAvailable(void);
+
 /** What tryReadAt:into:length: returns while the bytes are on their way. */
 static const int64_t AVGSourceReaderPending = -2;
 
 /**
- * A range reader over a URL or a data source: blocks in memory and in an optional store, fetched
- * on the reader's own thread. Thread-safe.
+ * A reader over a URL or a data source: with range-source, blocks in memory and in an optional
+ * store, fetched on the reader's own thread; without it, the URL downloaded into a temporary file,
+ * read as it arrives. Thread-safe.
  */
 @interface AVGSourceReader : NSObject
 

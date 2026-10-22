@@ -68,9 +68,10 @@ final class PlayerEventForwarder implements AlphaVideoGpuView.PlayerCallback {
     }
 
     @Override
-    public void onError(String error) {
+    public void onError(String error, @Nullable String code) {
         WritableMap event = Arguments.createMap();
         event.putString("error", error);
+        if (code != null) event.putString("code", code);
         send("onError", event);
     }
 

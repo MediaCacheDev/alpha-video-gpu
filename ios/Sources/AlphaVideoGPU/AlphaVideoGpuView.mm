@@ -145,6 +145,8 @@ static BOOL AVGIsASTCArray(NSDictionary *metadata) {
   return vkFormat >= 157 && vkFormat <= 184 && [metadata[@"frameCount"] unsignedIntValue] >= 1;
 }
 
+NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
+
 @implementation AlphaVideoGpuView {
   MTLPixelFormat _metalPixelFormat;
   BOOL _useCompressedFormat;
@@ -498,6 +500,15 @@ static BOOL AVGIsASTCArray(NSDictionary *metadata) {
   _playingDataSource = self.dataSource.length > 0 ? [self.dataSource copy] : nil;
   NSString *dataSourceName = _playingDataSource;
   BOOL readsRanges = dataSourceName != nil || AVGIsRemote(uri);
+  if (readsRanges && !AVGRangeSourceAvailable()) {
+    if (dataSourceName) {
+      [self notifyError:[NSString stringWithFormat:@"The data source \"%@\" needs the range-source add-on, which the "
+                                                   @"app's build leaves out", dataSourceName]
+                   code:AlphaVideoGpuErrorNoSourceModule];
+      return;
+    }
+    [self warnIfStorageWithoutAddOn];
+  }
   id<AlphaVideoGpuDataSource> dataSource = nil;
   if (dataSourceName) {
     dataSource = [AlphaVideoGpuDataSources dataSourceNamed:dataSourceName];
@@ -581,9 +592,26 @@ static BOOL AVGIsASTCArray(NSDictionary *metadata) {
 
 - (void)notifyError:(NSString *)error
 {
+  [self notifyError:error code:nil];
+}
+
+- (void)notifyError:(NSString *)error code:(nullable NSString *)code
+{
   _isSourceLoading = NO;
   NSLog(@"AlphaVideoGpuView: Error: %@", error);
-  if (self.onError) self.onError(error ?: @"Unknown error");
+  if (self.onError) self.onError(error ?: @"Unknown error", code);
+}
+
+- (void)warnIfStorageWithoutAddOn
+{
+  BOOL set = ![self.storage isEqualToString:@"auto"] || self.maxStorageBytes > 0 || self.cacheKey.length > 0;
+  static dispatch_once_t once;
+  if (set) {
+    dispatch_once(&once, ^{
+      NSLog(@"[AlphaVideoGPU] storage, maxStorageBytes and cacheKey need the range-source add-on, which the app's "
+            @"build leaves out; URLs are downloaded whole for each play instead");
+    });
+  }
 }
 
 - (void)setupMetal

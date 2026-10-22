@@ -10,8 +10,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A native range reader over an {@link AlphaVideoGpuDataSource}: blocks in memory and in an
- * optional store, fetched on the reader's own thread. One playback owns it, opens it on its
+ * A native reader over an {@link AlphaVideoGpuDataSource}: with the range-source add-on, blocks in
+ * memory and in an optional store, fetched on the reader's own thread; without it, the file
+ * downloaded whole into a temporary file, read as it arrives. One playback owns it, opens it on its
  * worker thread and closes it there; a zstd stream over it keeps its own native reference.
  */
 final class AlphaVideoGpuReader {
@@ -44,12 +45,14 @@ final class AlphaVideoGpuReader {
      *
      * @param storeDir the folder of the disk store, or the name of the memory one
      * @param key what the store calls this file
+     * @param downloadDir where the file is downloaded without the add-on
      */
     static AlphaVideoGpuReader open(AlphaVideoGpuDataSource source, Uri uri, Map<String, String> headers,
-                                    Storage storage, String storeDir, String key, long maxStorageBytes) throws IOException {
+                                    Storage storage, String storeDir, String key, long maxStorageBytes,
+                                    String downloadDir) throws IOException {
         String[] error = new String[1];
-        long handle = nativeOpen(new Upstream(source, uri, headers), storage.ordinal(), storeDir, key,
-            maxStorageBytes, error);
+        long handle = nativeOpen(RangeSourceLink.plugin(), new Upstream(source, uri, headers), storage.ordinal(),
+            storeDir, key, maxStorageBytes, downloadDir, error);
         if (handle == 0) throw new IOException(error[0] != null ? error[0] : "Cannot open " + uri);
         return new AlphaVideoGpuReader(handle, uri.toString());
     }
@@ -192,12 +195,13 @@ final class AlphaVideoGpuReader {
     }
 
     /**
+     * @param plugin range-source's table ({@link RangeSourceLink#plugin}), or 0 to download the file
      * @param storage a {@link Storage} ordinal
      * @param error set to why, when it returns 0
      * @return a reference to the reader, or 0
      */
-    private static native long nativeOpen(Upstream upstream, int storage, String storeDir, String key,
-                                          long maxStorageBytes, String[] error);
+    private static native long nativeOpen(long plugin, Upstream upstream, int storage, String storeDir, String key,
+                                          long maxStorageBytes, String downloadDir, String[] error);
     private static native void nativeRelease(long reference);
     private static native int nativeTryRead(long reference, long position, byte[] buffer, int offset, int length);
     private static native long nativeSize(long reference);

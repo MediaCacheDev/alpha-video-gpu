@@ -10,7 +10,7 @@
 #include <unistd.h>
 #include <vector>
 
-namespace avsource {
+namespace rangesource {
 
 struct StoreEntry {
     std::string key;
@@ -521,4 +521,4 @@ void Store::closeFile(StoreEntry& entry) {
     }
 }
 
-} // namespace avsource
+} // namespace rangesource

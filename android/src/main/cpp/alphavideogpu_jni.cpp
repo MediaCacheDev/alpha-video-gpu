@@ -211,37 +211,30 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeDeleteTexture(JNIEn
     glDeleteTextures(1, &id);
 }
 
-// Zero-copy Zstd decompression directly to a direct ByteBuffer
+// Zstd decompression from one direct ByteBuffer (the file, mapped or read) into another
 JNIEXPORT jboolean JNICALL
 Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeDecompressZstdToBuffer(JNIEnv *env, jclass clazz,
-                                                                   jbyteArray data, jint offset,
-                                                                   jint compressed_length,
+                                                                   jobject data, jlong offset,
+                                                                   jlong compressed_length,
                                                                    jobject output_buffer,
                                                                    jint uncompressed_length) {
-    // Get input data
-    jbyte* input_bytes = env->GetByteArrayElements(data, nullptr);
-    if (!input_bytes) {
-        LOGE("Failed to get input byte array");
+    const auto* input = static_cast<const uint8_t*>(env->GetDirectBufferAddress(data));
+    const jlong input_size = env->GetDirectBufferCapacity(data);
+    if (!input || offset < 0 || compressed_length < 0 || offset + compressed_length > input_size) {
+        LOGE("The Zstd input isn't a direct buffer holding the level");
         return JNI_FALSE;
     }
     
-    // Get direct buffer address
     void* output_ptr = env->GetDirectBufferAddress(output_buffer);
     if (!output_ptr) {
         LOGE("Failed to get direct buffer address for Zstd output");
-        env->ReleaseByteArrayElements(data, input_bytes, JNI_ABORT);
         return JNI_FALSE;
     }
     
-    const uint8_t* compressed_data = reinterpret_cast<const uint8_t*>(input_bytes) + offset;
-    
-    // Decompress directly into the direct ByteBuffer (zero-copy)
     size_t decompressed_size = ZSTD_decompress(
         output_ptr, uncompressed_length,
-        compressed_data, compressed_length
+        input + offset, (size_t)compressed_length
     );
-    
-    env->ReleaseByteArrayElements(data, input_bytes, JNI_ABORT);
     
     if (ZSTD_isError(decompressed_size)) {
         LOGE("Zstd decompression to buffer failed: %s", ZSTD_getErrorName(decompressed_size));
@@ -253,7 +246,7 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeDecompressZstdToBuf
         return JNI_FALSE;
     }
     
-    LOGI("Zstd decompressed %d -> %zu bytes (zero-copy to direct buffer)", compressed_length, decompressed_size);
+    LOGI("Zstd decompressed %lld -> %zu bytes (zero-copy to direct buffer)", (long long)compressed_length, decompressed_size);
     
     return JNI_TRUE;
 }
@@ -265,18 +258,15 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeDecompressZstdToBuf
  */
 JNIEXPORT jintArray JNICALL
 Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeLoadTextureArray(JNIEnv *env, jclass clazz,
-                                                             jbyteArray ktx2_data,
+                                                             jobject ktx2_data,
                                                              jboolean use_astc) {
-    jsize data_length = env->GetArrayLength(ktx2_data);
-    jbyte* data = env->GetByteArrayElements(ktx2_data, nullptr);
+    const auto* bytes = static_cast<const uint8_t*>(env->GetDirectBufferAddress(ktx2_data));
+    const jlong data_length = env->GetDirectBufferCapacity(ktx2_data);
     
-    if (!data || data_length < 104) {
+    if (!bytes || data_length < 104) {
         LOGE("Invalid KTX2 data for texture array");
-        if (data) env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
         return nullptr;
     }
-    
-    const uint8_t* bytes = (const uint8_t*)data;
     
     // Parse KTX2 header
     uint32_t vkFormat = *(uint32_t*)(bytes + 12);
@@ -289,6 +279,11 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeLoadTextureArray(JN
     uint64_t level0Offset = *(uint64_t*)(bytes + 80);
     uint64_t level0Length = *(uint64_t*)(bytes + 88);
     uint64_t level0UncompressedLength = *(uint64_t*)(bytes + 96);
+    if (level0Offset > (uint64_t)data_length || level0Length > (uint64_t)data_length - level0Offset) {
+        LOGE("Level 0 (%llu bytes at %llu) runs past the file's %lld bytes", (unsigned long long)level0Length,
+             (unsigned long long)level0Offset, (long long)data_length);
+        return nullptr;
+    }
     
     // Look up ASTC format info from vkFormat
     const ASTCFormatInfo* astcInfo = get_astc_format_info(vkFormat);
@@ -314,7 +309,6 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeLoadTextureArray(JN
         
         if (ZSTD_isError(result)) {
             LOGE("Zstd decompression failed: %s", ZSTD_getErrorName(result));
-            env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
             return nullptr;
         }
         
@@ -323,8 +317,6 @@ Java_dev_mediacache_alphavideo_gpu_AlphaVideoGpuNative_nativeLoadTextureArray(JN
         // Uncompressed
         astcData.assign(bytes + level0Offset, bytes + level0Offset + level0Length);
     }
-    
-    env->ReleaseByteArrayElements(ktx2_data, data, JNI_ABORT);
     
     // Calculate bytes per layer using dynamic block dimensions
     uint32_t bytesPerLayer = astc_bytes_per_layer(width, height, bw, bh);
@@ -419,7 +411,7 @@ struct StreamingDecompressState {
     
     // A URL or data source: read from a range reader into `chunk`, which holds the level's bytes
     // [chunk_start, chunk_start + chunk_length)
-    std::shared_ptr<avsource::RangeReader> reader;
+    std::shared_ptr<avg_rs::Reader> reader;
     int64_t level_offset = 0;
     std::vector<uint8_t> chunk;
     size_t chunk_start = 0;
@@ -535,7 +527,7 @@ static jlong fillChunk(StreamingDecompressState* state) {
     }
     size_t want = std::min(kReaderChunkBytes, state->input_size - state->input_pos);
     int64_t n = state->reader->tryRead(state->level_offset + (int64_t)state->input_pos, state->chunk.data(), (int64_t)want);
-    if (n == avsource::RangeReader::kPending) return kStreamPending;
+    if (n == avg_rs::Reader::kPending) return kStreamPending;
     if (n <= 0) {
         std::string why = state->reader->lastError();
         state->error = n == 0 ? "the file ends inside the level" : (why.empty() ? "reading failed" : why);

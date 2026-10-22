@@ -25,7 +25,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -58,7 +57,19 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         /** Playback reached the last frame with looping off. */
         default void onFinished() {}
         default void onError(String error) {}
+        /** An error with its code, such as {@link #ERROR_NO_SOURCE_MODULE}, or null. Calls {@link #onError(String)} unless overridden. */
+        default void onError(String error, @Nullable String code) {
+            onError(error);
+        }
     }
+
+    /**
+     * {@link PlayerCallback#onError(String, String)}'s code for a data source
+     * ({@link #setDataSource}) without the range-source add-on, which reads them.
+     */
+    public static final String ERROR_NO_SOURCE_MODULE = "NO_SOURCE_MODULE";
+    // Storage set without the add-on is warned of once per process
+    private static final AtomicBoolean warnedStorageWithoutAddOn = new AtomicBoolean(false);
     
     // GL constants - ASTC formats for all 14 block sizes
     private static final int GL_COMPRESSED_RGBA_ASTC_4x4_KHR   = 0x93B0;
@@ -299,8 +310,12 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     }
     
     private void notifyError(String error) {
+        notifyError(error, null);
+    }
+
+    private void notifyError(String error, @Nullable String code) {
         Log.e(TAG, "Error: " + error);
-        if (playerCallback != null) playerCallback.onError(error);
+        if (playerCallback != null) playerCallback.onError(error, code);
     }
     
     // Public API
@@ -582,6 +597,9 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         final AlphaVideoGpuSource local;
         try {
             local = resolveSource(uri, mPlayingCacheKey);
+        } catch (NoSourceModuleException e) {
+            mainHandler.post(() -> notifyError(e.getMessage(), ERROR_NO_SOURCE_MODULE));
+            return;
         } catch (IOException | IllegalArgumentException e) {
             if (shouldStop.get()) return;  // stopped while opening
             mainHandler.post(() -> notifyError("Loading " + uri + " failed: " + e.getMessage()));
@@ -847,7 +865,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         // large as decoded ones, so such files are for local playback, and zstd ones stream.
         final ByteBuffer mmapBuffer;
         try {
-            mmapBuffer = local.reader() != null ? local.readAllDirect(getContext()) : mapLocalFile(local);
+            mmapBuffer = local.reader() != null ? local.readAllDirect(getContext()) : local.map(getContext());
         } catch (Exception e) {
             if (shouldStop.get()) return;
             Log.e(TAG, "Failed to read " + local + ": " + e.getMessage());
@@ -1026,17 +1044,6 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         }
         
         logI("Uncompressed streaming animation ended");
-    }
-    
-    /** Memory-maps a local file; the mapping stays valid after the descriptor and channel are closed. */
-    private ByteBuffer mapLocalFile(AlphaVideoGpuSource local) throws IOException {
-        try (AssetFileDescriptor afd = local.openFd(getContext());
-             FileInputStream in = new FileInputStream(afd.getFileDescriptor())) {
-            java.nio.channels.FileChannel channel = in.getChannel();
-            long start = afd.getStartOffset();
-            long length = afd.getLength() >= 0 ? afd.getLength() : channel.size() - start;
-            return channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, start, length);
-        }
     }
     
     /**
@@ -1694,18 +1701,18 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
      * Returns Object[] = {width, height, layerCount, bytesPerLayer, ByteBuffer frameData}
      * Uses a single contiguous direct ByteBuffer for zero-copy GPU uploads.
      */
-    private Object[] loadTextureArrayToRam(byte[] ktx2Data, boolean useAstc) {
+    private Object[] loadTextureArrayToRam(ByteBuffer ktx2Data, boolean useAstc) {
         try {
             // Parse KTX2 header to get dimensions and layer count
-            if (ktx2Data.length < 104) {
+            if (ktx2Data.capacity() < 104) {
                 Log.e(TAG, "KTX2 data too small for header");
                 return null;
             }
             
-            ByteBuffer header = ByteBuffer.wrap(ktx2Data).order(ByteOrder.LITTLE_ENDIAN);
+            ByteBuffer header = ktx2Data.duplicate().order(ByteOrder.LITTLE_ENDIAN);
             
             // Check magic
-            if (ktx2Data[0] != (byte)0xAB || ktx2Data[1] != 0x4B) {
+            if (header.get(0) != (byte)0xAB || header.get(1) != 0x4B) {
                 Log.e(TAG, "Invalid KTX2 magic");
                 return null;
             }
@@ -1738,14 +1745,16 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             if (supercompressionScheme == 2) { // Zstd
                 // Decompress directly into the direct ByteBuffer
                 boolean success = AlphaVideoGpuNative.nativeDecompressZstdToBuffer(
-                    ktx2Data, (int)level0ByteOffset, (int)level0ByteLength, frameBuffer, totalSize);
+                    ktx2Data, level0ByteOffset, level0ByteLength, frameBuffer, totalSize);
                 if (!success) {
                     Log.e(TAG, "Zstd decompression to buffer failed");
                     return null;
                 }
             } else if (supercompressionScheme == 0) { // None
                 // Copy uncompressed data directly to buffer
-                frameBuffer.put(ktx2Data, (int)level0ByteOffset, (int)level0ByteLength);
+                ByteBuffer level = ktx2Data.duplicate();
+                level.limit((int) (level0ByteOffset + level0ByteLength)).position((int) level0ByteOffset);
+                frameBuffer.put(level);
                 frameBuffer.rewind();
             } else {
                 Log.e(TAG, "Unsupported supercompression: " + supercompressionScheme);
@@ -1765,7 +1774,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     private void loadTextureArray(AlphaVideoGpuSource local) throws Exception {
         logD("Loading texture array from: " + local);
         
-        byte[] ktx2Data = local.readAll(getContext());
+        // Off the Java heap, whose cap (256 MB on many phones) a large clip can pass
+        ByteBuffer ktx2Data = local.readAllDirect(getContext());
         
         boolean useAstc = astcSupported;
         
@@ -1951,6 +1961,13 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         final String dataSourceName = mPlayingDataSource;
         final boolean appSource = dataSourceName != null;
         if (!appSource && !isRemote(uri)) return AlphaVideoGpuSource.parse(uri);
+        if (!RangeSourceLink.available()) {
+            if (appSource) {
+                throw new NoSourceModuleException("The data source \"" + dataSourceName + "\" needs the "
+                    + "range-source add-on (dev.mediacache:range-source), which the app's build leaves out");
+            }
+            warnIfStorageWithoutAddOn(cacheKey);
+        }
 
         final AlphaVideoGpuDataSource source;
         if (appSource) {
@@ -1968,9 +1985,26 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             ? new File(getContext().getCacheDir(), STORE_NAME).getPath() : STORE_NAME;
         String key = cacheKey != null && !cacheKey.isEmpty() ? cacheKey : uri;
         AlphaVideoGpuReader reader = AlphaVideoGpuReader.open(source, Uri.parse(uri), mPlayingHeaders, storage,
-            storeDir, key, mMaxStorageBytes);
+            storeDir, key, mMaxStorageBytes, getContext().getCacheDir().getPath());
         logD("Opened " + uri + " (" + reader.size() + " bytes, storage " + storage + ")");
         return AlphaVideoGpuSource.reader(reader, shouldStop);
+    }
+
+    /** A data source without the range-source add-on: reported with {@link #ERROR_NO_SOURCE_MODULE}. */
+    private static final class NoSourceModuleException extends IOException {
+        NoSourceModuleException(String message) {
+            super(message);
+        }
+    }
+
+    private void warnIfStorageWithoutAddOn(String cacheKey) {
+        boolean set = !STORAGE_AUTO.equals(mStorage) || mMaxStorageBytes != DEFAULT_MAX_STORAGE_BYTES
+            || (cacheKey != null && !cacheKey.isEmpty());
+        if (set && warnedStorageWithoutAddOn.compareAndSet(false, true)) {
+            Log.w(TAG, "storage, maxStorageBytes and cacheKey need the range-source add-on "
+                + "(dev.mediacache:range-source), which the app's build leaves out; URLs are downloaded whole "
+                + "for each play instead");
+        }
     }
 
     private AlphaVideoGpuReader.Storage storageFor(boolean appSource) {

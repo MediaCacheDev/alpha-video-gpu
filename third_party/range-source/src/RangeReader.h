@@ -4,11 +4,12 @@
 #include "Upstream.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
-namespace avsource {
+namespace rangesource {
 
 struct ReaderOptions {
     /** Block size in bytes. A stored copy keeps the block size it was written with. */
@@ -22,6 +23,27 @@ struct ReaderOptions {
     /** Attempts after a failed open or read, each after twice the delay of the one before. */
     int retries = 3;
     int64_t retryDelayMs = 500;
+};
+
+/**
+ * What a read checks, while it waits, to give up: a C++ flag, a C flag (range_source.h), or none.
+ */
+class AbortFlag {
+public:
+    AbortFlag() = default;
+    AbortFlag(std::nullptr_t) {}
+    AbortFlag(const std::atomic<bool>* flag) : flag_(flag) {}
+    AbortFlag(const volatile int32_t* flag) : cFlag_(flag) {}
+
+    bool raised() const {
+        if (flag_) return flag_->load();
+        if (cFlag_) return __atomic_load_n(cFlag_, __ATOMIC_ACQUIRE) != 0;
+        return false;
+    }
+
+private:
+    const std::atomic<bool>* flag_ = nullptr;
+    const volatile int32_t* cFlag_ = nullptr;
 };
 
 /**
@@ -59,10 +81,9 @@ public:
     /**
      * Reads up to `size` bytes at `pos` into `out`, waiting for them if they're being fetched.
      * Returns how many: fewer at a block's end, 0 at or past the end of the file, -1 if they can't
-     * be fetched (lastError() says why), once the reader is closed, or once `abort` (may be null)
-     * becomes true.
+     * be fetched (lastError() says why), once the reader is closed, or once `abort` is raised.
      */
-    int64_t read(int64_t pos, uint8_t* out, int64_t size, const std::atomic<bool>* abort = nullptr);
+    int64_t read(int64_t pos, uint8_t* out, int64_t size, AbortFlag abort = {});
 
     /** What tryRead returns while the bytes are on their way. */
     static constexpr int64_t kPending = -2;
@@ -75,7 +96,7 @@ public:
     int64_t tryRead(int64_t pos, uint8_t* out, int64_t size);
 
     /** Reads the whole file, so that it's held in the store. False on an error or abort. */
-    bool fetchAll(const std::atomic<bool>* abort = nullptr);
+    bool fetchAll(AbortFlag abort = {});
 
     /** The file's size, or -1 while it isn't known. */
     int64_t size() const;
@@ -92,4 +113,4 @@ private:
     const std::shared_ptr<Core> core_;
 };
 
-} // namespace avsource
+} // namespace rangesource

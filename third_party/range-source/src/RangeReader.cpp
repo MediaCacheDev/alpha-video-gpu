@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace avsource {
+namespace rangesource {
 
 namespace {
 
@@ -77,7 +77,7 @@ private:
     void failLocked(int64_t index, const std::string& message);
 
 public:
-    int64_t read(int64_t pos, uint8_t* out, int64_t size, const std::atomic<bool>* abort, bool wait);
+    int64_t read(int64_t pos, uint8_t* out, int64_t size, AbortFlag abort, bool wait);
     int64_t nextTargetLocked();
     bool heldLocked(int64_t index) const;
     bool pastEndLocked(int64_t index) const;
@@ -375,15 +375,15 @@ RangeReader::~RangeReader() {
     close();
 }
 
-int64_t RangeReader::read(int64_t pos, uint8_t* out, int64_t size, const std::atomic<bool>* abort) {
+int64_t RangeReader::read(int64_t pos, uint8_t* out, int64_t size, AbortFlag abort) {
     return core_->read(pos, out, size, abort, true);
 }
 
 int64_t RangeReader::tryRead(int64_t pos, uint8_t* out, int64_t size) {
-    return core_->read(pos, out, size, nullptr, false);
+    return core_->read(pos, out, size, {}, false);
 }
 
-int64_t RangeReader::Core::read(int64_t pos, uint8_t* out, int64_t size, const std::atomic<bool>* abort, bool wait) {
+int64_t RangeReader::Core::read(int64_t pos, uint8_t* out, int64_t size, AbortFlag abort, bool wait) {
     if (pos < 0 || size < 0) return -1;
     if (size == 0) return 0;
     const int64_t index = pos / blockSize;
@@ -393,7 +393,7 @@ int64_t RangeReader::Core::read(int64_t pos, uint8_t* out, int64_t size, const s
     const uint64_t failuresBefore = failures;
     readAheadPaused = false;
     for (;;) {
-        if (closed || (abort && abort->load())) return -1;
+        if (closed || abort.raised()) return -1;
         if (info.size >= 0 && pos >= info.size) return 0;
         if (Bytes data = blockLocked(index)) {
             const int64_t n = std::min<int64_t>(size, static_cast<int64_t>(data->size()) - offset);
@@ -416,6 +416,9 @@ int64_t RangeReader::Core::read(int64_t pos, uint8_t* out, int64_t size, const s
             askedFailures = failures;
             return -1;
         }
+        // Read-ahead follows this read from now: otherwise, with the block in, the fetch thread
+        // could go back to read ahead of the last read, and then come here again
+        readEnd = pos;
         if (demand != index) {
             demand = index;
             changed.notify_all();
@@ -431,7 +434,7 @@ int64_t RangeReader::Core::read(int64_t pos, uint8_t* out, int64_t size, const s
     }
 }
 
-bool RangeReader::fetchAll(const std::atomic<bool>* abort) {
+bool RangeReader::fetchAll(AbortFlag abort) {
     std::vector<uint8_t> scratch(static_cast<size_t>(core_->blockSize));
     for (int64_t pos = 0;;) {
         const int64_t n = read(pos, scratch.data(), static_cast<int64_t>(scratch.size()), abort);
@@ -475,4 +478,4 @@ void RangeReader::close() {
     core_->upstream->cancel();
 }
 
-} // namespace avsource
+} // namespace rangesource

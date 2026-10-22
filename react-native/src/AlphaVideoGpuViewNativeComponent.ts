@@ -63,6 +63,8 @@ type StateChangeEvent = Readonly<{
 
 type ErrorEvent = Readonly<{
   error: string;
+  /** `'NO_SOURCE_MODULE'` for a data source without the range-source add-on */
+  code?: string;
 }>;
 
 export interface NativeProps extends ViewProps {

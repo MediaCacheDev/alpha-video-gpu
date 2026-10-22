@@ -89,9 +89,9 @@ static NSString *RNAVGString(id value)
     RCTDirectEventBlock block = weakSelf.reactOnFinished;
     if (block) block(@{});
   };
-  self.onError = ^(NSString *error) {
+  self.onError = ^(NSString *error, NSString *code) {
     RCTDirectEventBlock block = weakSelf.reactOnError;
-    if (block) block(@{@"error": error});
+    if (block) block(code ? @{@"error": error, @"code": code} : @{@"error": error});
   };
 }
 

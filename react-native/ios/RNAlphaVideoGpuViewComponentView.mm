@@ -129,9 +129,9 @@ using namespace facebook::react;
     auto emitter = [weakSelf playerEventEmitter];
     if (emitter) emitter->onFinished({});
   };
-  _player.onError = ^(NSString *error) {
+  _player.onError = ^(NSString *error, NSString *code) {
     auto emitter = [weakSelf playerEventEmitter];
-    if (emitter) emitter->onError({.error = RCTStringFromNSString(error)});
+    if (emitter) emitter->onError({.error = RCTStringFromNSString(error), .code = RCTStringFromNSString(code ?: @"")});
   };
 }
 

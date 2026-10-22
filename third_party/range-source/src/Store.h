@@ -8,7 +8,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace avsource {
+namespace rangesource {
 
 class Store;
 struct StoreEntry;
@@ -95,4 +95,4 @@ private:
     std::unordered_map<std::string, std::shared_ptr<StoreEntry>> entries_;
 };
 
-} // namespace avsource
+} // namespace rangesource

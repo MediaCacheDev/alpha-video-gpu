@@ -13,8 +13,9 @@ final class AlphaVideoGpuNative {
     private AlphaVideoGpuNative() {}
 
     static native void nativeDeleteTexture(int textureId);
-    static native boolean nativeDecompressZstdToBuffer(byte[] data, int offset, int compressedLength, java.nio.ByteBuffer outputBuffer, int uncompressedLength);  // Zero-copy to direct ByteBuffer
-    static native int[] nativeLoadTextureArray(byte[] ktx2Data, boolean useAstc);
+    // The file comes as a direct ByteBuffer (mapped, or read from a reader), never on the Java heap
+    static native boolean nativeDecompressZstdToBuffer(java.nio.ByteBuffer data, long offset, long compressedLength, java.nio.ByteBuffer outputBuffer, int uncompressedLength);
+    static native int[] nativeLoadTextureArray(java.nio.ByteBuffer ktx2Data, boolean useAstc);
 
     // Streaming decompression methods (per-instance, returns/accepts stream ID)
     static native long nativeInternalZstdStreamingInit(int fd, long dataOffset, long compressedSize);  // Internal KTX2 zstd (supercompressionScheme=2); offset within the descriptor

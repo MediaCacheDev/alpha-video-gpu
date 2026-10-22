@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-namespace avsource {
+namespace rangesource {
 
 /** What a source tells about the file when a read opens. */
 struct SourceInfo {
@@ -55,4 +55,4 @@ public:
     virtual void cancel() {}
 };
 
-} // namespace avsource
+} // namespace rangesource

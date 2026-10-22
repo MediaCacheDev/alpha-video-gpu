@@ -366,7 +366,7 @@ On the web, `source` can also be a `Blob` or `File`, or a byte source, `{ size, 
 
 #### Streaming and storage
 
-An http(s) source is read by HTTP range requests as it plays, through the same reader on every platform ([alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source)). On Android and iOS:
+An http(s) source is read by HTTP range requests as it plays, through the same reader on every platform ([range-source](https://github.com/MediaCacheDev/range-source)). On Android and iOS:
 
 - With `stream` on and a zstd file (the encoder's default), playback starts after a few small reads: the header, and the seek table at the end of the level. The level is then read from its start, 256 KB at a time as the decoder needs it, and a seek reads from the seek point before its target. A file written as one zstd stream has no seek table, so a far seek reads on from where the decoder is.
 - An uncompressed file, and any file with `stream` off, is read whole before it plays, in one request.
@@ -836,7 +836,7 @@ The events have the same shape on Android, iOS and web. Playback is controlled w
 | `android/media3/` | The adapter from a Media3 `DataSource.Factory` to a data source | `dev.mediacache:alpha-video-gpu-media3` |
 | `ios/Sources/AlphaVideoGPU/` | The iOS library: `AlphaVideoGpuView` (Objective-C++) and data sources, with its public header in `include/` | SwiftPM `AlphaVideoGPU` (`Package.swift`), CocoaPods `alpha-video-gpu` (`alpha-video-gpu.podspec`) |
 | `third_party/zstd/` | zstd 1.4.9 (single-file library), compiled into both native libraries | |
-| `third_party/alpha-video-source/` | The C++ range reader and stores of [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source), compiled into both native libraries. `scripts/vendor_alpha_video_source.sh` updates it | |
+| `third_party/range-source/` | The C interface and basic input of [range-source](https://github.com/MediaCacheDev/range-source), and its C++ reader and stores, compiled into both native libraries. `scripts/vendor_range_source.sh` updates it | |
 | `react-native/` | `src/` (the component), `android/` (the view manager; its Gradle module compiles `android/` too), `ios/` (a subclass of the iOS view with React props) | npm `react-native-alpha-video-gpu` (`package.json`, `react-native-alpha-video-gpu.podspec`) |
 | `web/` | The WebGL player for browsers, with its React wrapper. `npm run build` there builds `dist/` | npm `alpha-video-gpu-web` |
 | `scripts/publish-android.sh` | `local` publishes the Android library and the Media3 adapter to `~/.m2`; `central` signs them and uploads them to the Maven Central Portal (see the script for the variables) | |
@@ -863,7 +863,7 @@ The fixtures in `tests/fixtures/` are test cards from the tester app, encoded to
 | Web, in a browser | `web/test/browser/index.html`, see below | Every streaming and memory mode on every fixture in a real browser: frame codes after seeks and in playback, from the canvas |
 | Android and iOS devices | the tester app's `test:pixels` and `test:streaming` | Every mode and memory strategy on every card, pixel by pixel, and streaming; see below |
 
-The browser page isn't automated. Build `web/dist/` (`cd web && npm run build`), serve this repository over HTTP, and open `web/test/browser/index.html`; results show on the page and in `window.results`. alpha-video-source's server supports range requests, which the streaming modes use:
+The browser page isn't automated. Build `web/dist/` (`cd web && npm run build`), serve this repository over HTTP, and open `web/test/browser/index.html`; results show on the page and in `window.results`. range-source's test server supports range requests, which the streaming modes use:
 
 ```bash
 cd ../range-source/web && npm run serve -- <path to this repo> --port 8766

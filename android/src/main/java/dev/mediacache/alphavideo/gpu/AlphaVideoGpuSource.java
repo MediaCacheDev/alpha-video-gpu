@@ -6,13 +6,13 @@ import android.content.res.Resources;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
@@ -151,18 +151,6 @@ final class AlphaVideoGpuSource {
         }
     }
 
-    byte[] readAll(Context context) throws IOException {
-        try (InputStream in = openStream(context)) {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buffer = new byte[64 * 1024];
-            int n;
-            while ((n = in.read(buffer)) != -1) {
-                out.write(buffer, 0, n);
-            }
-            return out.toByteArray();
-        }
-    }
-
     /** Up to {@code count} bytes from the start of the file (fewer if the file is shorter). */
     byte[] readHead(Context context, int count) throws IOException {
         try (InputStream in = openStream(context)) {
@@ -198,15 +186,40 @@ final class AlphaVideoGpuSource {
         }
     }
 
-    /** The whole file in a direct buffer, for uploads straight from it. */
+    /**
+     * Memory-maps a local file; the mapping stays valid after the descriptor is closed. Assets and
+     * raw resources must be stored uncompressed in the APK.
+     */
+    ByteBuffer map(Context context) throws IOException {
+        try (AssetFileDescriptor afd = openFd(context);
+             FileInputStream in = new FileInputStream(afd.getFileDescriptor())) {
+            FileChannel channel = in.getChannel();
+            long start = afd.getStartOffset();
+            long length = afd.getLength() >= 0 ? afd.getLength() : channel.size() - start;
+            return channel.map(FileChannel.MapMode.READ_ONLY, start, length);
+        }
+    }
+
+    /**
+     * The whole file in a direct buffer, for uploads straight from it, never on the Java heap: a
+     * local file mapped where it can be, a reader's file read into one.
+     */
     ByteBuffer readAllDirect(Context context) throws IOException {
-        long size = reader != null ? reader.size() : -1;
+        if (reader == null) {
+            try {
+                return map(context);
+            } catch (IOException e) {
+                // An entry compressed in the APK can only be read as a stream
+                try (InputStream in = openStream(context)) {
+                    return readDirect(in);
+                }
+            }
+        }
+        long size = reader.size();
         if (size < 0 || size > Integer.MAX_VALUE) {
-            byte[] all = readAll(context);
-            ByteBuffer out = ByteBuffer.allocateDirect(all.length);
-            out.put(all);
-            out.rewind();
-            return out;
+            try (InputStream in = openStream(context)) {
+                return readDirect(in);
+            }
         }
         ByteBuffer out = ByteBuffer.allocateDirect((int) size);
         byte[] chunk = new byte[256 * 1024];
@@ -218,6 +231,27 @@ final class AlphaVideoGpuSource {
         }
         out.rewind();
         return out;
+    }
+
+    /** A stream of unknown length into a direct buffer exactly as long, grown by doubling. */
+    private static ByteBuffer readDirect(InputStream in) throws IOException {
+        ByteBuffer out = ByteBuffer.allocateDirect(1024 * 1024);
+        byte[] chunk = new byte[256 * 1024];
+        int n;
+        while ((n = in.read(chunk)) != -1) {
+            if (out.remaining() < n) {
+                long grown = Math.max(2L * out.capacity(), (long) out.position() + n);
+                if (grown > Integer.MAX_VALUE) throw new IOException("The file is over 2 GB");
+                ByteBuffer bigger = ByteBuffer.allocateDirect((int) grown);
+                out.flip();
+                bigger.put(out);
+                out = bigger;
+            }
+            out.put(chunk, 0, n);
+        }
+        out.flip();
+        // Native code reads the buffer's capacity as the file's length
+        return out.slice();
     }
 
     /** A reader's bytes in order from 0, as a stream; skipping moves the position without reading. */

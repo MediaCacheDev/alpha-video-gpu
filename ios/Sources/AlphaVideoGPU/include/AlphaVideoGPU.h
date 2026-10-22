@@ -76,6 +76,12 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 /**
+ * onError's code for a data source without the range-source add-on, which reads them. Without it
+ * a URL is downloaded whole for each play, and storage, maxStorageBytes and cacheKey are ignored.
+ */
+extern NSString *const AlphaVideoGpuErrorNoSourceModule;
+
+/**
  * Plays a KTX2 animation with alpha. A new `source` loads on the next main-queue turn, so set the
  * other properties in the same turn and they apply to it.
  *
@@ -143,7 +149,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) void (^onStateChange)(NSString *state);
 /** Playback reached the last frame with loop off. */
 @property (nonatomic, copy, nullable) void (^onFinished)(void);
-@property (nonatomic, copy, nullable) void (^onError)(NSString *error);
+/** A load or playback error; `code` is set for those an app may handle, such as AlphaVideoGpuErrorNoSourceModule. */
+@property (nonatomic, copy, nullable) void (^onError)(NSString *error, NSString *_Nullable code);
 
 /** Plays from the shown frame, or from the start once a clip that doesn't loop has finished. */
 - (void)play;
