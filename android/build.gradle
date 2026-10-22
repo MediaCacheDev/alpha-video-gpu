@@ -55,6 +55,14 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    sourceSets {
+        main {
+            // The one class that uses range-source's types; the React Native package swaps in
+            // a stub when the app hasn't installed it
+            java.srcDirs += 'src/rangesource/java'
+        }
+    }
+
     publishing {
         singleVariant('release') {
             withSourcesJar()
