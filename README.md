@@ -866,7 +866,7 @@ The fixtures in `tests/fixtures/` are test cards from the tester app, encoded to
 The browser page isn't automated. Build `web/dist/` (`cd web && npm run build`), serve this repository over HTTP, and open `web/test/browser/index.html`; results show on the page and in `window.results`. alpha-video-source's server supports range requests, which the streaming modes use:
 
 ```bash
-cd ../alpha-video-source/web && npm run serve -- <path to this repo> --port 8766
+cd ../range-source/web && npm run serve -- <path to this repo> --port 8766
 # then open http://localhost:8766/web/test/browser/index.html
 ```
 

@@ -5,7 +5,7 @@
  * and all wrapper implementations (React Native Web, React, Vanilla JS).
  */
 
-import type { ByteSource, ByteStore, StorageKind } from 'alpha-video-source';
+import type { ByteSource, ByteStore, StorageKind } from 'range-source-web';
 
 /**
  * What a player plays: a URL (http(s), relative, or asset://path), a Blob or File, bytes in

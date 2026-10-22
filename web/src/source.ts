@@ -5,7 +5,7 @@ import {
   isByteSource,
   openReader,
   type ByteSource,
-} from 'alpha-video-source';
+} from 'range-source-web';
 import type { KTX2Source, KTX2SourceOptions, KTX2Storage } from './types';
 
 /** Keeps this player's stored clips apart from other players' (each has its own cap). */

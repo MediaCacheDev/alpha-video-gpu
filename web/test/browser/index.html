@@ -11,7 +11,7 @@
     ?input=<kind>  url (default), blob, bytes (a { size, read } source) or buffer
     ?replay        play each URL case again, failing if a stored clip makes requests
 
-  Serve it with Range support (alpha-video-source's test/range-server.mjs) to test range
+  Serve it with Range support (range-source-web's test/range-server.mjs) to test range
   reads; python3 -m http.server answers without Range, which tests the fallback.
 
   The results are in window.results once window.done is true, and on the page.
@@ -39,6 +39,9 @@
 </head>
 <body>
   <pre id="log"></pre>
+  <script type="importmap">
+    { "imports": { "range-source-web": "../../node_modules/range-source-web/dist/index.mjs" } }
+  </script>
   <script type="module" src="./run.js"></script>
 </body>
 </html>

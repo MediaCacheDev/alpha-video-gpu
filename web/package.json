@@ -63,6 +63,9 @@
   "bugs": {
     "url": "https://github.com/MediaCacheDev/alpha-video-gpu/issues"
   },
+  "dependencies": {
+    "range-source-web": "^1.0.0"
+  },
   "peerDependencies": {
     "react": ">=16.8"
   },
@@ -73,7 +76,7 @@
   },
   "devDependencies": {
     "@types/react": "^18.3.31",
-    "alpha-video-source": "file:../../alpha-video-source/web",
+    "range-source-web": "file:../../range-source/web",
     "react": "^18.3.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

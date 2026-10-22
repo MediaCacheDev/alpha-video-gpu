@@ -41,14 +41,14 @@ A seek shows the frame, clamped to the clip, and playback carries on from it or 
 - **A URL:** `https://`, relative, or `asset://path` (served from the site root). It is read with HTTP range requests, so streaming starts after the first few hundred kilobytes, and a seek fetches only from its seek point on. `headers` (for example `Authorization`) go with every request. A server without range support works too, read progressively from the start.
 - **A `Blob` or `File`,** read with `slice`.
 - **An `ArrayBuffer` or `Uint8Array`.**
-- **A byte source** of your own: `{ size, read(offset, length, signal) }`, returning a `Promise<Uint8Array>`. It's for apps that fetch, decrypt or cache in their own code. See [alpha-video-source](https://github.com/MediaCacheDev/alpha-video-source/tree/main/web#sources) for the full interface; `httpSource`, `blobSource` and `memorySource` are re-exported here.
+- **A byte source** of your own: `{ size, read(offset, length, signal) }`, returning a `Promise<Uint8Array>`. It's for apps that fetch, decrypt or cache in their own code. See [range-source-web](https://github.com/MediaCacheDev/range-source/tree/main/web#sources), which the player depends on, for the full interface; `httpSource`, `blobSource` and `memorySource` are re-exported here.
 
 What a URL's bytes are kept in between plays is the `storage` option, read when the player is created:
 
 - `'auto'` (the default for URLs) is OPFS, falling back to IndexedDB where OPFS isn't available.
 - `'opfs'`, `'indexeddb'`, `'cache'` (the Cache API) or `'memory'` (this page only) pick one. Where it isn't available, the player falls back to IndexedDB, then memory.
 - `'none'` stores nothing. Clips up to 16 MB still stay in memory, so loops don't fetch again.
-- A `ByteStore` of your own (from `createStore`, or written against alpha-video-source's interface).
+- A `ByteStore` of your own (from `createStore`, or written against range-source-web's interface).
 
 Storage is partial: it keeps the ranges played so far, and a clip held whole plays again without the network. `maxStorageBytes` (default 512 MB) caps what this player keeps across every clip, evicting the least recently played. Stored clips are named by `cacheKey`, else the URL, so a presigned URL that changes on each visit can keep the same copy. A copy is dropped when the server's `ETag`, `Last-Modified` or length no longer matches it. A clip held whole isn't checked again; give a changed file a new `cacheKey` or URL.
 
@@ -117,7 +117,7 @@ Other parameters exercise sources and storage:
 - `?replay` plays each case a second time. With a persistent store, it checks that the clip was stored whole and played again without a request.
 - `?input=blob|bytes|buffer` loads each file as a `Blob`, a minimal `{ size, read }` byte source, or an `ArrayBuffer` instead of a URL.
 
-To test range requests, serve the folder with alpha-video-source's server: `npm run serve -- <folder> --port 8766` in `alpha-video-source/web`. Add `--no-range` for a server without range support. Python's `http.server` doesn't support ranges either.
+To test range requests, serve the folder with range-source-web's server: `npm run serve -- <folder> --port 8766` in `range-source/web`. Add `--no-range` for a server without range support. Python's `http.server` doesn't support ranges either.
 
 ## License
 
