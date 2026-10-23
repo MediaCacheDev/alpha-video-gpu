@@ -1,6 +1,6 @@
 {
   "name": "alpha-video-gpu-web",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Transparent (alpha) animations in a <canvas> from ASTC texture arrays in KTX2 files, drawn with WebGL 2, for plain JS/TS and React. Streams by range requests, with seeking and offline storage; the zstd decoder is bundled inline.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

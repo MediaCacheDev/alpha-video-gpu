@@ -2,6 +2,10 @@
 
 The packages built from this repository share one version: `react-native-alpha-video-gpu` and `alpha-video-gpu-web` on npm, `dev.mediacache:alpha-video-gpu` on Maven Central, and the `AlphaVideoGPU` Swift package and `alpha-video-gpu` pod.
 
+## alpha-video-gpu-web 1.0.1 - 2026-10-23
+
+- README: the demo clip and a link to the demo app at the top, as in the repository's README. No code changes; the other packages stay at 1.0.0.
+
 ## 1.0.0 - 2026-10-23
 
 First public release.

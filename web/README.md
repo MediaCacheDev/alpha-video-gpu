@@ -1,5 +1,11 @@
 # alpha-video-gpu-web
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MediaCacheDev/alpha-video-gpu/main/docs/alpha-video-gpu.avif" alt="Transparent ASTC videos playing over a checkerboard in the demo app on Android" width="360">
+  <br>
+  <a href="https://github.com/MediaCacheDev/alpha-video-test">Compare transparent formats in the demo app</a>
+</p>
+
 Plays transparent (alpha) animations stored as ASTC texture arrays in KTX2 files, in a `<canvas>` with WebGL 2. Where the browser has `WEBGL_compressed_texture_astc` the GPU samples the ASTC directly; elsewhere the frames are decoded to RGBA in WebAssembly, as the Android and iOS players do without ASTC. The zstd decoder (JS and WebAssembly) is bundled inline: there are no files to host and no `<script>` tags.
 
 It is the web half of [alpha-video-gpu](https://github.com/MediaCacheDev/alpha-video-gpu), whose React Native component uses it on React Native Web. Encoding, streaming and the file format are described there.
