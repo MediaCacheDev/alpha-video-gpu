@@ -1,5 +1,11 @@
 # alpha-video-gpu
 
+<p align="center">
+  <img src="docs/alpha-video-gpu.avif" alt="Transparent ASTC videos playing over a checkerboard in the demo app on Android" width="360">
+  <br>
+  <a href="https://github.com/MediaCacheDev/alpha-video-test">Compare transparent formats in the demo app</a>
+</p>
+
 Plays transparent (alpha) videos stored as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
 
 | Platform | Package | View |
