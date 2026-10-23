@@ -24,6 +24,10 @@
 // How long a display tick spends catching up to a seek; the rest goes on over the next ticks
 static const CFTimeInterval kSeekSkipSliceSeconds = 0.008;
 
+// GPU slots when streaming with the ram strategy, or an uncompressed file: frames are uploaded
+// as they're shown, and the previous ones may still be drawing
+static const NSInteger kRamRingSize = 4;
+
 // The store's cap when maxStorageBytes isn't set
 static const int64_t kAVGDefaultMaxStorageBytes = 512LL * 1024 * 1024;
 // Bytes of a level read from a reader at a time
@@ -199,6 +203,11 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   NSInteger _decoderLoopIteration;         // Which loop iteration the decoder is on
   NSInteger _playbackLoopIteration;        // Which loop iteration playback is on
   BOOL _useVramStrategy;                   // True for VRAM-heavy mode
+  // Per pass, for tuning streamingPrefetchAhead: the fewest frames decoded after the shown one,
+  // and how often playback waited for the decoder
+  NSInteger _fewestAhead;
+  NSInteger _stalls;
+  BOOL _stalled;
 
   // The shown frame changed (a load or a seek) and is drawn once decoded, playing or not
   BOOL _frameOwed;
@@ -275,9 +284,7 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
     _isDestroyed = NO;
     
     // Streaming configuration defaults (match Android)
-    self.streamingRingSize = 16;       // GPU ring buffer slots
-    self.streamingCacheSize = 60;      // CPU frame cache size
-    self.streamingPrefetchAhead = 30;  // Frames to decode ahead
+    self.streamingPrefetchAhead = 8;  // Frames to decode ahead
     self.memoryStrategy = @"vram";     // vram, ram
     
     // Initialize streaming state
@@ -859,7 +866,8 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   
   // Calculate frames ahead using relative distance
   NSInteger framesAhead = (currentDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
-  NSInteger framesToDecode = self.streamingPrefetchAhead - framesAhead;
+  // framesAhead counts the shown frame
+  NSInteger framesToDecode = self.streamingPrefetchAhead + 1 - framesAhead;
   
   if (framesToDecode <= 0) {
     static int skipLogCount = 0;
@@ -895,7 +903,7 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
       // Use the same formula as at the start of the method
       NSInteger newDecodeVPos = (_decoderLoopIteration * self.totalFrames + _decoderPosition) % vPosModulus;
       NSInteger newFramesAhead = (newDecodeVPos - currentVirtualPos + vPosModulus) % vPosModulus;
-      framesToDecode = self.streamingPrefetchAhead - newFramesAhead;
+      framesToDecode = self.streamingPrefetchAhead + 1 - newFramesAhead;
       if (framesToDecode <= 0) {
         AVG_VLOG(@"After wrap-around: already ahead enough, stopping decode");
         break;
@@ -1221,14 +1229,13 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
     }
   } else {
     // RAM mode: Use sliding window with relative distance
-    // Keep frames within [-2, +streamingCacheSize] window
+    // Keep the previous frame and the ones decoded ahead
     for (NSNumber *virtualPos in _frameCache.allKeys) {
       NSInteger vPos = [virtualPos integerValue];
       NSInteger distance = (vPos - currentVirtualPos + vPosModulus) % vPosModulus;
-      // distance > vPosModulus - 2 means frame is 1-2 behind (wrapped)
-      // distance <= streamingCacheSize means frame is ahead
+      // distance > vPosModulus - 2 means frame is 1 behind (wrapped)
       BOOL isBehind = distance > (NSInteger)(vPosModulus - 2);
-      BOOL isAhead = distance <= self.streamingCacheSize;
+      BOOL isAhead = distance <= self.streamingPrefetchAhead;
       if (!isBehind && !isAhead) {
         [toRemove addObject:virtualPos];
       }
@@ -1351,11 +1358,10 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   AVG_VLOG(@"Uncompressed streaming: %ux%u, %u layers, %u bytes/layer (ASTC %ux%u), offset=%llu",
         width, height, layerCount, bytesPerLayer, _astcBlockWidth, _astcBlockHeight, level0Offset);
   
-  // Determine GPU cache size
+  // Frames are read from the mapping as they're shown, nothing ahead (but on the simulator,
+  // which decodes them to RGBA in memory), so a small ring does for either memory strategy
   BOOL useVramStrategy = ![self.memoryStrategy isEqualToString:@"ram"];
-  NSInteger gpuCacheSize = useVramStrategy ? 
-      MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
-      MIN(self.streamingRingSize, (NSInteger)layerCount);
+  NSInteger gpuCacheSize = MIN(kRamRingSize, (NSInteger)layerCount);
   
   // Setup on main thread
   dispatch_sync(dispatch_get_main_queue(), ^{
@@ -1563,8 +1569,8 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   
   // Only needed on simulator where we decode ASTC to RGBA
   NSInteger vPosModulus = self.totalFrames * 2;
-  // Decoding past the cache would have the frames evicted before they are shown
-  NSInteger aheadLimit = MIN(self.streamingPrefetchAhead, self.streamingCacheSize);
+  // framesAhead counts the shown frame
+  NSInteger aheadLimit = self.streamingPrefetchAhead + 1;
   
   // The position belongs to the decode queue, so the batch is sized there
   dispatch_async(_astcDecodeQueue, ^{
@@ -1665,7 +1671,7 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
       NSInteger vPos = [virtualPos integerValue];
       NSInteger distance = (vPos - currentVirtualPos + vPosModulus) % vPosModulus;
       BOOL isBehind = distance > (NSInteger)(vPosModulus - 2);
-      BOOL isAhead = distance <= self.streamingCacheSize;
+      BOOL isAhead = distance <= self.streamingPrefetchAhead;
       if (!isBehind && !isAhead) {
         [toRemove addObject:virtualPos];
       }
@@ -2197,11 +2203,11 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   // Calculate bytes per layer using current ASTC block dimensions
   uint32_t bytesPerLayer = [self astcBytesPerLayerForWidth:width height:height];
   
-  // Determine memory strategy
+  // vram decodes into the ring: the shown frame, the ones decoded after it, and the previous
+  // frame, which the GPU may still be drawing. ram uploads each frame as it's shown.
   BOOL useVramStrategy = ![self.memoryStrategy isEqualToString:@"ram"];
-  NSInteger gpuCacheSize = useVramStrategy ? 
-      MIN(self.streamingCacheSize, (NSInteger)layerCount) : 
-      MIN(self.streamingRingSize, (NSInteger)layerCount);
+  NSInteger gpuCacheSize = MIN(useVramStrategy ? self.streamingPrefetchAhead + 2 : kRamRingSize,
+                               (NSInteger)layerCount);
   
   AVG_VLOG(@"Internal zstd streaming params: strategy=%@, gpuCache=%ld, bytesPerLayer=%u (ASTC %ux%u)",
         self.memoryStrategy, (long)gpuCacheSize, bytesPerLayer, _astcBlockWidth, _astcBlockHeight);
@@ -2231,6 +2237,8 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
     self->_decoderPosition = 0;
     self->_decoderLoopIteration = 0;
     self->_playbackLoopIteration = 0;
+    self->_fewestAhead = layerCount;
+    self->_stalls = 0;
     
     self->_dstream = dstream;
     self->_pendingSkipBytes = 0;
@@ -2350,20 +2358,10 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   }
 }
 
-// Same ranges as Android; a size of 0 would leave the ring with no slots.
-- (void)setStreamingRingSize:(NSInteger)size
-{
-  _streamingRingSize = MAX(4, MIN(64, size));
-}
-
-- (void)setStreamingCacheSize:(NSInteger)size
-{
-  _streamingCacheSize = MAX(10, MIN(200, size));
-}
-
+// Same range as Android and the web
 - (void)setStreamingPrefetchAhead:(NSInteger)frames
 {
-  _streamingPrefetchAhead = MAX(5, MIN(100, frames));
+  _streamingPrefetchAhead = MAX(1, MIN(100, frames));
 }
 
 - (void)setPlaybackSpeed:(CGFloat)speed
@@ -2460,6 +2458,10 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
         
         if (slotVPos != virtualPos && !_frameCache[@(virtualPos)]) {
           // Frame not ready yet - skip this update
+          if (!_stalled) {
+            _stalled = YES;
+            _stalls++;
+          }
           static int notReadyCount = 0;
           if (notReadyCount++ < 20) {
             AVG_VLOG(@"Frame not ready - frame=%ld, vPos=%ld, slot=%ld has vPos=%ld, cacheSize=%lu, decoderPos=%ld",
@@ -2468,12 +2470,21 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
           }
           return;
         }
+        _stalled = NO;
+        NSInteger decodeVPos = (_decoderLoopIteration * self.totalFrames + _decoderPosition) % vPosModulus;
+        _fewestAhead = MIN(_fewestAhead, (decodeVPos - virtualPos + vPosModulus) % vPosModulus - 1);
       }
     }
     
     self.currentFrame++;
     
     if (self.currentFrame >= self.totalFrames) {
+      if (_streamingRingBufferMode && !_isUncompressedStreaming) {
+        AVG_VLOG(@"Pass buffer: fewest frames ahead %ld of %ld, stalls %ld",
+              (long)_fewestAhead, (long)self.streamingPrefetchAhead, (long)_stalls);
+        _fewestAhead = self.totalFrames;
+        _stalls = 0;
+      }
       if (self.loop) {
         self.currentFrame = 0;
         if (_streamingRingBufferMode) {

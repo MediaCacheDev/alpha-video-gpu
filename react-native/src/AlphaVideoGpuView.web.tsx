@@ -68,11 +68,7 @@ export interface AlphaVideoGpuViewProps {
   enableFrameEvents?: boolean;
 
   // Streaming parameters (with stream)
-  /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
-  streamingRingSize?: number;
-  /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */
-  streamingCacheSize?: number;
-  /** Frames to decode ahead of playback. Default: 30 */
+  /** Frames decoded ahead of the shown one, all streaming keeps. Default: 8 */
   streamingPrefetchAhead?: number;
   /** Memory strategy: 'vram' | 'ram'. Default: 'vram' */
   memoryStrategy?: 'vram' | 'ram';
@@ -110,9 +106,7 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   onFrameUpdate,
   onFinished,
   onError,
-  streamingRingSize = 16,
-  streamingCacheSize = 60,
-  streamingPrefetchAhead = 30,
+  streamingPrefetchAhead = 8,
   memoryStrategy = 'vram',
   stream = true,
   enableFrameEvents = false,
@@ -152,8 +146,6 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
       loop,
       playbackSpeed,
       stream,
-      streamingRingSize,
-      streamingCacheSize,
       streamingPrefetchAhead,
       memoryStrategy,
       verbose,

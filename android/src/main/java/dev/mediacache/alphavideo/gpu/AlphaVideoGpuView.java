@@ -167,10 +167,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
     private boolean ramHeavyMode = false;      // True when using RAM-heavy non-stream mode
     private int ramUploadedFrame = -1;         // Currently uploaded frame in GPU ring buffer
     
-    // Configurable streaming parameters (set via props)
-    private int configStreamingRingSize = 16;      // GPU ring buffer slots (VRAM)
-    private int configStreamingCacheSize = 60;     // CPU frame cache size (RAM)
-    private int configStreamingPrefetchAhead = 30; // Frames to decode ahead of playback
+    // Frames decoded ahead of the shown one while streaming (set via props). Streaming keeps
+    // only these, so it also sizes the GPU ring (vram) or the CPU cache (ram).
+    private int configStreamingPrefetchAhead = 8;
+    // The ram strategy's GPU ring: the previous frame, the shown one and the next two
+    private static final int RAM_RING_SIZE = 4;
     
     // Memory strategy: "vram", "ram"
     // - vram (default): frames in GPU VRAM (best for many simultaneous players)
@@ -435,18 +436,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         this.enableFrameEvents = enable;
     }
     
-    public void setStreamingRingSize(int size) {
-        this.configStreamingRingSize = Math.max(4, Math.min(64, size));
-        logD("setStreamingRingSize: " + this.configStreamingRingSize);
-    }
-    
-    public void setStreamingCacheSize(int size) {
-        this.configStreamingCacheSize = Math.max(10, Math.min(200, size));
-        logD("setStreamingCacheSize: " + this.configStreamingCacheSize);
-    }
-    
     public void setStreamingPrefetchAhead(int frames) {
-        this.configStreamingPrefetchAhead = Math.max(5, Math.min(100, frames));
+        this.configStreamingPrefetchAhead = Math.max(1, Math.min(100, frames));
         logD("setStreamingPrefetchAhead: " + this.configStreamingPrefetchAhead);
     }
     
@@ -893,12 +884,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         logI("Uncompressed streaming: " + pixelWidth + "x" + pixelHeight + ", " + 
               layerCount + " layers, " + bytesPerLayer + " bytes/layer (ASTC " + astcBlockWidth + "x" + astcBlockHeight + "), data offset=" + level0ByteOffset);
         
-        // Determine GPU cache size based on memory strategy
+        // Frames are read from the mapping as they're shown, nothing ahead, so a small ring does
+        // for either memory strategy
         boolean useVramStrategy = !"ram".equals(memoryStrategy);
         boolean useAstc = astcSupported;
-        int gpuCacheSize = useVramStrategy ? 
-            Math.min(configStreamingCacheSize, layerCount) : 
-            Math.min(configStreamingRingSize, layerCount);
+        int gpuCacheSize = Math.min(RAM_RING_SIZE, layerCount);
         
         logI("Uncompressed streaming params: strategy=" + memoryStrategy + 
               ", gpuCache=" + gpuCacheSize + ", vramMode=" + useVramStrategy);
@@ -1117,9 +1107,12 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         
         // Determine memory strategy
         final boolean useVramStrategy = !"ram".equals(memoryStrategy);
-        final int GPU_CACHE_SIZE = useVramStrategy ? configStreamingCacheSize : configStreamingRingSize;
-        final int CPU_CACHE_SIZE = useVramStrategy ? 5 : configStreamingCacheSize;
         final int PREFETCH_AHEAD = configStreamingPrefetchAhead;
+        // The shown frame, the ones decoded after it, and the previous frame, which the GPU may
+        // still be drawing
+        final int framesKept = PREFETCH_AHEAD + 2;
+        final int GPU_CACHE_SIZE = useVramStrategy ? framesKept : RAM_RING_SIZE;
+        final int CPU_CACHE_SIZE = useVramStrategy ? 5 : framesKept;
         
         logI("Internal zstd streaming params: strategy=" + memoryStrategy + 
               ", gpuCache=" + GPU_CACHE_SIZE + ", cpuCache=" + CPU_CACHE_SIZE + 
@@ -1187,7 +1180,7 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
             // RAM mode: DirectByteBuffer for accumulation (zero-copy decompression),
             // byte[] pool for CPU cache storage
             frameAccumulatorBuffer = ByteBuffer.allocateDirect(bytesPerLayer + bufferSize);
-            final int POOL_SIZE = CPU_CACHE_SIZE + 5;
+            final int POOL_SIZE = CPU_CACHE_SIZE;
             bufferPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
             for (int i = 0; i < POOL_SIZE; i++) {
                 bufferPool.offer(new byte[bytesPerLayer]);
@@ -1215,7 +1208,8 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         java.util.function.IntConsumer decodeFrames = (virtualPlaybackPos) -> {
             int currentVirtualDecodePos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
             int framesToDecode = (currentVirtualDecodePos - virtualPlaybackPos + vPosModulus) % vPosModulus;
-            int targetFramesAhead = PREFETCH_AHEAD;
+            // framesToDecode counts the shown frame
+            int targetFramesAhead = PREFETCH_AHEAD + 1;
             // A long catch-up to a seek goes on over several calls, so new seeks and stops get in
             long skipDeadline = System.nanoTime() + SKIP_SLICE_NANOS;
             inputPending[0] = false;
@@ -1400,6 +1394,11 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
         currentFrame = 0;
         boolean frameOwed = true;
         boolean wasPlaying = false;
+        // Per pass, for tuning streamingPrefetchAhead: the fewest frames decoded after the shown
+        // one, and how often playback waited for the decoder
+        int fewestAhead = totalFrames;
+        int stalls = 0;
+        boolean stalled = false;
         
         try {
             while (!shouldStop.get() && !isDestroyed.get()) {
@@ -1456,6 +1455,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 if (!frameInGpu && !frameInCpuCache) {
                     // Still catching up to a seek: decodeFrames goes on with it
                     if (bytesToSkip[0] > 0 && !decompressEnded[0] && !inputPending[0]) continue;
+                    if (playing && !stalled) {
+                        stalled = true;
+                        stalls++;
+                    }
                     // Bytes on their way are expected; anything else is a stall worth a warning
                     if (!inputPending[0]) {
                         Log.w(TAG, "Internal zstd frame not ready: frame=" + currentFrame + ", vPos=" + virtualPlaybackPos);
@@ -1487,6 +1490,10 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                     clock.restart();
                     wasPlaying = true;
                 }
+                stalled = false;
+                int decodedVPos = (decoderLoopIteration[0] * totalFrames + decodePos[0]) % vPosModulus;
+                int ahead = (decodedVPos - virtualPlaybackPos + vPosModulus) % vPosModulus - 1;
+                fewestAhead = Math.min(fewestAhead, ahead);
                 if (enableFrameEvents) {
                     mainHandler.post(() -> notifyFrameUpdate());
                 }
@@ -1494,12 +1501,18 @@ public class AlphaVideoGpuView extends TextureView implements TextureView.Surfac
                 
                 if (currentFrame + 1 < totalFrames) {
                     currentFrame++;
-                } else if (loop) {
-                    currentFrame = 0;
-                    playbackLoopIteration = (playbackLoopIteration + 1) % 2;
-                    logI("Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
                 } else {
-                    finish();
+                    logI("Pass buffer: fewest frames ahead " + fewestAhead + " of " + PREFETCH_AHEAD
+                        + ", stalls " + stalls);
+                    fewestAhead = totalFrames;
+                    stalls = 0;
+                    if (loop) {
+                        currentFrame = 0;
+                        playbackLoopIteration = (playbackLoopIteration + 1) % 2;
+                        logI("Internal zstd loop transition: playbackLoop=" + playbackLoopIteration);
+                    } else {
+                        finish();
+                    }
                 }
             }
         } catch (InterruptedException e) {

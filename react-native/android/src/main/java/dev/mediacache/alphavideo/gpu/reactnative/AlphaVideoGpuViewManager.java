@@ -115,19 +115,7 @@ public class AlphaVideoGpuViewManager extends AlphaVideoGpuViewManagerSpec<Alpha
         view.setPaused(paused);
     }
     
-    @ReactProp(name = "streamingRingSize", defaultInt = 16)
-    @Override
-    public void setStreamingRingSize(AlphaVideoGpuView view, int size) {
-        view.setStreamingRingSize(size);
-    }
-    
-    @ReactProp(name = "streamingCacheSize", defaultInt = 60)
-    @Override
-    public void setStreamingCacheSize(AlphaVideoGpuView view, int size) {
-        view.setStreamingCacheSize(size);
-    }
-    
-    @ReactProp(name = "streamingPrefetchAhead", defaultInt = 30)
+    @ReactProp(name = "streamingPrefetchAhead", defaultInt = 8)
     @Override
     public void setStreamingPrefetchAhead(AlphaVideoGpuView view, int frames) {
         view.setStreamingPrefetchAhead(frames);

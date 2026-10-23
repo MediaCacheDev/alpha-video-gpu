@@ -186,9 +186,7 @@ import { AlphaVideoGpuView } from 'react-native-alpha-video-gpu';
   playbackSpeed={1.0}
   stream={true}               // decodes a window of frames while playing (default); false loads every frame
   memoryStrategy="vram"       // frames on the GPU (default), or 'ram'; see Options
-  streamingRingSize={16}      // stream with 'ram': GPU slots, 4 to 64
-  streamingCacheSize={60}     // stream: frames kept decoded, 10 to 200
-  streamingPrefetchAhead={30} // stream: frames decoded ahead, 5 to 100
+  streamingPrefetchAhead={8}  // stream: frames kept decoded ahead, 1 to 100; see Buffering
   enableFrameEvents={false}   // true calls onFrameUpdate for every frame
   verbose={false}             // true logs info traces; warnings and errors always log
   onLoad={({ nativeEvent }) => console.log(nativeEvent.frameCount, nativeEvent.frameRate)}
@@ -236,9 +234,7 @@ view.setPaused(false)                  // a hold, for example while the screen i
 view.setPlaybackSpeed(1.0f)
 view.setStream(true)                   // decodes a window of frames while playing (default); false loads every frame
 view.setMemoryStrategy("vram")         // frames on the GPU (default), or "ram"; see Options
-view.setStreamingRingSize(16)          // stream with "ram": GPU slots, 4 to 64
-view.setStreamingCacheSize(60)         // stream: frames kept decoded, 10 to 200
-view.setStreamingPrefetchAhead(30)     // stream: frames decoded ahead, 5 to 100
+view.setStreamingPrefetchAhead(8)      // stream: frames kept decoded ahead, 1 to 100; see Buffering
 view.setEnableFrameEvents(false)       // true calls onFrameUpdate for every frame
 view.setVerbose(false)                 // true logs info traces to Logcat
 view.setPlayerCallback(object : AlphaVideoGpuView.PlayerCallback {
@@ -289,9 +285,7 @@ view.playbackPaused = false            // a hold; MTKView's own `paused` is used
 view.playbackSpeed = 1.0
 view.stream = true                     // decodes a window of frames while playing (default); false loads every frame
 view.memoryStrategy = "vram"           // frames on the GPU (default), or "ram"; see Options
-view.streamingRingSize = 16            // stream with "ram": GPU slots, 4 to 64
-view.streamingCacheSize = 60           // stream: frames kept decoded, 10 to 200
-view.streamingPrefetchAhead = 30       // stream: frames decoded ahead, 5 to 100
+view.streamingPrefetchAhead = 8        // stream: frames kept decoded ahead, 1 to 100; see Buffering
 view.enableFrameEvents = false         // true calls onFrameUpdate for every frame
 view.verbose = false                   // true logs info traces to the Xcode console
 view.onLoad = { width, height, frameCount, frameRate in }
@@ -328,9 +322,7 @@ function MyComponent() {
       playbackSpeed={1.0}
       stream={true}               // decodes a window of frames while playing (default); false loads every frame
       memoryStrategy="vram"       // frames on the GPU (default), or 'ram'; see Options
-      streamingRingSize={16}      // stream with 'ram': GPU slots, 4 to 64
-      streamingCacheSize={60}     // stream: frames kept decoded, 10 to 200
-      streamingPrefetchAhead={30} // stream: frames decoded ahead, 5 to 100
+      streamingPrefetchAhead={8}  // stream: frames kept decoded ahead, 1 to 100; see Buffering
       enableFrameEvents={false}   // true calls onFrameUpdate for every frame
       verbose={false}             // true logs info traces; warnings and errors always log
       onLoad={({ nativeEvent }) => console.log(nativeEvent.frameCount, nativeEvent.frameRate)}
@@ -348,16 +340,16 @@ A ref controls playback: `play()`, `pause()`, `stop()` (pauses on the first fram
 
 ### Options
 
-The examples under [Installation](#installation), [Usage](#usage) and [Web Support](#web-support) set every option, each to its default. The memory options (`stream`, `memoryStrategy` and the three sizes) and the storage options (`storage`, `maxStorageBytes`, `cacheKey`) are read when a source loads, so set them before the source; on the web, pass them when creating the player, and `cacheKey` with `setSource`. `autoPlay`, `loop`, `paused`, `playbackSpeed`, `enableFrameEvents` and `verbose` can change at any time.
+The examples under [Installation](#installation), [Usage](#usage) and [Web Support](#web-support) set every option, each to its default. The memory options (`stream`, `memoryStrategy` and `streamingPrefetchAhead`) and the storage options (`storage`, `maxStorageBytes`, `cacheKey`) are read when a source loads, so set them before the source; on the web, pass them when creating the player, and `cacheKey` with `setSource`. `autoPlay`, `loop`, `paused`, `playbackSpeed`, `enableFrameEvents` and `verbose` can change at any time.
 
-Sizes outside their range are clamped to it. Where the frames live, and which size applies:
+Where the frames live:
 
 | | `stream` off | `stream` on (the default) |
 |---|---|---|
-| `'vram'` (the default) | Every frame in a GPU texture array | A GPU ring of `streamingCacheSize` frames, decoded straight into it |
-| `'ram'` | Every frame in RAM, uploaded to the GPU as it's shown. Android and web; iOS loads every frame into VRAM | `streamingCacheSize` decoded frames in RAM, uploaded into a GPU ring of `streamingRingSize` slots |
+| `'vram'` (the default) | Every frame in a GPU texture array | `streamingPrefetchAhead` + 2 frames in a GPU texture array, decoded straight into it |
+| `'ram'` | Every frame in RAM, uploaded to the GPU as it's shown. Android and web; iOS loads every frame into VRAM | `streamingPrefetchAhead` + 2 frames in RAM, uploaded into 4 GPU slots as they're shown |
 
-`streamingPrefetchAhead` is how far ahead of the playhead the decoder runs, within the cache. See [Playback Modes](#playback-modes) for when to use each.
+`streamingPrefetchAhead` is the only size to set: how many frames are kept decoded after the shown one, 1 to 100 (values outside are clamped). See [Buffering](#buffering) for the trade-off and [Playback Modes](#playback-modes) for when to use each mode.
 
 ### Sources
 
@@ -549,9 +541,7 @@ const player = createAlphaVideoGpuPlayer(document.querySelector('canvas')!, {
   playbackSpeed: 1.0,
   stream: true,                // decodes a window of frames while playing (default); false loads every frame
   memoryStrategy: 'vram',      // frames on the GPU (default), or 'ram'; see Options
-  streamingRingSize: 16,       // stream with 'ram': GPU slots, 4 to 64
-  streamingCacheSize: 60,      // stream: frames kept decoded, 10 to 200
-  streamingPrefetchAhead: 30,  // stream: frames decoded ahead, 5 to 100
+  streamingPrefetchAhead: 8,   // stream: frames kept decoded ahead, 1 to 100; see Buffering
   frameEvents: true,           // the web default; false calls onFrameUpdate only after seeks
   verbose: false,              // true logs info traces to the browser console
   storage: 'auto',             // where played bytes are kept: OPFS, else IndexedDB; or 'indexeddb', 'cache', 'memory', 'none'
@@ -585,9 +575,7 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
   playbackSpeed={1.0}
   stream={true}
   memoryStrategy="vram"
-  streamingRingSize={16}
-  streamingCacheSize={60}
-  streamingPrefetchAhead={30}
+  streamingPrefetchAhead={8}
   verbose={false}
   onLoad={({ frameCount }) => {}}
   onStateChange={(state) => {}}
@@ -625,7 +613,7 @@ The `memoryStrategy` prop controls where the main frame buffer is located. The g
 
 On iOS, playback without `stream` always keeps every frame in VRAM.
 
-**Why `vram` is the default:** when streaming, it holds `streamingCacheSize` frames on the GPU and almost nothing in RAM, where `ram` holds the same frames in RAM plus a GPU ring of `streamingRingSize`. So it uses less memory in total and copies each frame once, and on Android the upload runs asynchronously through a pixel buffer. Its frames stay out of the Java heap on Android (whose limit is often 256–512 MB) and the JavaScript heap on the web. Phones share physical memory between CPU and GPU, so on iOS the textures still count toward the app's memory limit, but `vram` still uses less of it. The ring is allocated as one texture array when the source loads; a clip too large for it reports `onError`.
+**Why `vram` is the default:** when streaming, it holds `streamingPrefetchAhead` + 2 frames on the GPU and almost nothing in RAM, where `ram` holds the same frames in RAM plus 4 GPU slots. So it uses less memory in total and copies each frame once, and on Android the upload runs asynchronously through a pixel buffer. Its frames stay out of the Java heap on Android (whose limit is often 256–512 MB) and the JavaScript heap on the web. Phones share physical memory between CPU and GPU, so on iOS the textures still count toward the app's memory limit, but `vram` still uses less of it. The ring is allocated as one texture array when the source loads; a clip too large for it reports `onError`.
 
 ### Non-Streaming
 
@@ -670,9 +658,7 @@ The `streamMode` metadata key that older encoders wrote is ignored; only the `st
   source={{ uri: 'https://example.com/video.ktx2' }}
   stream
   memoryStrategy="vram"
-  streamingRingSize={16}
-  streamingCacheSize={60}
-  streamingPrefetchAhead={30}
+  streamingPrefetchAhead={8}
 />
 ```
 
@@ -681,39 +667,58 @@ The `streamMode` metadata key that older encoders wrote is ignored; only the `st
 | Prop | Default | Description |
 |------|---------|-------------|
 | `stream` | `true` | Stream a texture array instead of loading every frame |
-| `memoryStrategy` | `"vram"` | `"vram"` = GPU ring buffer (minimizes RAM), `"ram"` = CPU cache + GPU ring buffer (minimizes VRAM) |
-| `streamingRingSize` | `16` | RAM mode: GPU texture slots that frames are uploaded into (4–64). Unused in VRAM mode |
-| `streamingCacheSize` | `60` | Frames kept decoded (10–200): in CPU memory in RAM mode, and as the GPU ring's slots in VRAM mode |
-| `streamingPrefetchAhead` | `30` | Frames decoded ahead of the playback position (5–100) |
+| `memoryStrategy` | `"vram"` | Where the decoded frames are kept: `"vram"` on the GPU (minimizes RAM), `"ram"` in RAM with 4 GPU slots (minimizes VRAM) |
+| `streamingPrefetchAhead` | `8` | Frames kept decoded after the shown one (1–100); see [Buffering](#buffering) |
 
 #### VRAM Streaming (Default)
 
-Frames are decoded directly into a GPU texture ring buffer of `streamingCacheSize` slots. Minimal CPU RAM usage - only the ring buffer exists in VRAM.
+Frames are decoded straight into a GPU texture array of `streamingPrefetchAhead` + 2 layers, used as a ring: frame n goes in layer n modulo the size. With `streamingPrefetchAhead={5}`, 7 layers:
 
 ```
-[GPU Ring Buffer: 60 slots]
-Slot 0: Frame 100  ← Currently displaying
-Slot 1: Frame 101
-Slot 2: Frame 102
-...
-Slot 59: Frame 159 ← Prefetched ahead
+[GPU texture array: 5 + 2 = 7 layers]
+Frame 100  layer 2   previous frame, which the GPU may still be drawing
+Frame 101  layer 3   ← shown
+Frame 102  layer 4   ┐
+Frame 103  layer 5   │
+Frame 104  layer 6   │ decoded ahead (streamingPrefetchAhead = 5)
+Frame 105  layer 0   │
+Frame 106  layer 1   ┘
+When frame 102 shows, frame 107 is decoded into layer 2, over frame 100
 ```
 
 #### RAM Streaming
 
-Frames are first decoded to a CPU RAM cache of `streamingCacheSize` frames, then uploaded to a smaller GPU ring buffer of `streamingRingSize` slots on demand. Minimizes VRAM usage while providing a larger decode-ahead buffer.
+The same frames are decoded into RAM instead, and each is uploaded into one of 4 GPU slots as it's about to show. That keeps VRAM at 4 frames whatever `streamingPrefetchAhead` is, and costs an upload per frame shown.
 
 ```
-[CPU Cache: 60 frames] → [GPU Ring Buffer: 16 slots]
-Frames 80-139 cached    Frames 100-119 in GPU
+[RAM: 5 + 2 = 7 frames]                 [GPU: 4 slots]
+Frames 100–106 (101 shown, 102–106 ahead) → the shown frame and the next ones to show
 ```
 
 #### Why Streaming?
 
 Streaming enables playback of arbitrarily long videos with **fixed memory footprint**:
 - A 10,000 frame video uses the same memory as a 100 frame video
-- Memory usage is fully configurable via ring buffer and cache size props
+- Memory is set by one prop, `streamingPrefetchAhead`
 - Ideal for long-form content, digital signage, or memory-constrained devices
+
+#### Buffering
+
+`streamingPrefetchAhead` is the only buffer setting. The decoder runs ahead of the playhead until that many frames after the shown one are ready, and a frame's space is reused once it's behind the playhead, so the player holds `streamingPrefetchAhead` + 2 frames: the previous one, the shown one and the ones ahead. With `vram` they are the GPU ring itself, so its size follows from the same setting; with `ram` they are in RAM, and the GPU has 4 slots whatever the setting.
+
+The frames ahead are a safety margin. Decompressing zstd usually keeps well ahead, but some stretches take longer than a frame's time: the restart at each loop, other players or the app busy on the CPU, or the bytes of a URL still arriving. While frames are left ahead, playback carries on through them; when none are left, the shown frame stays up until the next is ready. A larger margin rides out longer slow stretches and costs memory, 1 byte a pixel per frame in `astc4x4` (less for larger blocks, and 4 bytes on the web without GPU ASTC):
+
+| Frame size | One frame (`astc4x4`) | At the default (10 frames) |
+|---|---|---|
+| 400×400 | 0.16 MB | 1.6 MB |
+| 1080×1080 | 1.2 MB | 12 MB |
+| 1920×1080 | 2.1 MB | 21 MB |
+
+The default, 8, is about a quarter of a second at 30 fps, the same as alpha-video's. Decompressing zstd is lighter work than decoding video, so it is a generous margin; go higher for large frames on low-end phones, or on the web to keep short loops in the ring.
+
+It doesn't change the decoding work, only how far ahead it's done, and it doesn't buffer bytes: with range-source, the reads ahead of the decoder are its own (see [Streaming and storage](#streaming-and-storage)). Uncompressed files decode nothing ahead and ignore it. On the web a clip whose frames all fit in the `vram` ring loops without decoding again, so a larger value can save the CPU work of short loops there.
+
+To tune it on Android and iOS, turn on `verbose`. At the end of every pass through the clip the player logs a line like `Pass buffer: fewest frames ahead 6 of 8, stalls 0`: the fewest frames it had ready during the pass, and how many times it had none and held a frame. Watch a few loops on the slowest device you support, with as many players as the app shows at once. If the fewest stays well above 0 and there are no stalls, a smaller value saves memory; with stalls, a larger one helps if they come from short slow stretches, but if decoding can't keep up on average no margin will, and fewer players at once or an uncompressed file will.
 
 ### Encoding for Streaming
 
@@ -764,8 +769,6 @@ texenc --input ./frames --output video_uncompressed.ktx2 --fps 30 --zstd 0
 <AlphaVideoGpuView
   source={{ uri: 'https://example.com/video_uncompressed.ktx2' }}
   stream
-  memoryStrategy="ram"
-  streamingRingSize={16}
 />
 ```
 
@@ -773,7 +776,7 @@ texenc --input ./frames --output video_uncompressed.ktx2 --fps 30 --zstd 0
 
 1. **Memory-mapped file access** - The KTX2 file is mmap'd, allowing the OS to page frames in/out efficiently
 2. **Direct GPU upload** - ASTC blocks are copied directly to GPU texture memory (no Zstd decompression needed)
-3. **Ring buffer playback** - Only `streamingCacheSize` frames (`streamingRingSize` with `memoryStrategy="ram"`) are in GPU memory at once
+3. **Ring buffer playback** - Each frame is copied into a ring of 4 GPU slots as it's shown, so only 4 frames are in GPU memory at once. Nothing is decoded ahead, so `streamingPrefetchAhead` and `memoryStrategy` don't apply
 4. **No decoding on the CPU** - On devices with ASTC hardware, each frame is a copy from the mapped file to the GPU
 
 ### Trade-offs
@@ -837,9 +840,7 @@ Not ideal for:
 | `maxStorageBytes` | `number` | 512 MB | The store's cap, over every clip in it |
 | `memoryStrategy` | `"vram"` \| `"ram"` | `"vram"` | Where frames are kept; see [Options](#options) |
 | `stream` | `boolean` | `true` | Stream a texture array with a ring buffer |
-| `streamingRingSize` | `number` | `16` | GPU texture slots for RAM-mode streaming (4–64) |
-| `streamingCacheSize` | `number` | `60` | Frames kept decoded while streaming (10–200): in CPU memory in RAM mode, in the GPU ring in VRAM mode |
-| `streamingPrefetchAhead` | `number` | `30` | Frames to decode ahead (5–100) |
+| `streamingPrefetchAhead` | `number` | `8` | Frames kept decoded after the shown one while streaming (1–100): a safety margin that costs memory. The player keeps this many plus 2, on the GPU with `vram` and in RAM with `ram` (see [Buffering](#buffering)) |
 | `enableFrameEvents` | `boolean` | `false` | Send `onFrameUpdate` for every frame played, not only after seeks |
 | `verbose` | `boolean` | `false` | Log info traces (Logcat, Xcode console, browser console); warnings and errors always log |
 | `onLoad` | `({ nativeEvent: { width, height, frameCount, frameRate, duration } }) => void` | — | Metadata is known |

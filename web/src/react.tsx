@@ -58,8 +58,6 @@ export interface AlphaVideoGpuPlayerProps {
   stream?: boolean;
 
   // Streaming parameters
-  streamingRingSize?: number;
-  streamingCacheSize?: number;
   streamingPrefetchAhead?: number;
   memoryStrategy?: MemoryStrategy;
   /** Log info traces to the console. Default: false */
@@ -103,8 +101,6 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
   playbackSpeed = 1.0,
   paused = false,
   stream = true,
-  streamingRingSize,
-  streamingCacheSize,
   streamingPrefetchAhead,
   memoryStrategy,
   verbose = false,
@@ -138,8 +134,6 @@ export const AlphaVideoGpuPlayer = forwardRef<AlphaVideoGpuPlayerRef, AlphaVideo
       loop,
       playbackSpeed,
       stream,
-      streamingRingSize,
-      streamingCacheSize,
       streamingPrefetchAhead,
       memoryStrategy,
       verbose,

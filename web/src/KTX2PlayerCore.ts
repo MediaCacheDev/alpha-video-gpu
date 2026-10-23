@@ -79,6 +79,9 @@ function isAbortError(error: unknown): boolean {
 /** How long the streaming decoder works before letting the page draw and handle input. */
 const DECODE_SLICE_MS = 8;
 
+/** GPU slots when streaming with the ram strategy. */
+const RAM_RING_SIZE = 4;
+
 function yieldToEventLoop(): Promise<void> {
   const scheduler = (globalThis as any).scheduler;
   if (typeof scheduler?.yield === 'function') return scheduler.yield();
@@ -95,8 +98,6 @@ export class KTX2PlayerCore {
   private _loop: boolean;
   private _playbackSpeed: number;
   private _stream: boolean;
-  private _streamingRingSize: number;
-  private _streamingCacheSize: number;
   private _streamingPrefetchAhead: number;
   private _memoryStrategy: MemoryStrategy;
   private _verbose: boolean;
@@ -190,10 +191,8 @@ export class KTX2PlayerCore {
     this._loop = options.loop ?? true;
     this._playbackSpeed = options.playbackSpeed ?? 1.0;
     this._stream = options.stream ?? true;
-    // Same ranges as Android and iOS; a size of 0 would leave the ring with no slots.
-    this._streamingRingSize = clampInt(options.streamingRingSize ?? 16, 4, 64);
-    this._streamingCacheSize = clampInt(options.streamingCacheSize ?? 60, 10, 200);
-    this._streamingPrefetchAhead = clampInt(options.streamingPrefetchAhead ?? 30, 5, 100);
+    // Same range as Android and iOS
+    this._streamingPrefetchAhead = clampInt(options.streamingPrefetchAhead ?? 8, 1, 100);
     this._memoryStrategy = options.memoryStrategy === 'ram' ? 'ram' : 'vram';
     this._verbose = options.verbose ?? false;
     this._storage = options.storage;
@@ -702,7 +701,10 @@ export class KTX2PlayerCore {
     const useVram = this._memoryStrategy !== 'ram';
     this._useVramStrategy = useVram;
 
-    const gpuCacheSize = useVram ? this._streamingCacheSize : this._streamingRingSize;
+    // Frames are uploaded as they're shown, so the ram ring holds the shown frame and the next
+    // three; vram's keeps as many as streaming decodes, which lets a clip that fits loop without
+    // decoding again
+    const gpuCacheSize = useVram ? this._streamingPrefetchAhead + 2 : RAM_RING_SIZE;
     const ringSize = Math.min(gpuCacheSize, layerCount);
 
     this._log(`[AlphaVideoGpu] Memory strategy: ${this._memoryStrategy} (useVram=${useVram}), GPU cache: ${ringSize} slots`);
@@ -829,10 +831,7 @@ export class KTX2PlayerCore {
     this._backgroundDecodeStream = stream;
     const decompressLoop = async () => {
       const layerCount = this._streamingLayerCount;
-      // In RAM mode frames past the cache window would be evicted as soon as they're decoded
-      const aheadLimit = this._useVramStrategy
-        ? this._streamingPrefetchAhead
-        : Math.min(this._streamingPrefetchAhead, this._streamingCacheSize);
+      const aheadLimit = this._streamingPrefetchAhead;
       let sliceEnd = performance.now() + DECODE_SLICE_MS;
       // The stream clears as the loop ends, not a task later: a restart in between would see it
       // still set, start nothing, and leave playback waiting for frames
@@ -843,7 +842,7 @@ export class KTX2PlayerCore {
             sliceEnd = performance.now() + DECODE_SLICE_MS;
           } else if (stream.skipping) {
             await stream.skip(sliceEnd);
-          } else if (stream.position - this._currentFrame < aheadLimit) {
+          } else if (stream.position - this._currentFrame <= aheadLimit) {
             const frameIndex = stream.position;
             const frameData = await stream.readLayer();
             if (this._layerStream !== stream) break;
@@ -921,7 +920,7 @@ export class KTX2PlayerCore {
       }
     } else {
       const minFrame = currentPlaybackFrame - 2;
-      const maxFrame = currentPlaybackFrame + this._streamingCacheSize;
+      const maxFrame = currentPlaybackFrame + this._streamingPrefetchAhead;
       for (const frameIndex of frameCache.keys()) {
         if (frameIndex < minFrame || frameIndex > maxFrame) toRemove.push(frameIndex);
       }
@@ -929,8 +928,8 @@ export class KTX2PlayerCore {
 
     for (const frameIndex of toRemove) frameCache.delete(frameIndex);
 
-    if (frameCache.size > this._streamingCacheSize + 10) {
-      console.warn(`[AlphaVideoGpu] Frame cache too large: ${frameCache.size} frames (max: ${this._streamingCacheSize}), playback: ${currentPlaybackFrame}`);
+    if (frameCache.size > this._streamingPrefetchAhead + 10) {
+      console.warn(`[AlphaVideoGpu] Frame cache too large: ${frameCache.size} frames (max: ${this._streamingPrefetchAhead}), playback: ${currentPlaybackFrame}`);
     }
   }
 
@@ -1037,8 +1036,8 @@ export class KTX2PlayerCore {
       if (slot === -1) return false;
       layerIndex = slot;
 
-      // Prefetch next frames
-      for (let i = 1; i <= 3; i++) {
+      // Prefetch next frames, short of the slot the shown frame is drawn from
+      for (let i = 1; i <= 3 && i < this._streamingRingActualSize; i++) {
         const nextFrame = currentFrame + i;
         if (nextFrame < metadata.frameCount) {
           this._ensureFrameInRingBuffer(nextFrame);

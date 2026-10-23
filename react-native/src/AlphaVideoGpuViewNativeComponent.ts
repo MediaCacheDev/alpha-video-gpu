@@ -82,12 +82,8 @@ export interface NativeProps extends ViewProps {
   maxStorageBytes?: WithDefault<Double, 0>;
 
   // Streaming parameters (with stream)
-  /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
-  streamingRingSize?: WithDefault<Int32, 16>;
-  /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */
-  streamingCacheSize?: WithDefault<Int32, 60>;
-  /** Frames to decode ahead of playback. Default: 30 */
-  streamingPrefetchAhead?: WithDefault<Int32, 30>;
+  /** Frames decoded ahead of the shown one, all streaming keeps: the GPU ring (vram) or the CPU cache (ram). Default: 8 */
+  streamingPrefetchAhead?: WithDefault<Int32, 8>;
 
   /**
    * Memory strategy for frame storage.

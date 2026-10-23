@@ -73,14 +73,14 @@ import { AlphaVideoGpuPlayer } from 'alpha-video-gpu-web/react';
 />
 ```
 
-Props: `src` (any source `setSource` takes), `cacheKey`, `headers`, `storage`, `maxStorageBytes`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingRingSize`, `streamingCacheSize`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. A ref has `play()`, `pause()`, `stop()`, `seekToFrame(frame)` and `seekToTime(seconds)`. A new `src` loads again, as does a new `cacheKey` for a URL. New `headers` are used from the next load, and `storage` and `maxStorageBytes` are read when the component mounts. React 16.8 or later is an optional peer dependency.
+Props: `src` (any source `setSource` takes), `cacheKey`, `headers`, `storage`, `maxStorageBytes`, `width`, `height`, `className`, `style`, `autoPlay`, `loop`, `playbackSpeed`, `paused`, `stream`, `streamingPrefetchAhead`, `memoryStrategy`, `verbose`, and the callbacks `onLoad`, `onStateChange`, `onFrameUpdate`, `onFinished`, `onError`. A ref has `play()`, `pause()`, `stop()`, `seekToFrame(frame)` and `seekToTime(seconds)`. A new `src` loads again, as does a new `cacheKey` for a URL. New `headers` are used from the next load, and `storage` and `maxStorageBytes` are read when the component mounts. React 16.8 or later is an optional peer dependency.
 
 ## Without GPU ASTC
 
 When the browser has no `WEBGL_compressed_texture_astc`, each frame is decoded to RGBA on the main thread when it's uploaded, with the decoder the Android and iOS players use, compiled to WebAssembly. It loads as a separate 42 KB chunk, only in those browsers. Bundlers (webpack, Vite, esbuild) take the ESM build even for a `require`, as the `module` export condition comes first, so React Native for Web gets the chunk too; only Node's CommonJS build inlines it. What changes:
 
 - **Speed.** About 1.2 ms per 400×400 frame on an Apple M4, so roughly 16 ms at 1080p; slower CPUs take proportionally longer.
-- **Memory.** Textures are RGBA8, 4 bytes a pixel against 1 for `astc4x4` (and less for larger blocks), so a VRAM streaming ring of `streamingCacheSize` frames takes that much more GPU memory. Preloaded (`stream={false}`) playback keeps the clip as ASTC in memory and decodes only the shown frame, whatever `memoryStrategy` says, as every frame in RGBA could need gigabytes.
+- **Memory.** Textures are RGBA8, 4 bytes a pixel against 1 for `astc4x4` (and less for larger blocks), so a VRAM streaming ring of `streamingPrefetchAhead` + 2 frames takes that much more GPU memory. Preloaded (`stream={false}`) playback keeps the clip as ASTC in memory and decodes only the shown frame, whatever `memoryStrategy` says, as every frame in RGBA could need gigabytes.
 
 `verbose` logs which path a player took.
 

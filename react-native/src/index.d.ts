@@ -61,8 +61,7 @@ export interface AlphaVideoGpuViewProps {
   onLoad?: (event: { nativeEvent: { width: number; height: number; frameCount: number; frameRate: number; duration: number } }) => void;
   
   // Streaming parameters
-  streamingRingSize?: number;
-  streamingCacheSize?: number;
+  /** Frames decoded ahead of the shown one, all streaming keeps (in the GPU ring with 'vram', in RAM with 'ram') */
   streamingPrefetchAhead?: number;
   /** Where frames are kept: 'vram' (default) or 'ram' */
   memoryStrategy?: 'vram' | 'ram';

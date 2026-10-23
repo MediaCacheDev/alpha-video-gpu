@@ -64,11 +64,7 @@ export interface KTX2PlayerCoreOptions {
   stream?: boolean;
 
   // Streaming parameters
-  /** RAM-mode streaming: GPU ring slots frames are uploaded into. Unused in VRAM mode. Default: 16 */
-  streamingRingSize?: number;
-  /** Frames kept decoded while streaming: in CPU memory (RAM mode) or as the GPU ring (VRAM mode). Default: 60 */
-  streamingCacheSize?: number;
-  /** Frames to decode ahead of playback. Default: 30 */
+  /** Frames decoded ahead of the shown one, all streaming keeps. Default: 8 */
   streamingPrefetchAhead?: number;
   /** Memory strategy: 'vram' | 'ram'. Default: 'vram' */
   memoryStrategy?: MemoryStrategy;

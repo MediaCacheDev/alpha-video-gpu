@@ -21,8 +21,6 @@ public abstract class AlphaVideoGpuViewManagerSpec<T extends View> extends Simpl
     public abstract void setPlaybackSpeed(T view, float value);
     public abstract void setPaused(T view, boolean value);
     public abstract void setCacheKey(T view, @Nullable String value);
-    public abstract void setStreamingRingSize(T view, int value);
-    public abstract void setStreamingCacheSize(T view, int value);
     public abstract void setStreamingPrefetchAhead(T view, int value);
     public abstract void setMemoryStrategy(T view, @Nullable String value);
     public abstract void setStream(T view, boolean value);

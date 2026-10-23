@@ -75,8 +75,6 @@ using namespace facebook::react;
   _player.playbackPaused = newProps.paused;
   _player.enableFrameEvents = newProps.enableFrameEvents;
   _player.stream = newProps.stream;
-  _player.streamingRingSize = newProps.streamingRingSize;
-  _player.streamingCacheSize = newProps.streamingCacheSize;
   _player.streamingPrefetchAhead = newProps.streamingPrefetchAhead;
   _player.memoryStrategy = RCTNSStringFromString(toString(newProps.memoryStrategy));
   _player.verbose = newProps.verbose;
