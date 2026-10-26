@@ -1,6 +1,6 @@
 {
   "name": "react-native-alpha-video-gpu",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Transparent (alpha) animations for React Native on Android, iOS and web, from ASTC texture arrays in KTX2 files. The GPU draws the frames as stored, with Metal, OpenGL ES or WebGL, so dozens play at once with little CPU.",
   "main": "react-native/src/index.js",
   "types": "react-native/src/index.d.ts",

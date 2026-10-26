@@ -12,7 +12,7 @@ Plays transparent (alpha) videos stored as ASTC texture arrays in KTX2 files, dr
 |---|---|---|
 | React Native (Android, iOS, web) | npm `react-native-alpha-video-gpu` | `AlphaVideoGpuView` |
 | Android | Maven `dev.mediacache:alpha-video-gpu` | `dev.mediacache.alphavideo.gpu.AlphaVideoGpuView` |
-| iOS | Swift Package Manager, product `AlphaVideoGPU`; CocoaPods `alpha-video-gpu` | `AlphaVideoGpuView` |
+| iOS | Swift Package Manager, product `AlphaVideoGPU` (`AlphaVideoGPUCore` without range-source); CocoaPods `alpha-video-gpu` | `AlphaVideoGpuView` |
 | Web (plain JS/TS, React) | npm `alpha-video-gpu-web` | `createAlphaVideoGpuPlayer`, `AlphaVideoGpuPlayer` |
 
 See it next to the other formats in the [demo app](#demo-and-related-packages).
@@ -267,14 +267,14 @@ pod 'alpha-video-gpu', '1.0.0'
 **Swift Package Manager**, package `alpha-video-gpu`, product `AlphaVideoGPU`:
 
 ```swift
-.package(url: "https://github.com/MediaCacheDev/alpha-video-gpu", from: "1.0.0")
+.package(url: "https://github.com/MediaCacheDev/alpha-video-gpu", from: "1.0.1")
 // in the target's dependencies:
 .product(name: "AlphaVideoGPU", package: "alpha-video-gpu")
 ```
 
-The module is `AlphaVideoGPU` either way.
+In an Xcode project, add the package (File > Add Package Dependencies) and pick `AlphaVideoGPU` for the app target. The module is `AlphaVideoGPU` either way.
 
-Both bring [range-source](https://github.com/MediaCacheDev/range-source), which reads URLs by range and keeps them between plays: the pod's `Source` subspec, and the package's default trait, `Source` (Swift 6.1, Xcode 16.3 or later). To leave it out ([Without range-source](#without-range-source)), take the pod's core alone, `pod 'alpha-video-gpu', '1.0.0', :subspecs => ['Core']`. From a package, depend on the player with `traits: []`. An Xcode app project can't choose a package's traits, so an app that adds the package in Xcode always has range-source.
+Both bring [range-source](https://github.com/MediaCacheDev/range-source), which reads URLs by range and keeps them between plays: the pod's `Source` subspec, and the package's `AlphaVideoGPU` product. To leave it out ([Without range-source](#without-range-source)), take the pod's core alone, `pod 'alpha-video-gpu', '1.0.0', :subspecs => ['Core']`, or the package's `AlphaVideoGPUCore` product instead of `AlphaVideoGPU`. These are products rather than a package trait because Xcode before 26.4 applies no package traits, default ones included.
 
 `AlphaVideoGpuView` is an Objective-C `MTKView`, so it works from Swift and Objective-C:
 
@@ -364,7 +364,7 @@ Where the frames live:
 | Form | iOS | Android | Web | Notes |
 |------|-----|---------|-----|-------|
 | `https://…`, `http://…` | ✓ | ✓ | ✓ | Read by range requests as it plays, and kept between plays; see [Streaming and storage](#streaming-and-storage). Without range-source on Android and iOS, downloaded whole. `source.headers` go with every request. |
-| anything, with `source.dataSource` | ✓ | ✓ | — | Read by a data source the app registered under that name; see [Data sources](#data-sources). On the web, pass a byte source instead (below). |
+| anything, with `source.dataSource` | ✓ | ✓ | ✓ | Read by a data source the app registered under that name; see [Data sources](#data-sources). On react-native-web the name is registered with range-source-web; a web app holding the player passes a byte source instead (below). |
 | `file:///abs/path`, `/abs/path` | ✓ | ✓ | — | Read in place. |
 | `asset://path/in/bundle` | ✓ | ✓ | ✓ | Android: APK `assets/`. iOS: the app bundle's resource folder. Web: the site root (`/path/in/bundle`). |
 | `content://…` | — | ✓ | — | Read through the `ContentResolver`. |
@@ -465,7 +465,11 @@ final class MyDataSource: NSObject, RangeDataSource {
 RangeDataSources.register(MyDataSource(), name: "mine")
 ```
 
-**React Native:** register in native code, as above, in `MainApplication` (Android) and `AppDelegate` (iOS, `import RangeSource`).
+**React Native:** register in native code, as above, in `MainApplication` (Android) and `AppDelegate` (iOS, `import RangeSource`). On react-native-web, register a function that makes a byte source for a URI with range-source-web (1.2.0 or later): `RangeDataSources.register('mine', (uri, { headers }) => myByteSource(uri, headers))`.
+
+**MediaCache** is a data source on Android, iOS, React Native (react-native-web included) and the web. `cache.registerRangeDataSource()` registers it as `'mediacache'`. The player's files then stream through the cache: each byte is fetched once, shared with every other player of the file, and kept under the cache's eviction, TTL and offline replay. See [Transparent Video](https://github.com/MediaCacheDev/media-cache#transparent-video-alpha-video-and-alpha-video-gpu) in MediaCache's README.
+
+MediaCache needs range-source on Android, iOS and React Native: MediaCache fetches and stores the bytes, and range-source passes the player's reads to it. range-source is included by default ([Installation](#installation)), but an app that left it out has to add it back, and `registerRangeDataSource` returns false without it. On the web, the player's range-source-web is always included.
 
 #### Bundled with `require()`
 
@@ -835,7 +839,7 @@ Not ideal for:
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `source` | `{ uri: string, cacheKey?: string, headers?: Record<string, string>, dataSource?: string }` | — | What to play; see [Sources](#sources). On web also a `Blob` or a byte source, and `dataSource` has no effect |
+| `source` | `{ uri: string, cacheKey?: string, headers?: Record<string, string>, dataSource?: string }` | — | What to play; see [Sources](#sources). On web also a `Blob` or a byte source, and `dataSource` names a data source registered with range-source-web |
 | `style` | `ViewStyle` | — | Container style |
 | `autoPlay` | `boolean` | `true` | Start playback once loaded |
 | `loop` | `boolean` | `true` | Loop playback |
@@ -890,7 +894,7 @@ The fixtures in `tests/fixtures/` are test cards from the tester app, encoded to
 | Web, under Node | `cd web && npm test` | The KTX2 parser, the seek table, streaming reads and seeks in zstd and uncompressed files, and every frame of the fixtures through the software ASTC decoder, read back by its frame code |
 | Android, on the host | `cd android && ./gradlew testReleaseUnitTest` | The seek table parser (JUnit) |
 | iOS, on the host | `clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test` | The seek table, reads and seeks (`zstd_seek.h`), from the repository root |
-| iOS simulator | `xcodebuild test -scheme AlphaVideoGPU -destination 'platform=iOS Simulator,name=iPhone 16 Pro'`, and the same with `-scheme WithoutRangeSource-Package` in `ios/Tests/WithoutRangeSource` | With range-source (`SourceTests`), a data source registered with it. Without it (a package depending on this one with `traits: []`), a file plays and a data source reports `NO_SOURCE_MODULE`. `RANGE_SOURCE_PATH` points them at a range-source checkout instead of its release |
+| iOS simulator | `xcodebuild test -scheme AlphaVideoGPU-Package -destination 'platform=iOS Simulator,name=iPhone 16 Pro'`, and the same with `-scheme WithoutRangeSource-Package` in `ios/Tests/WithoutRangeSource` | With range-source (`SourceTests`), a data source registered with it. Without it (a package taking the `AlphaVideoGPUCore` product), a file plays and a data source reports `NO_SOURCE_MODULE`. `RANGE_SOURCE_PATH` points them at a range-source checkout instead of its release |
 | Web, in a browser | `web/test/browser/index.html`, see below | Every streaming and memory mode on every fixture in a real browser: frame codes after seeks and in playback, from the canvas |
 | Android and iOS devices | the tester app's `test:pixels` and `test:streaming` | Every mode and memory strategy on every card, pixel by pixel, and streaming; see below |
 
@@ -921,7 +925,7 @@ The tester app installs `react-native-range-source`. Without it (`npm uninstall 
 (cd web && npm test)
 (cd android && ./gradlew testReleaseUnitTest)
 clang -O1 -Ithird_party -Iios/Sources/AlphaVideoGPU ios/Tests/zstd_seek_test.c third_party/zstd/zstd.c -o /tmp/zstd_seek_test && /tmp/zstd_seek_test
-xcodebuild test -scheme AlphaVideoGPU -destination 'platform=iOS Simulator,name=iPhone 16 Pro'
+xcodebuild test -scheme AlphaVideoGPU-Package -destination 'platform=iOS Simulator,name=iPhone 16 Pro'
 (cd ios/Tests/WithoutRangeSource && xcodebuild test -scheme WithoutRangeSource-Package -destination 'platform=iOS Simulator,name=iPhone 16 Pro')
 # the browser page, with ?astc=off too; then, in alpha-video-test: test:pixels and test:streaming with --player gpu on each platform
 ```

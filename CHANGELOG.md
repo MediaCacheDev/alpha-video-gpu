@@ -2,6 +2,14 @@
 
 The packages built from this repository share one version: `react-native-alpha-video-gpu` and `alpha-video-gpu-web` on npm, `dev.mediacache:alpha-video-gpu` on Maven Central, and the `AlphaVideoGPU` Swift package and `alpha-video-gpu` pod.
 
+## react-native-alpha-video-gpu 1.0.1 - Unreleased
+
+For `react-native-alpha-video-gpu` and the `AlphaVideoGPU` Swift package; the other packages stay at 1.0.0.
+
+- On react-native-web, `source.dataSource` names a data source registered with range-source-web's `RangeDataSources`, as it names a native one on Android and iOS, so the same `source={{ uri, dataSource }}` plays on all three; MediaCache registers as `'mediacache'` with `cache.registerRangeDataSource()`. An unregistered name reports `onError`. Its bytes are stored only with `storage="disk"` or `"memory"`.
+- React Native, Android: the new architecture builds with React Native 0.76 and earlier, whose codegen task has no `jsInputFiles` property to set, so the build failed.
+- iOS, Swift Package Manager: the `AlphaVideoGPU` product brings range-source, and a new product, `AlphaVideoGPUCore`, is the player without it. They replace the package trait `Source`, which Xcode before 26.4 doesn't apply, default traits included: 1.0.0's notes said Xcode apps always had range-source, but they never got it, and now they do with no change. A package that depended on the player with `traits: []` to leave range-source out takes `AlphaVideoGPUCore` instead.
+
 ## alpha-video-gpu-web 1.0.1 - 2026-10-23
 
 - README: the demo clip and a link to the demo app at the top, as in the repository's README. No code changes; the other packages stay at 1.0.0.

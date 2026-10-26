@@ -43,7 +43,7 @@ static void AVGWarnWithoutAddOn(void)
 {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    NSLog(@"[AlphaVideoGPU] range-source isn't installed (the RangeSource SwiftPM product, the alpha-video-gpu pod's "
+    NSLog(@"[AlphaVideoGPU] range-source isn't installed (the AlphaVideoGPU SwiftPM product, the alpha-video-gpu pod's "
           @"Source subspec, or for React Native npm i react-native-range-source): URLs are downloaded whole for each "
           @"play, without range requests, storage, maxStorageBytes or cacheKey");
   });
@@ -520,7 +520,7 @@ NSString *const AlphaVideoGpuErrorNoSourceModule = @"NO_SOURCE_MODULE";
   if (readsRanges && !AVGRangeSourceAvailable()) {
     if (dataSourceName) {
       [self notifyError:[NSString stringWithFormat:@"The data source \"%@\" needs the range-source add-on (the "
-                                                   @"RangeSource SwiftPM product, the alpha-video-gpu pod's Source "
+                                                   @"AlphaVideoGPU SwiftPM product, the alpha-video-gpu pod's Source "
                                                    @"subspec, or for React Native react-native-range-source), which "
                                                    @"the app doesn't include", dataSourceName]
                    code:AlphaVideoGpuErrorNoSourceModule];

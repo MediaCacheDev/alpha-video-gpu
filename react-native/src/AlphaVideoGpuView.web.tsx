@@ -38,8 +38,20 @@ export interface SourceType {
   cacheKey?: string;
   /** Sent with every request for the URL, e.g. Authorization; given to a `dataSource` too */
   headers?: Record<string, string>;
-  /** iOS and Android: a data source registered in native code under this name */
+  /**
+   * Read the file through the data source registered under this name: range-source's
+   * `RangeDataSources` on Android and iOS, and range-source-web's on the web. MediaCache
+   * registers as `'mediacache'` with `cache.registerRangeDataSource()`.
+   */
   dataSource?: string;
+}
+
+type DataSourceFactory = (uri: string, init?: { headers?: Record<string, string> }) => ByteSource;
+
+/** range-source-web's `RangeDataSources`, read from its global symbol so this package needn't depend on it. */
+function registeredDataSource(name: string): DataSourceFactory | undefined {
+  const scope = globalThis as { [key: symbol]: Map<string, DataSourceFactory> | undefined };
+  return scope[Symbol.for('range-source.dataSources')]?.get(name);
 }
 
 export interface AlphaVideoGpuViewProps {
@@ -178,14 +190,34 @@ export const AlphaVideoGpuView = forwardRef<AlphaVideoGpuViewRef, AlphaVideoGpuV
   // the load on it would resetSource() and refetch on each refresh, visibly restarting
   // a loop that should run until unmount. The cache key is the stable identity.
   const sourceCacheKey = normalizedSource?.cacheKey || cacheKey;
-  const sourceIdentity = directSource || sourceCacheKey || normalizedSource?.uri || null;
+  const dataSource = normalizedSource?.dataSource;
+  const keyed = sourceCacheKey || normalizedSource?.uri;
+  const sourceIdentity = directSource || (keyed && dataSource ? `${dataSource}:${keyed}` : keyed) || null;
 
   // Load source when it changes
   useEffect(() => {
     const core = coreRef.current;
-    const toLoad = directSource || normalizedSource?.uri;
-    if (!core || !toLoad || !sourceIdentity || loadedSourceRef.current === sourceIdentity) return;
+    const uri = normalizedSource?.uri;
+    if (!core || !sourceIdentity || loadedSourceRef.current === sourceIdentity) return;
 
+    if (dataSource && uri) {
+      // The data source keeps the bytes; the player stores them too only when storage is set
+      const factory = registeredDataSource(dataSource);
+      if (!factory) {
+        callbacksRef.current.onError?.({ nativeEvent: { error: `No data source is registered on the web under "${dataSource}"` } });
+        return;
+      }
+      loadedSourceRef.current = sourceIdentity;
+      const stored = storage === 'disk' || storage === 'memory';
+      core.setSource(factory(uri, { headers: headersRef.current }), stored ? { cacheKey: keyed } : {});
+      return () => {
+        loadedSourceRef.current = null;
+        core.resetSource();
+      };
+    }
+
+    const toLoad = directSource || uri;
+    if (!toLoad) return;
     loadedSourceRef.current = sourceIdentity;
     core.setSource(toLoad, { cacheKey: sourceCacheKey, headers: headersRef.current });
 

@@ -12,7 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /**
  * onError's code for a data source without the range-source add-on, which reads them (the
- * RangeSource SwiftPM product, the alpha-video-gpu pod's Source subspec, or for React Native
+ * AlphaVideoGPU SwiftPM product, the alpha-video-gpu pod's Source subspec, or for React Native
  * react-native-range-source). Without it a URL is downloaded whole for each play, and storage,
  * maxStorageBytes and cacheKey are ignored.
  */

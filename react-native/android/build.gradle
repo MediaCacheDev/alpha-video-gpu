@@ -30,7 +30,10 @@ if (isNewArchitectureEnabled()) {
     // levels up, in the package root.
     tasks.named('generateCodegenSchemaFromJavaScript').configure {
         jsRootDir.set(file("${packageRoot}/react-native/src"))
-        jsInputFiles.set(fileTree("${packageRoot}/react-native/src") { include '**/*.ts', '**/*.tsx', '**/*.js' })
+        // A property in newer React Native; in 0.76 and earlier, a file tree that follows jsRootDir
+        if (jsInputFiles instanceof org.gradle.api.provider.Property) {
+            jsInputFiles.set(fileTree("${packageRoot}/react-native/src") { include '**/*.ts', '**/*.tsx', '**/*.js' })
+        }
     }
     tasks.named('generateCodegenArtifactsFromSchema').configure {
         packageJsonFile.set(file("${packageRoot}/package.json"))
