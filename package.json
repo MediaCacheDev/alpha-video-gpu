@@ -15,6 +15,7 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "!android/src/test",
+    "!ios/Sources/AlphaVideoGPUSource",
     "!react-native/android/build",
     "!react-native/android/.gradle",
     "!react-native/android/.cxx",

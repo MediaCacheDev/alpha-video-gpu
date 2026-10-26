@@ -2,9 +2,9 @@
 
 The packages built from this repository share one version: `react-native-alpha-video-gpu` and `alpha-video-gpu-web` on npm, `dev.mediacache:alpha-video-gpu` on Maven Central, and the `AlphaVideoGPU` Swift package and `alpha-video-gpu` pod.
 
-## react-native-alpha-video-gpu 1.0.1 - Unreleased
+## 1.0.1 - 2026-10-26
 
-For `react-native-alpha-video-gpu` and the `AlphaVideoGPU` Swift package; the other packages stay at 1.0.0.
+For `react-native-alpha-video-gpu` and the `AlphaVideoGPU` Swift package. `dev.mediacache:alpha-video-gpu` and the `alpha-video-gpu` pod stay at 1.0.0 (the pod's subspecs already included range-source), and `alpha-video-gpu-web` at 1.0.1.
 
 - On react-native-web, `source.dataSource` names a data source registered with range-source-web's `RangeDataSources`, as it names a native one on Android and iOS, so the same `source={{ uri, dataSource }}` plays on all three; MediaCache registers as `'mediacache'` with `cache.registerRangeDataSource()`. An unregistered name reports `onError`. Its bytes are stored only with `storage="disk"` or `"memory"`.
 - React Native, Android: the new architecture builds with React Native 0.76 and earlier, whose codegen task has no `jsInputFiles` property to set, so the build failed.
