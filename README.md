@@ -1,9 +1,11 @@
 # alpha-video-gpu
 
 <p align="center">
-  <img src="docs/alpha-video-gpu.avif" alt="Transparent ASTC videos playing over a checkerboard in the demo app on Android" width="360">
+  <a href="https://www.alpha-video.dev"><img src="docs/alpha-video-gpu.avif" alt="Transparent ASTC videos playing over a checkerboard in the demo app on Android" width="360"></a>
   <br>
-  <a href="https://github.com/MediaCacheDev/alpha-video-test">Compare transparent formats in the demo app</a>
+  <a href="https://www.alpha-video.dev">Compare transparent formats in the web demo</a>
+  <br>
+  <a href="https://github.com/MediaCacheDev/alpha-video-test">The demo app's source, for Android, iOS and the web</a>
 </p>
 
 Plays transparent (alpha) videos stored as ASTC texture arrays in KTX2 files, drawn with Metal on iOS, OpenGL ES on Android and WebGL on the web. Frames go to the GPU without being decoded, so CPU and battery use stay low. It comes as a React Native component, as standalone Android and iOS libraries, and as a web package.
@@ -15,7 +17,7 @@ Plays transparent (alpha) videos stored as ASTC texture arrays in KTX2 files, dr
 | iOS | Swift Package Manager, product `AlphaVideoGPU` (`AlphaVideoGPUCore` without range-source); CocoaPods `alpha-video-gpu` | `AlphaVideoGpuView` |
 | Web (plain JS/TS, React) | npm `alpha-video-gpu-web` | `createAlphaVideoGpuPlayer`, `AlphaVideoGpuPlayer` |
 
-See it next to the other formats in the [demo app](#demo-and-related-packages).
+See it next to the other formats in the [web demo](https://www.alpha-video.dev), or in the [demo app](#demo-and-related-packages) on Android and iOS.
 
 ## alpha-video-gpu or alpha-video?
 
@@ -939,7 +941,7 @@ xcodebuild test -scheme AlphaVideoGPU-Package -destination 'platform=iOS Simulat
 
 ## Demo and related packages
 
-[alpha-video-test](https://github.com/MediaCacheDev/alpha-video-test) is a React Native app (Android, iOS and web) that plays the same video in each of these formats side by side, with FPS, CPU and memory readouts, so you can compare them on your own device.
+[alpha-video-test](https://github.com/MediaCacheDev/alpha-video-test) is a React Native app (Android, iOS and web) that plays the same video in each of these formats side by side, with FPS, CPU and memory readouts, so you can compare them on your own device. Its web build runs at [www.alpha-video.dev](https://www.alpha-video.dev).
 
 - [alpha-video-gpu-encoder](https://github.com/MediaCacheDev/alpha-video-gpu-encoder): makes the KTX2 files for this player (`texenc`).
 - [alpha-video](https://github.com/MediaCacheDev/alpha-video): WebM VP9 and AV1 with alpha, decoded in software by a shared C++ core or in hardware by MediaCodec on Android. The smallest files.
